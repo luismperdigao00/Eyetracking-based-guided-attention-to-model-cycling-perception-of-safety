@@ -73,3 +73,9 @@ temp/
 # Git / user configuration (repo is in ~)
 # ============================================================================
 .gitconfig
+
+# =========================
+# Shell history (never commit)
+# =========================
+.bash_history
+.ssh/

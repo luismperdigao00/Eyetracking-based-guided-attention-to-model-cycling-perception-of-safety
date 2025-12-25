@@ -1,465 +1,468 @@
-import warnings
-import sys
-from typing import Callable, Optional
+"""
+utils/losses.py
 
+Loss building blocks and orchestration for pairwise subjective-safety learning.
+
+This module centralizes:
+  - Pairwise ranking losses (non-ties) where a preferred side must score higher
+  - Tie losses where the model is encouraged to predict similar scores
+  - Classification loss (CrossEntropy) for discrete label prediction
+  - Optional gaze/attention alignment loss via symmetric KL divergence
+
+It is designed to be called from your training loop with:
+    total_loss = compute_loss(args, network_output_dict, labels)
+
+Label conventions in this project:
+  - labels["label_r"] is the raw ranking label in {-1, 0, +1}
+        -1: left wins
+         0: tie
+        +1: right wins
+
+Important compatibility detail (legacy behavior):
+  - This file flips the sign for MarginRankingLoss:
+        label = -1 * labels["label_r"]
+    so that (output_left, output_right, label) is consistent with historical training runs.
+
+Expected network_output_dict structure (as produced by your models):
+  - network_output_dict["left"]["output"]   : Tensor [B] or [B,1]
+  - network_output_dict["right"]["output"]  : Tensor [B] or [B,1]
+  - network_output_dict["logits"]["output"] : Tensor [B, C] (if classification head exists)
+  - network_output_dict["left"]["attn_map"] : Tensor [B, H, W] (optional, for gaze KL)
+  - network_output_dict["right"]["attn_map"]: Tensor [B, H, W] (optional, for gaze KL)
+
+Expected labels dict structure:
+  - labels["label_r"] : Tensor [B] in {-1,0,+1}
+  - labels["label_c"] : Tensor [B] in {0..C-1} (if classification is used)
+  - labels["gaze_l"] / labels["gaze_r"] : Tensor [B, H, W] (optional, gaze maps)
+  - labels["has_eye_mask"] : Tensor [B] in {0,1} (optional, mask for gaze availability)
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import sys
 import torch
 from torch import Tensor
 import torch.nn as nn
-from torch.nn.modules import Module
-from torch.nn import _reduction as _Reduction
 import torch.nn.functional as F
 
 
-
-__all__ = ['MarginRankingLossWithTies']
-
-
-class _Loss(Module):
-    reduction: str
-
-    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean') -> None:
-        super().__init__()
-        if size_average is not None or reduce is not None:
-            self.reduction: str = _Reduction.legacy_get_string(size_average, reduce)
-        else:
-            self.reduction = reduction
+__all__ = [
+    "SmoothPairwiseRankingLoss",
+    "TieHuberLoss",
+    "MarginRankingLossWithTies",
+    "compute_ranking_loss",
+    "compute_loss_classification",
+    "normalize_to_prob",
+    "attention_kl_loss",
+    "compute_loss",
+]
 
 
-class _WeightedLoss(_Loss):
-    def __init__(self, weight: Optional[Tensor] = None, size_average=None, reduce=None, reduction: str = 'mean') -> None:
-        super().__init__(size_average, reduce, reduction)
-        self.register_buffer('weight', weight)
-        self.weight: Optional[Tensor]
+# ====================================================================================== #
+# Loss primitives
+# ====================================================================================== #
 
 class SmoothPairwiseRankingLoss(nn.Module):
     """
-    Smooth pairwise ranking loss (RankNet-style, logistic).
+    Smooth pairwise ranking loss (RankNet-style / logistic).
 
-    label semantics (after your sign flip):
-        -1 → right should have higher score
-        +1 → left should have higher score
-
-    For each non-tie pair:
+    For a non-tie pair:
         diff = s_left - s_right
         y ∈ {-1, +1}
         loss = softplus(-y * diff) = log(1 + exp(-y * diff))
 
-    - Smooth (no hinge)
-    - Non-zero gradients even when diff is large but in the right direction
-    - Good for noisy, subjective pairwise preferences
+    Compared to hinge-based MarginRankingLoss:
+      - smooth (no kink)
+      - provides non-zero gradients even when predictions are correct
+      - tends to be more robust for noisy, subjective labels
+
+    Notes:
+      - This loss assumes `target` is +1 when left should be larger than right,
+        and -1 when right should be larger than left.
     """
 
     def __init__(self, reduction: str = "mean"):
         super().__init__()
-        if reduction != "mean":
-            raise ValueError("SmoothPairwiseRankingLoss currently supports only reduction='mean'")
+        if reduction not in ("mean",):
+            raise ValueError("SmoothPairwiseRankingLoss currently supports only reduction='mean'.")
         self.reduction = reduction
 
     def forward(self, input_left: Tensor, input_right: Tensor, target: Tensor) -> Tensor:
-        # target: +1 (left wins), -1 (right wins)
-        diff = input_left - input_right  # [B]
-        # softplus(-y * diff) = log(1 + exp(-y * diff))
+        diff = input_left - input_right
         loss = F.softplus(-target * diff)
         return loss.mean()
-    
+
 
 class TieHuberLoss(nn.Module):
     """
-    Symmetric Huber loss around 0 for ties.
+    Robust symmetric loss around 0 to encourage ties.
 
-    For tie pairs:
-        diff = s_left - s_right
-        We want diff ≈ 0, but robustly (not overly punishing outliers).
+    For tie pairs we want:
+        diff = s_left - s_right ≈ 0
 
-    Loss:
+    Huber-like penalty around 0:
         if |diff| <= delta:
             0.5 * diff^2 / delta
         else:
             |diff| - 0.5 * delta
 
-    where delta = margin_ties (a small positive number).
-    If margin_ties == 0, we fall back to pure L1: |diff|.
+    If delta <= 0, it falls back to pure L1: |diff|.
     """
 
-    def __init__(self, margin: float = 0.0, reduction: str = "mean"):
+    def __init__(self, delta: float, reduction: str = "mean"):
         super().__init__()
-        self.delta = margin
-        if reduction != "mean":
-            raise ValueError("TieHuberLoss currently supports only reduction='mean'")
+        if reduction not in ("mean",):
+            raise ValueError("TieHuberLoss currently supports only reduction='mean'.")
+        self.delta = float(delta)
         self.reduction = reduction
 
     def forward(self, input_left: Tensor, input_right: Tensor) -> Tensor:
-        diff = input_left - input_right  # [B]
-        abs_diff = torch.abs(diff)
+        diff = input_left - input_right
+        abs_diff = diff.abs()
 
         if self.delta <= 0.0:
-            # Pure L1 if delta == 0
             loss = abs_diff
         else:
-            # Huber around 0
             mask = abs_diff <= self.delta
             loss = torch.empty_like(abs_diff)
-            # quadratic region
             loss[mask] = 0.5 * (diff[mask] ** 2) / self.delta
-            # linear region
             loss[~mask] = abs_diff[~mask] - 0.5 * self.delta
 
         return loss.mean()
 
-class MarginRankingLossWithTies(_Loss):
-    r"""
 
-    Args:
-        reduction (str, optional): Specifies the reduction to apply to the output:
-            ``'none'`` | ``'mean'`` | ``'sum'``. ``'none'``: no reduction will be applied,
-            ``'mean'``: the sum of the output will be divided by the number of
-            elements in the output, ``'sum'``: the output will be summed. Note: :attr:`size_average`
-            and :attr:`reduce` are in the process of being deprecated, and in the meantime,
-            specifying either of those two args will override :attr:`reduction`. Default: ``'mean'``
-    Shape:
-        - Input: :math:`(*)`, where :math:`*` means any number of dimensions.
-        - Target: :math:`(*)`, same shape as the input.
-        - Output: scalar. If :attr:`reduction` is ``'none'``, then
-          :math:`(*)`, same shape as the input.
-
-    Examples::
-        >>> loss = MarginRankingLossWithTies(margin=1)
-        >>> input1 = torch.randn(3, requires_grad=True)
-        >>> input2 = torch.randn(3, requires_grad=True)
-        >>> target = torch.randn(3).sign()
-        >>> output = loss(input1, input2, target)
-        >>> output.backward()
+class MarginRankingLossWithTies(nn.Module):
     """
-    __constants__ = ['margin', 'reduction']
-    margin: float
+    Tie loss used when label == 0.
 
-    def __init__(self, margin: float = 0., size_average=None, reduce=None, reduction: str = 'mean') -> None:
-        super().__init__(size_average, reduce, reduction)
-        self.margin = margin
+    Enforces |s_left - s_right| <= margin via hinge penalty:
+        loss = relu(|diff| - margin)
 
-    def forward(self, input1: Tensor, input2: Tensor) -> Tensor:
-        ties_loss_valid = torch.abs(input1 - input2) - self.margin
-        zeros = torch.zeros_like(ties_loss_valid)
-        loss = torch.max(ties_loss_valid, zeros)
+    This is conceptually consistent with the non-tie hinge ranking loss, but symmetric.
+    """
 
-        if self.reduction == 'mean':
-            avg_loss = loss.mean()
-        else:
-            raise Exception("Reduction type not valid. Currently, only allows for 'mean'.")
-        return avg_loss
+    def __init__(self, margin: float, reduction: str = "mean"):
+        super().__init__()
+        self.margin = float(margin)
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError("reduction must be one of {'none','mean','sum'}")
+        self.reduction = reduction
 
+    def forward(self, input_left: Tensor, input_right: Tensor) -> Tensor:
+        penalty = F.relu((input_left - input_right).abs() - self.margin)
+
+        if self.reduction == "none":
+            return penalty
+        if self.reduction == "sum":
+            return penalty.sum()
+        return penalty.mean()
+
+
+# ====================================================================================== #
+# Small utilities
+# ====================================================================================== #
+
+def _as_1d_scores(x: Tensor) -> Tensor:
+    """Ensure model outputs are [B]. Accepts [B] or [B,1]."""
+    if x.dim() == 2 and x.size(1) == 1:
+        return x.view(-1)
+    if x.dim() == 1:
+        return x
+    # Defensive: flatten only if it collapses to a single value per sample.
+    x_flat = x.view(x.size(0), -1)
+    if x_flat.size(1) != 1:
+        raise ValueError(f"Expected one score per sample. Got shape {tuple(x.shape)}.")
+    return x_flat.view(-1)
+
+
+# ====================================================================================== #
+# Ranking loss: split non-ties vs ties
+# ====================================================================================== #
 
 def compute_ranking_loss(
-    network_output_dict,
-    labels,
-    criterion_ranking,
+    network_output_dict: dict,
+    labels: dict,
+    criterion_ranking: nn.Module,
     ties: bool = False,
-    criterion_ties=None,
-):
+    criterion_ties: Optional[nn.Module] = None,
+) -> Tuple[Tensor, Tensor]:
     """
-    Compute ranking loss with optional tie loss.
+    Compute (non-tie ranking loss, tie loss) for a batch.
 
-    label semantics:
-        -1 → left wins
-         0 → tie
-        +1 → right wins
+    Non-ties:
+      - Uses `criterion_ranking(output_left, output_right, label)` where label ∈ {-1,+1}
+
+    Ties:
+      - Only computed if ties=True
+      - Uses `criterion_ties(output_left, output_right)` for samples where label == 0
+
+    Returns:
+        (loss_nonties, loss_ties) as two scalar tensors on the correct device/dtype.
     """
-
-    # -------------------------------------------------------------------------
-    # 0. Sanity checks
-    # -------------------------------------------------------------------------
     if ties and criterion_ties is None:
-        raise Exception('If including ties, criterion (loss) for ties must be included')
+        raise ValueError("ties=True requires a criterion_ties instance.")
 
-    # -------------------------------------------------------------------------
-    # 1. Extract model outputs (left / right) and flatten
-    # -------------------------------------------------------------------------
-    output_left_raw = network_output_dict['left']['output']
-    output_right_raw = network_output_dict['right']['output']
+    # 1) Extract model outputs
+    output_left_raw: Tensor = network_output_dict["left"]["output"]
+    output_right_raw: Tensor = network_output_dict["right"]["output"]
+    output_left = _as_1d_scores(output_left_raw)
+    output_right = _as_1d_scores(output_right_raw)
 
-    # Make sure they are 1D [batch_size]
-    output_left = output_left_raw.view(output_left_raw.size(0))
-    output_right = output_right_raw.view(output_right_raw.size(0))
+    # 2) Prepare ranking labels (legacy sign flip)
+    label: Tensor = -1 * labels["label_r"]
 
-    # -------------------------------------------------------------------------
-    # 2. Prepare labels: -1 (right), 0 (tie), +1 (left)
-    # -------------------------------------------------------------------------
-    
-    label = -1 * labels['label_r']
+    batch_size = int(label.size(0))
 
-    batch_size = label.size(0)
-
-    # -------------------------------------------------------------------------
-    # 3. Basic numerical debug checks
-    # -------------------------------------------------------------------------
+    # 3) Numerical guards (lightweight debug)
     if torch.isnan(output_left).any() or torch.isnan(output_right).any():
-        print("[DEBUG ranking_loss] NaN in outputs!")
+        print("[DEBUG compute_ranking_loss] NaN in ranking outputs!", file=sys.stderr)
     if torch.isinf(output_left).any() or torch.isinf(output_right).any():
-        print("[DEBUG ranking_loss] Inf in outputs!")
+        print("[DEBUG compute_ranking_loss] Inf in ranking outputs!", file=sys.stderr)
 
-    # -------------------------------------------------------------------------
-    # 4. Split into non-ties and ties
-    # -------------------------------------------------------------------------
-    index_mask_nontie = (label != 0)
-    index_mask_tie = (label == 0)
+    # 4) Split ties / non-ties
+    mask_nontie = (label != 0)
+    mask_tie = (label == 0)
+    n_nonties = int(mask_nontie.sum().item())
+    n_ties = int(mask_tie.sum().item())
 
-    n_nonties = index_mask_nontie.sum().item()
-    n_ties = index_mask_tie.sum().item()
-
-    # This tells you when the batch is "missing" a label type
     if (n_nonties == 0) or (ties and n_ties == 0):
         print(
             f"[DEBUG compute_ranking_loss] batch_size={batch_size}, "
-            f"n_nonties={n_nonties}, n_ties={n_ties}"
+            f"n_nonties={n_nonties}, n_ties={n_ties}",
+            file=sys.stderr,
         )
 
-    # -------------------------------------------------------------------------
-    # 5. Non-ties loss
-    #    - If the batch has no non-ties, this contributes 0.
-    # -------------------------------------------------------------------------
+    # 5) Non-ties loss
     if n_nonties > 0:
         loss_nonties = criterion_ranking(
-            output_left[index_mask_nontie],
-            output_right[index_mask_nontie],
-            label[index_mask_nontie],
+            output_left[mask_nontie],
+            output_right[mask_nontie],
+            label[mask_nontie],
         )
     else:
-        loss_nonties = torch.tensor(
-            0.0, device=output_left.device, dtype=output_left.dtype
-        )
+        loss_nonties = torch.tensor(0.0, device=output_left.device, dtype=output_left.dtype)
 
-    # -------------------------------------------------------------------------
-    # 6. Ties loss (optional)
-    #    - Only computed if `ties=True`.
-    #    - If the batch has no ties, this contributes 0.
-    # -------------------------------------------------------------------------
+    # 6) Ties loss
     if ties:
         if n_ties > 0:
             loss_ties = criterion_ties(
-                output_left[index_mask_tie],
-                output_right[index_mask_tie],
+                output_left[mask_tie],
+                output_right[mask_tie],
             )
         else:
-            loss_ties = torch.tensor(
-                0.0, device=output_left.device, dtype=output_left.dtype
-            )
+            loss_ties = torch.tensor(0.0, device=output_left.device, dtype=output_left.dtype)
     else:
-        loss_ties = torch.tensor(
-            0.0, device=output_left.device, dtype=output_left.dtype
-        )
+        loss_ties = torch.tensor(0.0, device=output_left.device, dtype=output_left.dtype)
 
-
-    # -------------------------------------------------------------------------
-    # 7. Final NaN check
-    # -------------------------------------------------------------------------
-
+    # 7) Final NaN check
     if torch.isnan(loss_nonties) or torch.isnan(loss_ties):
         print(
             "[DEBUG compute_ranking_loss] NaN loss_nonties / loss_ties detected! "
-            f"batch_size={batch_size}, n_nonties={n_nonties}, n_ties={n_ties}"
+            f"batch_size={batch_size}, n_nonties={n_nonties}, n_ties={n_ties}",
+            file=sys.stderr,
         )
 
     return loss_nonties, loss_ties
 
 
-def compute_loss_classification(network_output_dict, labels, criterion_classification):
+# ====================================================================================== #
+# Classification loss
+# ====================================================================================== #
+
+def compute_loss_classification(
+    network_output_dict: dict,
+    labels: dict,
+    criterion_classification: nn.Module,
+) -> Tensor:
     """
-    Computes the classification loss between network outputs and labels using a loss criterion
+    Compute classification loss using logits and class labels.
 
-        Parameters:
-             network_output_dict (dict): Network output
-             labels (nn.Tensor): Ground truth class labels
-             criterion_classification (nn.Loss): Loss function (criterion)
-
-        Returns:
-            loss_class (nn.Tensor): Loss values
+    Expects:
+      - network_output_dict["logits"]["output"] : [B, C]
+      - labels["label_c"] : [B]
     """
-
-    # Forward pass data output
-    logits = network_output_dict['logits']['output']
-
-    # Ground truth label data
-    label = labels['label_c']
-
-    # Classification loss
-    loss_class = criterion_classification(logits, label.long())
-    return loss_class
+    logits: Tensor = network_output_dict["logits"]["output"]
+    y: Tensor = labels["label_c"]
+    return criterion_classification(logits, y.long())
 
 
-def normalize_to_prob(x, eps=1e-8):
-    # x: [B,14,14] -> [B,196], each sums to 1
-    B = x.shape[0]
-    flat = x.reshape(B, -1)
+# ====================================================================================== #
+# Attention / gaze alignment (KL)
+# ====================================================================================== #
+
+def normalize_to_prob(x: Tensor, eps: float = 1e-8) -> Tensor:
+    """
+    Normalize a non-negative map into a probability distribution per sample.
+
+    Input:  x [B, H, W] or [B, N]
+    Output: p [B, H*W] with sum(p_i) = 1 for each sample.
+    """
+    if x.dim() == 2:
+        flat = x
+    else:
+        flat = x.view(x.size(0), -1)
+
     flat = flat.clamp(min=eps)
-    flat = flat / flat.sum(dim=1, keepdim=True).clamp(min=eps)
-    return flat
+    return flat / flat.sum(dim=1, keepdim=True).clamp(min=eps)
 
-def attention_kl_loss(attn_left, attn_right, gaze_left, gaze_right, has_mask):
-    # attn_*: [B,14,14] (unnormalized); gaze_*: [B,14,14] (already sums to 1 but we re-normalize safely)
-    p_left  = normalize_to_prob(gaze_left)
-    p_right = normalize_to_prob(gaze_right)
-    q_left  = normalize_to_prob(attn_left)
-    q_right = normalize_to_prob(attn_right)
 
-    eps = 1e-8
-    kl_left  = (p_left  * (torch.log(p_left  + eps) - torch.log(q_left  + eps))).sum(dim=1)
+def attention_kl_loss(
+    attn_left: Tensor,
+    attn_right: Tensor,
+    gaze_left: Tensor,
+    gaze_right: Tensor,
+    has_mask: Optional[Tensor],
+    eps: float = 1e-8,
+) -> Tensor:
+    """
+    Symmetric KL divergence between predicted attention maps and gaze maps.
+
+    All maps are normalized to per-sample probability distributions before KL.
+
+    Args:
+        attn_left/attn_right: predicted attention maps [B,H,W] (not necessarily normalized)
+        gaze_left/gaze_right: gaze probability maps [B,H,W] (we normalize defensively)
+        has_mask: optional [B] indicating which samples have gaze data (1) vs missing (0)
+
+    Returns:
+        scalar KL loss
+    """
+    p_left = normalize_to_prob(gaze_left, eps=eps)
+    p_right = normalize_to_prob(gaze_right, eps=eps)
+    q_left = normalize_to_prob(attn_left, eps=eps)
+    q_right = normalize_to_prob(attn_right, eps=eps)
+
+    kl_left = (p_left * (torch.log(p_left + eps) - torch.log(q_left + eps))).sum(dim=1)
     kl_right = (p_right * (torch.log(p_right + eps) - torch.log(q_right + eps))).sum(dim=1)
-    kl = 0.5 * (kl_left + kl_right)
+    kl = 0.5 * (kl_left + kl_right)  # [B]
 
     if has_mask is not None:
-        has_mask = has_mask.float()
-        denom = has_mask.sum().clamp(min=1.0)
-        kl = (kl * has_mask).sum() / denom
-    else:
-        kl = kl.mean()
-    return kl
-    
-def compute_loss(args, network_output_dict, labels):
-    
-    # ============================================================
-    # 1) non-tie ranking loss (hinge / margin ranking)
-    #    Used for pairs where label_r ∈ {+1, -1}
-    # ============================================================
+        has_mask_f = has_mask.float()
+        denom = has_mask_f.sum().clamp(min=1.0)
+        return (kl * has_mask_f).sum() / denom
+
+    return kl.mean()
+
+
+# ====================================================================================== #
+# Orchestrator: compute full loss per model type
+# ====================================================================================== #
+
+def compute_loss(args, network_output_dict: dict, labels: dict) -> Tensor:
+    """
+    Compute the training loss used by your pipeline, based on args.model.
+
+    Supported models (as currently used in your codebase):
+      - 'rcnn'   : ranking-only (non-ties + optional ties)
+      - 'sscnn'  : classification-only
+      - 'rsscnn' : classification + ranking + optional gaze KL
+
+    Returns:
+        scalar loss tensor suitable for backprop.
+    """
+    # ------------------------------------------------------------------
+    # 1) Non-tie ranking criterion (hinge)
+    # ------------------------------------------------------------------
     criterion_ranking = nn.MarginRankingLoss(
-        reduction='mean',
-        margin=args.ranking_margin,
+        reduction="mean",
+        margin=float(args.ranking_margin),
     )
-    
-    
-    # ============================================================
-    # 2) classification loss setup
-    #    - optional class weighting
+
+    # ------------------------------------------------------------------
+    # 2) Classification criterion
+    #    - optional class weights
     #    - optional label smoothing
-    # ============================================================
-    
-    # ---- 2.1 class weights (optional) ----
-    class_weight_tensor = None
-    
-    # only compute class weights if:
-    #   (a) user enabled class_weights, and
-    #   (b) logits exist (i.e., model is sscnn or rsscnn)
+    # ------------------------------------------------------------------
+    class_weight_tensor: Optional[Tensor] = None
     if getattr(args, "use_class_weights", False) and ("logits" in network_output_dict):
         logits = network_output_dict["logits"]["output"]
-        device = logits.device
-    
-        # convert Python list → tensor on correct device
         class_weight_tensor = torch.tensor(
             args.class_weights,
             dtype=torch.float,
-            device=device,
+            device=logits.device,
         )
-    
-    # ---- 2.2 label smoothing (optional) ----
-    smoothing = getattr(args, "label_smoothing", 0.0)
-    
-    # final classification criterion
+
+    smoothing = float(getattr(args, "label_smoothing", 0.0) or 0.0)
     criterion_classification = nn.CrossEntropyLoss(
-        weight=class_weight_tensor,                       # None or tensor
+        weight=class_weight_tensor,
         label_smoothing=(smoothing if smoothing > 0 else 0.0),
     )
-    
-    
-    # ============================================================
-    # 3) tie ranking loss (only used if ties=True)
-    #    MarginRankingLossWithTies enforces |diff| < margin
-    # ============================================================
-    if args.ties:
-        criterion_ties = MarginRankingLossWithTies(
-            reduction='mean',
-            margin=args.ranking_margin_ties,
+
+    # ------------------------------------------------------------------
+    # 3) Tie criterion (optional)
+    # ------------------------------------------------------------------
+    if bool(getattr(args, "ties", False)):
+        criterion_ties: Optional[nn.Module] = MarginRankingLossWithTies(
+            margin=float(args.ranking_margin_ties),
+            reduction="mean",
         )
     else:
         criterion_ties = None
 
-    # ======================================================================
-    # MODEL: ranking-only (rcnn)  --- USE SMOOTH LOSS
-    # ======================================================================
-    if args.model == 'rcnn':
-        # compute non-ties + ties losses exactly like in rsscnn
+    model = getattr(args, "model", None)
+
+    # ------------------------------------------------------------------
+    # Model: ranking-only (RCNN)
+    # ------------------------------------------------------------------
+    if model == "rcnn":
         loss_nonties, loss_ties = compute_ranking_loss(
-            network_output_dict,
-            labels,
-            criterion_ranking,
-            ties=args.ties,
+            network_output_dict=network_output_dict,
+            labels=labels,
+            criterion_ranking=criterion_ranking,
+            ties=bool(getattr(args, "ties", False)),
             criterion_ties=criterion_ties,
         )
-    
-        # combine them with λ_R and λ_tie
-        loss_rank_combo = args.rank_w * loss_nonties + args.ties_w * loss_ties
-    
-        return loss_rank_combo
+        return float(args.rank_w) * loss_nonties + float(args.ties_w) * loss_ties
 
-
-    # ======================================================================
-    # MODEL: classification-only (sscnn)
-    # ======================================================================
-    elif args.model == 'sscnn':
+    # ------------------------------------------------------------------
+    # Model: classification-only (SSCNN)
+    # ------------------------------------------------------------------
+    if model == "sscnn":
         return compute_loss_classification(
-            network_output_dict,
-            labels,
-            criterion_classification,
+            network_output_dict=network_output_dict,
+            labels=labels,
+            criterion_classification=criterion_classification,
         )
 
-    # ======================================================================
-    # MODEL: classification + ranking (rsscnn)
-    # ======================================================================
-    elif args.model == 'rsscnn':
-        # weights: keep classification at 1.0, separate λ_R and λ_tie
-        w_class   = 1.0
-        lambda_R  = args.rank_w
-        lambda_tie = args.ties_w
-        w_kl      = args.attn_w
-
-        # classification
+    # ------------------------------------------------------------------
+    # Model: classification + ranking (+ optional gaze KL) (RSSCNN)
+    # ------------------------------------------------------------------
+    if model == "rsscnn":
+        # Classification
         loss_class = compute_loss_classification(
-            network_output_dict,
-            labels,
-            criterion_classification,
+            network_output_dict=network_output_dict,
+            labels=labels,
+            criterion_classification=criterion_classification,
         )
 
-        # ranking (split into non-ties and ties)
+        # Ranking
         loss_nonties, loss_ties = compute_ranking_loss(
-            network_output_dict,
-            labels,
-            criterion_ranking,
-            ties=args.ties,
+            network_output_dict=network_output_dict,
+            labels=labels,
+            criterion_ranking=criterion_ranking,
+            ties=bool(getattr(args, "ties", False)),
             criterion_ties=criterion_ties,
         )
+        loss_rank_combo = float(args.rank_w) * loss_nonties + float(args.ties_w) * loss_ties
 
-        # combine ranking terms like in the paper:
-        #   L_R = λ_R * L_R̂(non-ties) + λ_1 * L_1(ties)
-        loss_rank_combo = lambda_R * loss_nonties + lambda_tie * loss_ties
-
-        # gaze KL (disabled when gaze='off' or attn_w == 0)
-        if getattr(args, 'gaze', 'use') == 'off' or w_kl == 0:
-            loss_kl = loss_rank_combo * 0.0  # same dtype/device, no-op
+        # Optional gaze KL
+        w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
+        gaze_mode = getattr(args, "gaze", "use")
+        if gaze_mode == "off" or w_kl == 0.0:
+            loss_kl = loss_rank_combo * 0.0  # zero on correct device/dtype
             w_kl = 0.0
         else:
             loss_kl = attention_kl_loss(
-                network_output_dict['left']['attn_map'],
-                network_output_dict['right']['attn_map'],
-                labels['gaze_l'],
-                labels['gaze_r'],
-                has_mask=labels['has_eye_mask'],
+                network_output_dict["left"]["attn_map"],
+                network_output_dict["right"]["attn_map"],
+                labels["gaze_l"],
+                labels["gaze_r"],
+                has_mask=labels.get("has_eye_mask", None),
             )
 
-        return w_class * loss_class + loss_rank_combo + w_kl * loss_kl
+        # Final weighted sum (classification has implicit weight 1.0)
+        return loss_class + loss_rank_combo + w_kl * loss_kl
 
-    else:
-        raise ValueError(f"Unknown model type: {args.model}")
-
-
-if __name__ == '__main__':
-
-    torch.manual_seed(8)
-
-    loss = MarginRankingLossWithTies(margin=1)
-    input1 = torch.randn(3, requires_grad=True)
-    print(input1)
-    input2 = torch.randn(3, requires_grad=True)
-    print(input2)
-    print(input1 - input2)
-    output = loss(input1, input2)
-    output.backward()
-
-    print(output)
+    raise ValueError(f"Unknown model type: {model!r}")
