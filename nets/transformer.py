@@ -35,6 +35,11 @@ def _to_cls_feats(feats: torch.Tensor) -> torch.Tensor:
 
     Accepts either ``[B, C]`` or ``[B, T, C]`` tensors (CLS at index 0). Some
     backbones return dictionaries; in that case common keys are inspected.
+
+    Returns
+    -------
+    torch.Tensor
+        The CLS embedding with shape ``[B, C]``.
     """
 
     if isinstance(feats, dict):
@@ -52,7 +57,13 @@ def _to_cls_feats(feats: torch.Tensor) -> torch.Tensor:
 
 
 def _count_trainable(parameters) -> Tuple[int, int]:
-    """Return (total_params, trainable_params)."""
+    """Return a tuple with parameter counts.
+
+    Returns
+    -------
+    (int, int)
+        ``(total_params, trainable_params)``, useful for logging model size.
+    """
 
     total = sum(p.numel() for p in parameters)
     trainable = sum(p.numel() for p in parameters if p.requires_grad)
@@ -163,6 +174,7 @@ class Transformer(nn.Module):
     # Backbone management
     # ------------------------------------------------------------------
     def _freeze_backbone(self) -> None:
+        """Freeze all backbone parameters (feature extractor mode)."""
         for param in self.backbone.parameters():
             param.requires_grad = False
 
@@ -197,6 +209,7 @@ class Transformer(nn.Module):
     # Attention capture
     # ------------------------------------------------------------------
     def _register_attn_capture(self) -> None:
+        """Attach hooks to every transformer block to capture raw attention."""
         vt = self.backbone
         if not hasattr(vt, "blocks") or len(vt.blocks) == 0:
             return
@@ -212,6 +225,7 @@ class Transformer(nn.Module):
                     qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
                     q, k, _v = qkv[0], qkv[1], qkv[2]
 
+                    # Raw attention weights [B, H, T, T]
                     attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                     attn = attn.softmax(dim=-1)  # [B, H, T, T]
 
@@ -232,6 +246,7 @@ class Transformer(nn.Module):
                 hook_block(attn_module)
 
     def _reset_attention_cache(self) -> None:
+        """Clear cached attentions before each forward branch."""
         self._attn_stack = []
         self._last_attn = None
 
@@ -257,6 +272,7 @@ class Transformer(nn.Module):
         return self._tokens_to_map(cls_to_patches, batch_size, device, dtype)
 
     def _tokens_to_map(self, cls_to_patches: torch.Tensor, batch_size: int, device, dtype) -> torch.Tensor:
+        """Convert CLS-to-patch weights to a normalized 14x14 map."""
         num_patches = cls_to_patches.size(1)
         grid = int(math.sqrt(num_patches))
         if grid * grid == num_patches:
@@ -272,7 +288,13 @@ class Transformer(nn.Module):
         return attn_map.squeeze(1)
 
     def _cls_attention_map(self, batch_size: int, device, dtype) -> torch.Tensor:
-        """Return a [B,14,14] attention map (uniform fallback)."""
+        """Return a [B,14,14] attention map (uniform fallback).
+
+        Respects ``attention_mode``:
+        - ``rollout`` uses all captured layers.
+        - ``last`` uses the most recent layer.
+        - ``topk`` sparsifies the last layer before mapping.
+        """
 
         if self.attention_mode == "rollout":
             return self._rollout_attention(batch_size, device, dtype)
@@ -297,6 +319,13 @@ class Transformer(nn.Module):
     # Branch + fusion
     # ------------------------------------------------------------------
     def _forward_branch(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Forward pass for a single branch.
+
+        Returns
+        -------
+        (torch.Tensor, torch.Tensor, Optional[torch.Tensor])
+            Tuple of (CLS features, ranking score [B,1], optional attention map [B,14,14]).
+        """
         self._reset_attention_cache()
 
         if hasattr(self.backbone, "forward_features"):
