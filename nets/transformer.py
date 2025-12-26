@@ -35,11 +35,6 @@ def _to_cls_feats(feats: torch.Tensor) -> torch.Tensor:
 
     Accepts either ``[B, C]`` or ``[B, T, C]`` tensors (CLS at index 0). Some
     backbones return dictionaries; in that case common keys are inspected.
-
-    Returns
-    -------
-    torch.Tensor
-        The CLS embedding with shape ``[B, C]``.
     """
 
     if isinstance(feats, dict):
@@ -57,13 +52,7 @@ def _to_cls_feats(feats: torch.Tensor) -> torch.Tensor:
 
 
 def _count_trainable(parameters) -> Tuple[int, int]:
-    """Return a tuple with parameter counts.
-
-    Returns
-    -------
-    (int, int)
-        ``(total_params, trainable_params)``, useful for logging model size.
-    """
+    """Return (total_params, trainable_params)."""
 
     total = sum(p.numel() for p in parameters)
     trainable = sum(p.numel() for p in parameters if p.requires_grad)
@@ -167,14 +156,13 @@ class Transformer(nn.Module):
         if use_attn_hook:
             self._register_attn_capture()
 
-        total, trainable = _count_trainable(self.parameters())
-        print(f"[Transformer] params total={total:,} trainable={trainable:,}")
+        #total, trainable = _count_trainable(self.parameters())
+        #print(f"[Transformer] params total={total:,} trainable={trainable:,}")
 
     # ------------------------------------------------------------------
     # Backbone management
     # ------------------------------------------------------------------
     def _freeze_backbone(self) -> None:
-        """Freeze all backbone parameters (feature extractor mode)."""
         for param in self.backbone.parameters():
             param.requires_grad = False
 
@@ -206,10 +194,54 @@ class Transformer(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Attention capture
+    # Attention capture (ViT self-attention → patch-level spatial maps)
     # ------------------------------------------------------------------
+    #
+    # Goal
+    # ----
+    # When gaze supervision is enabled, we need a spatial "attention map" from the
+    # transformer that can be compared to eye-tracker heatmaps (e.g., via KL).
+    #
+    # ViT operates on tokens, not pixels:
+    #   - Token 0 is the CLS token (global summary)
+    #   - Tokens 1..N are patch tokens (spatial grid)
+    #
+    # We capture raw self-attention matrices A ∈ R^{B×H×T×T} from attention layers,
+    # then derive a CLS→patch distribution and finally reshape it into a [B, 14, 14]
+    # map to match the gaze-map resolution used elsewhere in this project.
+    #
+    # What is stored
+    # --------------
+    # self._attn_stack : list (per forward pass) of attention tensors from each block
+    #                   each entry is either:
+    #                       - torch.Tensor [B, H, T, T]  (capture succeeded)
+    #                       - None                       (capture failed; placeholder)
+    # self._last_attn  : attention tensor from the last successfully captured block
+    #
+    # Gradient policy
+    # ---------------
+    # To avoid retaining large graphs unnecessarily:
+    #   - If (self.training and self.attn_grad): store attention WITH gradients
+    #   - Otherwise: store attention detached (no gradients)
+    #
+    # Important note
+    # --------------
+    # Many ViT implementations do not return attention weights. We therefore
+    # re-compute attention from Q and K as:
+    #     attn = softmax( (Q K^T) / sqrt(d_head) )
+    #
+    # This is *observational* instrumentation; the original forward behavior is preserved.
+    #
     def _register_attn_capture(self) -> None:
-        """Attach hooks to every transformer block to capture raw attention."""
+        """
+        Register attention capture hooks on all transformer blocks.
+
+        This monkey-patches each block's attention module `forward` method so that,
+        at runtime, we compute and cache the attention weights.
+
+        Expected backbone structure:
+            backbone.blocks[i].attn.qkv exists and behaves like standard ViT/DeiT.
+        """
         vt = self.backbone
         if not hasattr(vt, "blocks") or len(vt.blocks) == 0:
             return
@@ -218,97 +250,192 @@ class Transformer(nn.Module):
             original_forward = attn_module.forward
 
             def forward_with_capture(x, *args, **kwargs):
+                """
+                Wrapped attention forward.
+
+                Args:
+                    x: token embeddings entering attention, shape [B, T, D]
+                       B = batch size
+                       T = number of tokens (1 CLS + N patches)
+                       D = embedding dimension
+
+                Side effects:
+                    - Appends attention tensor [B, H, T, T] to self._attn_stack
+                    - Updates self._last_attn with the most recent captured tensor
+                """
                 try:
-                    batch, tokens, dim = x.shape
-                    qkv = attn_module.qkv(x)  # (B, T, 3*D)
-                    qkv = qkv.reshape(batch, tokens, 3, attn_module.num_heads, dim // attn_module.num_heads)
-                    qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
+                    B, T, D = x.shape
+                    H = attn_module.num_heads
+                    d_head = D // H
+
+                    # 1) Compute Q, K, V in the same format as ViT internals.
+                    #    qkv: [B, T, 3*D]
+                    qkv = attn_module.qkv(x)
+
+                    # 2) Reshape and split:
+                    #    -> [B, T, 3, H, d_head] -> [3, B, H, T, d_head]
+                    qkv = qkv.reshape(B, T, 3, H, d_head).permute(2, 0, 3, 1, 4)
                     q, k, _v = qkv[0], qkv[1], qkv[2]
 
-                    # Raw attention weights [B, H, T, T]
+                    # 3) Scaled dot-product attention:
+                    #    attn: [B, H, T, T]
                     attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                    attn = attn.softmax(dim=-1)  # [B, H, T, T]
+                    attn = attn.softmax(dim=-1)
 
+                    # 4) Store with or without gradients depending on training mode.
                     attn_to_store = attn if (self.training and self.attn_grad) else attn.detach()
+
                     self._attn_stack.append(attn_to_store)
-                    self._last_attn = attn_to_store  # convenience for legacy usage
+                    self._last_attn = attn_to_store  # convenience: last-block attention
+
                 except Exception:
-                    self._attn_stack.append(None)  # placeholder to keep depth aligned
+                    # Defensive behavior:
+                    # If a backbone deviates from expected ViT internals (no qkv, etc.),
+                    # keep alignment by inserting a placeholder.
+                    self._attn_stack.append(None)
                     self._last_attn = None
 
+                # Preserve original forward behavior
                 return original_forward(x, *args, **kwargs)
 
+            # Monkey-patch attention forward
             attn_module.forward = forward_with_capture
 
+        # Hook attention modules in all blocks
         for block in vt.blocks:
             attn_module = getattr(block, "attn", None)
             if attn_module is not None:
                 hook_block(attn_module)
 
     def _reset_attention_cache(self) -> None:
-        """Clear cached attentions before each forward branch."""
+        """
+        Clear attention buffers for a new forward pass.
+
+        Called once per branch forward (left image, right image) so attention
+        maps correspond strictly to the current input.
+        """
         self._attn_stack = []
         self._last_attn = None
 
     def _rollout_attention(self, batch_size: int, device, dtype) -> torch.Tensor:
-        """Compute rollout over stacked attentions. Falls back to uniform."""
+        """
+        Compute attention rollout across all captured blocks.
 
+        Rollout (common in ViT interpretability) approximates token influence by
+        multiplying attention matrices across layers, typically after:
+            - averaging heads
+            - adding identity (residual connection)
+            - row-normalizing
+
+        Output:
+            Tensor [B, 14, 14] representing a probability-like CLS→patch map.
+
+        Fallback:
+            If no attention was captured (or capture failed), return uniform maps.
+        """
         if not self._attn_stack:
             return torch.full((batch_size, 14, 14), 1.0 / (14 * 14), device=device, dtype=dtype)
 
-        # Keep only valid tensors, discard failed captures
+        # Keep only valid tensors; placeholders (None) are ignored.
         attns: List[torch.Tensor] = [a for a in self._attn_stack if isinstance(a, torch.Tensor)]
         if not attns:
             return torch.full((batch_size, 14, 14), 1.0 / (14 * 14), device=device, dtype=dtype)
 
-        result = torch.eye(attns[0].size(-1), device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+        # result starts as identity: [B, T, T]
+        T = attns[0].size(-1)
+        result = torch.eye(T, device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+
         for attn in attns:
-            attn_mean = attn.mean(dim=1)  # [B, T, T]
-            attn_aug = attn_mean + torch.eye(attn_mean.size(-1), device=device, dtype=dtype)
+            # Average over heads: [B, T, T]
+            attn_mean = attn.mean(dim=1)
+
+            # Add identity (residual path) and renormalize rows.
+            attn_aug = attn_mean + torch.eye(T, device=device, dtype=dtype)
             attn_aug = attn_aug / attn_aug.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+            # Compose influence across layers: [B, T, T]
             result = result @ attn_aug
 
-        cls_to_patches = result[:, 0, 1:]
+        # Extract CLS→patch tokens:
+        #   CLS token index is 0
+        #   patch tokens start at index 1
+        cls_to_patches = result[:, 0, 1:]  # [B, N_patches]
+
         return self._tokens_to_map(cls_to_patches, batch_size, device, dtype)
 
     def _tokens_to_map(self, cls_to_patches: torch.Tensor, batch_size: int, device, dtype) -> torch.Tensor:
-        """Convert CLS-to-patch weights to a normalized 14x14 map."""
+        """
+        Convert a CLS→patch token distribution into a fixed-resolution spatial map.
+
+        Input:
+            cls_to_patches: [B, N] (N = number of patch tokens)
+
+        Steps:
+            1) Infer patch grid size if N is a perfect square (e.g., 14*14, 16*16).
+            2) Reshape into [B, 1, grid, grid] if possible (else keep as [B, 1, 1, N]).
+            3) Upsample/downsample via bilinear interpolation to [B, 1, 14, 14].
+            4) Normalize so sum over spatial positions = 1 per sample.
+
+        Output:
+            attn_map: [B, 14, 14] probability-like map (sums to 1 per sample)
+        """
         num_patches = cls_to_patches.size(1)
         grid = int(math.sqrt(num_patches))
+
         if grid * grid == num_patches:
+            # Standard ViT case: patch tokens form a square grid.
             attn_map = cls_to_patches.view(batch_size, 1, grid, grid)
         else:
+            # Non-square / unknown token layout; keep a degenerate grid.
             attn_map = cls_to_patches.view(batch_size, 1, 1, num_patches)
+
+        # Resize to the gaze-map resolution expected by your pipeline.
         attn_map = F.interpolate(attn_map, size=(14, 14), mode="bilinear", align_corners=False)
 
-        # Normalize to sum to 1 per sample (probability-like map)
+        # Normalize to sum=1 per sample (probability distribution over 14x14 locations).
         flat = attn_map.view(batch_size, -1)
         flat = flat / flat.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
         attn_map = flat.view(batch_size, 1, 14, 14)
         return attn_map.squeeze(1)
 
     def _cls_attention_map(self, batch_size: int, device, dtype) -> torch.Tensor:
-        """Return a [B,14,14] attention map (uniform fallback).
-
-        Respects ``attention_mode``:
-        - ``rollout`` uses all captured layers.
-        - ``last`` uses the most recent layer.
-        - ``topk`` sparsifies the last layer before mapping.
         """
+        Build a CLS→patch attention map for the current forward pass.
 
+        Modes:
+            - "rollout": compose attentions across all blocks (see _rollout_attention)
+            - otherwise: use *last captured block* attention
+
+        For last-block mode:
+            1) average attention across heads: [B, H, T, T] -> [B, T, T]
+            2) take CLS row: [B, T]
+            3) drop CLS→CLS entry -> CLS→patches: [B, N_patches]
+            4) optional "topk": keep only the strongest k patch weights
+            5) convert tokens to [B, 14, 14] map via _tokens_to_map
+
+        Fallback:
+            If attention is unavailable, return uniform maps.
+        """
         if self.attention_mode == "rollout":
             return self._rollout_attention(batch_size, device, dtype)
 
         if self._last_attn is None or self._last_attn.dim() != 4:
             return torch.full((batch_size, 14, 14), 1.0 / (14 * 14), device=device, dtype=dtype)
 
-        attn = self._last_attn.mean(dim=1)  # [B, T, T]
-        cls_to_all = attn[:, 0]             # [B, T]
-        cls_to_patches = cls_to_all[:, 1:]  # drop CLS->CLS
+        # Average across heads: [B, T, T]
+        attn = self._last_attn.mean(dim=1)
+
+        # CLS attends to all tokens: [B, T]
+        cls_to_all = attn[:, 0]
+
+        # Drop CLS→CLS entry, keep CLS→patch distribution: [B, N_patches]
+        cls_to_patches = cls_to_all[:, 1:]
 
         if self.attention_mode == "topk" and self.topk and self.topk > 0:
-            # Mask all but top-k tokens per sample
-            values, indices = cls_to_patches.topk(k=min(self.topk, cls_to_patches.size(1)), dim=1)
+            # Keep only top-k patch tokens per sample, zero out the rest.
+            k = min(self.topk, cls_to_patches.size(1))
+            values, indices = cls_to_patches.topk(k=k, dim=1)
             mask = torch.zeros_like(cls_to_patches)
             mask.scatter_(1, indices, values)
             cls_to_patches = mask
@@ -319,13 +446,6 @@ class Transformer(nn.Module):
     # Branch + fusion
     # ------------------------------------------------------------------
     def _forward_branch(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass for a single branch.
-
-        Returns
-        -------
-        (torch.Tensor, torch.Tensor, Optional[torch.Tensor])
-            Tuple of (CLS features, ranking score [B,1], optional attention map [B,14,14]).
-        """
         self._reset_attention_cache()
 
         if hasattr(self.backbone, "forward_features"):

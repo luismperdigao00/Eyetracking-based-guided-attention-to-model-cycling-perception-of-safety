@@ -8,9 +8,9 @@ import torchvision.models as models
 import os
 from glob import glob
 import pickle
-import sys
+import sysIg
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_Igtest_split
 import numpy as np
 import wandb
 from data import ComparisonsDataset, CustomTransform, PairwiseAugmentationPipeline
@@ -111,6 +111,21 @@ def arg_parse():
 
     # -------------------- GAZE & CITY FILTERS ----------------
     parser.add_argument("--gaze", default="use", choices=["off", "use", "only"])
+    parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
+    help=(
+        "How to extract transformer attention maps:\n"
+        "  last    : use CLS→patch attention from the last transformer block\n"
+        "  rollout : rollout attention across all blocks (identity-augmented)\n"
+        "  topk    : last-block CLS→patch attention, sparsified to top-k tokens"
+        ),
+    )
+    parser.add_argument("--attn_topk", type=int,default=None,
+    help=(
+        "Number of patch tokens to keep when --attention_mode=topk. "
+        "If None, all tokens are used."
+        ),
+    )
+
     parser.add_argument("--cities", type=str, default="all")
 
     # -------------------- LR & OPTIMIZATION ------------------
@@ -541,7 +556,7 @@ def run_training_with_args(args, trial=None):
     print("Device:", device)
     print("Parsing model...")
 
-    use_gaze_loss = (args.gaze != "off" and args.attn_w > 0)
+    use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
 
     TRANSFORMER_BACKBONES = [
         "deit_base",
@@ -584,9 +599,12 @@ def run_training_with_args(args, trial=None):
             num_ft_blocks=args.num_ft_blocks,
             rank_dropout=args.rank_dropout,
             cross_dropout=args.cross_dropout,
-            use_attn_hook=(args.gaze != "off"),
+            use_attn_hook=use_gaze_loss,
             return_attn=use_gaze_loss,
+            attention_mode=args.attention_mode,
+            topk=args.attn_topk,
         )
+
 
         net.attn_grad = use_gaze_loss
 

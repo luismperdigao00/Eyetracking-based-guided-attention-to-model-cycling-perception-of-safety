@@ -352,7 +352,7 @@ def attention_kl_loss(
 
 def compute_loss(args, network_output_dict: dict, labels: dict) -> Tensor:
     """
-    Compute the training loss used by your pipeline, based on args.model.
+    Compute the training loss.
 
     Supported models (as currently used in your codebase):
       - 'rcnn'   : ranking-only (non-ties + optional ties)
@@ -445,6 +445,9 @@ def compute_loss(args, network_output_dict: dict, labels: dict) -> Tensor:
             ties=bool(getattr(args, "ties", False)),
             criterion_ties=criterion_ties,
         )
+        
+        # combine ranking terms like in the paper:
+        #   L_R = λ_R * L_R̂(non-ties) + λ_1 * L_1(ties)
         loss_rank_combo = float(args.rank_w) * loss_nonties + float(args.ties_w) * loss_ties
 
         # Optional gaze KL
