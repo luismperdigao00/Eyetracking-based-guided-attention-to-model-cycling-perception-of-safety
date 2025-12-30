@@ -767,68 +767,56 @@ PAIRWISE_AUG_PRESETS = {
 }
 
 
-def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay=0.75, base_lr=1e-4):
+def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay=0.8, base_lr=1e-4, backbone_scale=0.1):
     """
     Creates parameter groups for Layer-wise Learning Rate Decay (LLRD).
     
     Args:
-        model: The network (must have .backbone).
-        layer_decay: The geometric decay rate (e.g., 0.8 means prev layer is 80% of current).
-        base_lr: The max LR (applied to the Head and final block).
+        backbone_scale (float): Global multiplier for the backbone. 
+                                If base_lr=5e-4 and scale=0.1, 
+                                Head = 5e-4, Backbone Top = 5e-5.
     """
     parameter_group_names = {}
     parameter_group_vars = {}
 
-    # 1. Inspect the Backbone Structure
-    # DINOv3/ViT usually has model.backbone.blocks
     if hasattr(model, 'backbone') and hasattr(model.backbone, 'blocks'):
         layers = model.backbone.blocks
-        num_layers = len(layers) + 2  # +1 for patch_embed, +1 for final norm
+        num_layers = len(layers) + 2 
     else:
-        # Fallback for CNNs or unknown backbones: just return simple groups
-        print("[LLRD] Backbone not recognized as ViT (no .blocks). Using standard optimizer.")
-        return [
-            {'params': [p for p in model.parameters() if p.requires_grad], 'lr': base_lr, 'weight_decay': weight_decay}
-        ]
+        print("[LLRD] Backbone not recognized as ViT. Using standard optimizer.")
+        return [{'params': [p for p in model.parameters() if p.requires_grad], 'lr': base_lr, 'weight_decay': weight_decay}]
 
-    # 2. Assign Weights to Groups based on Layer ID
-    # Scale scales down geometrically: [..., 1.0, decay, decay^2, ...]
-    # We assign standard "head" params to the highest LR (scale=1.0)
-    
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
             
-        # Default assignment: Head / Classifier -> Max LR
+        # 1. Default: Head gets Maximum LR (Scale = 1.0)
         group_name = "head"
         scale = 1.0 
 
-        # Check if parameter belongs to backbone
+        # 2. Backbone Logic
         if "backbone" in name:
+            # Apply the global backbone reduction (e.g., 0.1)
+            # This ensures Head >> Backbone Top
+            base_scale = backbone_scale 
+            
             if "patch_embed" in name or "cls_token" in name or "pos_embed" in name:
-                # Input Layer (Lowest LR)
                 group_name = "layer_0"
-                scale = layer_decay ** (num_layers)
+                scale = base_scale * (layer_decay ** num_layers)
             elif "blocks" in name:
-                # Transformer Blocks (0 to N)
-                # Parse "blocks.5.attn..." to get layer index 5
                 try:
-                    # name format: backbone.blocks.5.weight
                     parts = name.split(".")
                     block_idx = int(parts[parts.index("blocks") + 1])
-                    # Layer N is closest to head (High LR). Layer 0 is furthest (Low LR).
-                    # Distance from end = (num_layers - 1) - block_idx
                     dist = (len(layers) - 1) - block_idx
-                    scale = layer_decay ** (dist + 1)
+                    # Apply LLRD on top of the base_scale
+                    scale = base_scale * (layer_decay ** (dist + 1))
                     group_name = f"layer_{block_idx + 1}"
                 except (ValueError, IndexError):
-                    scale = layer_decay ** (num_layers // 2) # Fallback
+                    scale = base_scale * (layer_decay ** (num_layers // 2))
             elif "norm" in name:
-                # Final backbone norm -> close to head
                 group_name = "backbone_norm"
-                scale = layer_decay ** 0.5 # Slightly less than head
+                scale = base_scale * (layer_decay ** 0.5)
             
-        # Create group if not exists
         if group_name not in parameter_group_vars:
             parameter_group_vars[group_name] = {
                 "weight_decay": 0.0 if (name in skip_list or "bias" in name or "norm" in name) else weight_decay,
@@ -838,7 +826,6 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay=0.7
         
         parameter_group_vars[group_name]["params"].append(param)
 
-    # 3. Format for Torch Optimizer
     param_groups = []
     for name, config in parameter_group_vars.items():
         scaled_lr = base_lr * config["lr_scale"]
@@ -847,6 +834,6 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay=0.7
             "weight_decay": config["weight_decay"],
             "lr": scaled_lr
         })
-        # print(f"  LLRD Group '{name}': LR={scaled_lr:.2e} (scale={config['lr_scale']:.4f}) | {len(config['params'])} params")
+        # print(f"  LLRD Group '{name}': LR={scaled_lr:.2e} | Params: {len(config['params'])}")
     
     return param_groups

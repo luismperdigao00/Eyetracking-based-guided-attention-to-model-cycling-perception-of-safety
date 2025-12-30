@@ -218,32 +218,18 @@ def _split_parameters(net: torch.nn.Module) -> Tuple[List[Tuple[str, torch.nn.Pa
     return head_params, backbone_params
 
 
-def _separate_decay(params: Iterable[Tuple[str, torch.nn.Parameter]]) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+def _separate_decay(params):
     """
-    Separate parameters into two subgroups:
-      - decay     : parameters that should receive weight decay (L2 regularization)
-      - no_decay  : parameters that should NOT receive weight decay
-
-    Why:
-      - For AdamW, best practice is to apply weight decay to "weights" (e.g., Linear/Conv kernels)
-        but NOT to:
-          * biases
-          * normalization parameters (LayerNorm/BatchNorm/etc.)
-          * 1D parameters (often bias or norm scale/shift)
-
-    Rules used:
-      - param.ndim == 1                  -> no_decay  (bias-like or norm-like vectors)
-      - name endswith(".bias")           -> no_decay
-      - "norm" in name.lower()           -> no_decay  (LayerNorm/BatchNorm/etc.)
-      - "ln"   in name.lower()           -> no_decay  (common abbreviation for LayerNorm)
-
-    Result:
-      - Returns two lists of tensors (not (name, tensor) pairs) ready to be placed into optimizer param_groups.
+    Helper to split parameters into 'decay' (weights) and 'no_decay' (biases, layernorm).
+    Used for AdamW to correctly apply weight decay only where appropriate.
     """
-    decay, no_decay = [], []
+    decay = []
+    no_decay = []
     for name, param in params:
-        # Exclude biases and normalization parameters from weight decay.
-        if param.ndim == 1 or name.endswith(".bias") or "norm" in name.lower() or "ln" in name.lower():
+        if not param.requires_grad:
+            continue
+        # Biases and LayerNorms/BatchNorms should NOT have weight decay
+        if "bias" in name or "norm" in name or "len_sig" in name:
             no_decay.append(param)
         else:
             decay.append(param)
@@ -253,34 +239,12 @@ def _separate_decay(params: Iterable[Tuple[str, torch.nn.Parameter]]) -> Tuple[L
 def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_params: list, backbone_params: list):
     """
     Constructs the optimizer with the correct training policy (LLRD, Weight Decay, etc.).
-
-    Data Science Context:
-    ---------------------
-    1. **Optimization Strategy**:
-       - **Transformers (ViT/DINO)**: work best with `AdamW`. They require 'Weight Decay' to 
-         prevent overfitting because they have huge capacity.
-       - **CNNs (VGG/ResNet)**: traditionally use `SGD` or `Adam`. We use `Adam` here for stability.
-
-    2. **Finetuning Policies**:
-       - **Frozen Backbone**: We only update the 'Head' (the classifier/ranker). The backbone is 
-         locked (requires_grad=False) to preserve pre-trained features.
-       - **Finetuning (Standard)**: We update everything. Usually, the backbone needs a smaller LR 
-         than the head to avoid destroying pre-trained knowledge (`backbone_lr_scale`).
-       - **Finetuning (LLRD)**: *Advanced.* We decay the LR layer-by-layer. Early layers (edges/textures) 
-         change very little; deep layers (concepts) change a lot. This is SOTA for ViTs.
-
-    Args:
-        args: Argument parser containing hyperparameters (base_lr, weight_decay, etc.).
-        net: The model instance (used for LLRD group extraction).
-        is_transformer: Bool flag to switch between AdamW (ViT) and Adam (CNN).
-        head_params: List of parameters belonging to the classification/ranking heads.
-        backbone_params: List of parameters belonging to the feature extractor.
     """
     base_lr = args.base_lr
     weight_decay = args.weight_decay
 
     # =========================================================================
-    # POLICY A: TRANSFORMERS (ViT, DINO, DeiT, EVA-02)
+    # POLICY A: TRANSFORMERS (ViT, DINO, DeiT, EVA-02, ConvNeXt-as-ViT)
     # =========================================================================
     if is_transformer:
         print(f"[Optimizer] Mode: Transformer (AdamW)")
@@ -292,11 +256,13 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
             print(f"[Optimizer] Policy: Layer-wise Decay (LLRD) | Base LR: {base_lr:.2e}")
             
             # Use the helper to assign different LRs to every layer
+            # CRITICAL FIX: backbone_scale=0.1 ensures the backbone doesn't "explode"
             optimizer_params = get_parameter_groups(
                 net, 
                 weight_decay=weight_decay, 
-                layer_decay=0.8,   # Standard geometric decay for DINO/ViT
-                base_lr=base_lr
+                layer_decay=0.8,    # Standard geometric decay for DINO/ViT
+                base_lr=base_lr,
+                backbone_scale=0.1  # <--- THE GOLDEN RATIO (Head=5e-4, Backbone=5e-5)
             )
             
             return optim.AdamW(
@@ -309,7 +275,6 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
 
         # 2. Frozen Backbone: Only train the Head
         #    If finetune is False, the backbone params generally have requires_grad=False.
-        #    We still separate 'head_decay' vs 'head_no_decay' for proper regularization.
         else:
             print(f"[Optimizer] Policy: Frozen Backbone (Head Only) | Base LR: {base_lr:.2e}")
             
@@ -326,14 +291,12 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
             )
 
     # =========================================================================
-    # POLICY B: CNNs (VGG, ResNet, etc.)
+    # POLICY B: CNNs (Standard VGG, ResNet, etc.)
     # =========================================================================
     else:
         print(f"[Optimizer] Mode: CNN (Adam)")
 
         # For CNNs, we historically use standard Adam without complex parameter groups.
-        # We also tend to disable weight decay in this specific codebase for CNNs 
-        # (based on your legacy settings), but you could enable it if needed.
         
         if args.finetune:
             print(f"[Optimizer] Policy: Full Finetuning (Uniform LR) | Base LR: {base_lr:.2e}")
@@ -349,7 +312,7 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
             lr=base_lr,
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=0.0, # Often 0 for simple CNN finetuning, can be changed to args.weight_decay
+            weight_decay=0.0, # Often 0 for simple CNN finetuning
         )
 
 
