@@ -1236,9 +1236,31 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # Split parameters into head vs backbone to enable differential learning rates / weight decay.
     head_params, backbone_params = _split_parameters(net_cfg)
     
-    # Construct optimizer using the project’s policy (e.g., AdamW, parameter groups, LR scaling).
-    # NOTE: we pass net_cfg so the optimizer sees the real module parameters/names.
-    optimizer = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
+    # -------------------------------------------------------------------------
+    # OPTIMIZER CONSTRUCTION (Modified for LLRD)
+    # -------------------------------------------------------------------------
+    # If finetuning a Transformer, use Layer-wise Learning Rate Decay (LLRD).
+    if is_transformer and args.finetune:
+        print(f"[Optimizer] Using Layer-wise Learning Rate Decay (LLRD) | Base LR: {args.base_lr}")
+        # LLRD groups (Lower LR for early layers, Base LR for head)
+        optimizer_params = get_parameter_groups(
+            net_cfg, 
+            weight_decay=args.weight_decay, 
+            layer_decay=0.8,   # Standard decay rate for ViTs
+            base_lr=args.base_lr
+        )
+        # We use AdamW directly with the grouped parameters
+        optimizer = optim.AdamW(
+            optimizer_params, 
+            lr=args.base_lr, 
+            weight_decay=args.weight_decay
+        )
+    else:
+        # Fallback: Standard logic for Frozen models or CNNs
+        # (Uses args.backbone_lr_scale if finetuning is on but not LLRD)
+        optimizer = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
+
+    # -------------------------------------------------------------------------
 
     scheduler, scheduler_type = _build_scheduler(
         args, optimizer, accum_steps, len(dataloader), args.base_lr

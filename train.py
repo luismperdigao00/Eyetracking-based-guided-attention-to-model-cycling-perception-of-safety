@@ -170,12 +170,26 @@ def arg_parse():
     # -------------------- MODEL SETTINGS ---------------------
     parser.add_argument("--model", type=str, default="rcnn",
                         choices=["rsscnn", "sscnn", "rcnn"])
+    # -------------------- MODEL SETTINGS ---------------------
+    parser.add_argument("--model", type=str, default="rcnn",
+                        choices=["rsscnn", "sscnn", "rcnn"])
+    
     parser.add_argument("--backbone", type=str,
                         default="vit_base_dino",
                         choices=[
+                            # Legacy / CNNs
                             "alex", "vgg", "dense", "resnet",
                             "deit_base", "deit_small", "deit_base_distilled", "deit_tiny",
-                            "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small", "vit_base_dinov3",
+                            "vit_base_dino", "vit_small", 
+                            "vit_dinov2_base", 
+                            
+                            # --- The New High-Performance Models ---
+                            "vit_base_dinov3",   # DINOv3 Base
+                            "vit_large_dinov3",  # DINOv3 Large (Stronger but heavier)
+                            "eva02_base",        # EVA-02 (Current SOTA)
+                            "siglip_so400m",     # SigLIP (Language-aligned)
+                            "dinov2_reg_base",   # DINOv2 + Registers
+                            "convnext_base",     # ConvNeXt (Modern VGG)
                         ])
 
     # === POOLING ARGUMENTS ===
@@ -480,14 +494,18 @@ def run_training_with_args(args, trial=None):
     # ----------------------------------------------------------------------------------------------- #
     # 4.0) Determine resolution based on backbone (Dynamic Resize)
     # ----------------------------------------------------------------------------------------------- #
-    # DINOv3 (ViT-B) is pre-trained at 256x256. 
-    # Standard models (DeiT, DINOv1/v2, VGG, ResNet) typically use 224x224.
-    if args.backbone == "vit_base_dinov3":
+    if "eva02" in args.backbone:
+        # EVA-02 is huge. 448 is best.
+        target_crop = 448
+        resize_dim = 448 
+    elif "dinov3" in args.backbone:
+        # DINOv3 (Base/Large) native is 256
         target_crop = 256
-        resize_dim = 256  # Resize to 256, then crop 256 (effectively takes the whole center square)
+        resize_dim = 256
     else:
+        # Standard ImageNet default
         target_crop = 224
-        resize_dim = 256  # Standard ImageNet practice: resize to 256, then center crop 224
+        resize_dim = 256
 
     print(f"Transform config -> Resize: {resize_dim}, Crop: {target_crop} (Backbone: {args.backbone})")
 
@@ -610,7 +628,7 @@ def run_training_with_args(args, trial=None):
             device = torch.device(f"cuda:{args.cuda_id}")
     else:
         device = torch.device("cpu")
-
+    print('Device:', device)
     use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
 
     TRANSFORMER_BACKBONES = [
@@ -620,9 +638,13 @@ def run_training_with_args(args, trial=None):
         "deit_base_distilled",
         "vit_base_dino",
         "vit_dinov2_base",
-        "eva02_base",
+        "eva02_base",       
         "vit_small",
         "vit_base_dinov3",
+        "vit_large_dinov3",  
+        "siglip_so400m",    
+        "dinov2_reg_base",   
+        "convnext_base",     
     ]
 
     CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]

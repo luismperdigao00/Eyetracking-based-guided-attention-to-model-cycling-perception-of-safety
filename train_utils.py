@@ -237,83 +237,88 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
 def build_transformer_backbone(name: str):
     """
     Build a transformer-style backbone.
-
-    - DeiT models come from: torch.hub.load('facebookresearch/deit:main', ...)
-    - DINO: torch.hub.load('facebookresearch/dino:main', ...)
-    - Other ViT backbones: timm.create_model(...)
     """
-
     # --------------------------
-    # DeiT models from torch.hub
+    # 1. EVA-02 (The "Giant Slayer")
     # --------------------------
-    if name == "deit_base":
-        return torch.hub.load(
-            "facebookresearch/deit:main",
-            "deit_base_patch16_224",
+    # Requires 448x448 for best results. Powerful semantic features.
+    if name == "eva02_base":
+        return timm.create_model(
+            "eva02_base_patch14_448.mim_in22k_ft_in1k",
             pretrained=True,
-        )
-    elif name == "deit_small":
-        return torch.hub.load(
-            "facebookresearch/deit:main",
-            "deit_small_patch16_224",
-            pretrained=True,
-        )
-    elif name == "deit_tiny":
-        return torch.hub.load(
-            "facebookresearch/deit:main",
-            "deit_tiny_patch16_224",
-            pretrained=True,
-        )
-    elif name == "deit_base_distilled":
-        return torch.hub.load(
-            "facebookresearch/deit:main",
-            "deit_base_distilled_patch16_224",
-            pretrained=True,
+            num_classes=0,
+            img_size=448, 
         )
 
     # --------------------------
-    # DINO v1 from torch.hub
+    # 2. SigLIP (The "Language Expert")
     # --------------------------
-    elif name == "vit_base_dino":
-        return torch.hub.load(
-            "facebookresearch/dino:main",
-            "dino_vitb16",
+    # Good for abstract concepts like "safety". 
+    elif name == "siglip_so400m":
+        return timm.create_model(
+            "vit_so400m_patch14_siglip_224",
             pretrained=True,
+            num_classes=0,
         )
 
     # --------------------------
-    # Dinov2, EVA, ViT-S via timm
+    # 3. DINOv2 + Registers (The "Stable DINO")
     # --------------------------
-    elif name == "vit_dinov2_base":
+    # Cleaner attention maps than DINOv1/v3. 
+    # Has 4 register tokens (handled by your new transformer.py).
+    elif name == "dinov2_reg_base":
         return timm.create_model(
             "vit_base_patch14_reg4_dinov2.lvd142m",
             pretrained=True,
             num_classes=0,
-            img_size=224,
+            img_size=224, # Native 518, but 224 works well with RoPE
         )
-    elif name == "eva02_base":
+
+    # --------------------------
+    # 4. ConvNeXt (The "CNN King")
+    # --------------------------
+    # Can be used inside the Transformer wrapper to benefit from "concat" pooling!
+    elif name == "convnext_base":
         return timm.create_model(
-            "eva02_base_patch14_224.mim_in22k",
+            "convnext_base.fb_in22k_ft_in1k",
             pretrained=True,
             num_classes=0,
         )
-    elif name == "vit_small":
-        return timm.create_model(
-            "vit_small_patch16_224",
-            pretrained=True,
-            num_classes=0,
-        )
+
+    # --------------------------
+    # 5. DINOv3 (Base & Large)
+    # --------------------------
     elif name == "vit_base_dinov3":
         return timm.create_model(
-            "vit_base_patch16_dinov3.lvd1689m",  # timm DINOv3 ViT-B model name :contentReference[oaicite:0]{index=0}
+            "vit_base_patch16_dinov3.lvd1689m",
             pretrained=True,
             num_classes=0,
-            img_size=256,  # official DINOv3 ViT-B uses 256×256 inputs :contentReference[oaicite:1]{index=1}
+            img_size=256,
+        )
+    elif name == "vit_large_dinov3":
+        return timm.create_model(
+            "vit_large_patch16_dinov3.lvd1689m",
+            pretrained=True,
+            num_classes=0,
+            img_size=256,
         )
 
+    # --------------------------
+    # Legacy / Other
+    # --------------------------
+    elif name == "vit_base_dino": # DINOv1
+        return torch.hub.load("facebookresearch/dino:main", "dino_vitb16", pretrained=True)
+    elif name == "deit_base":
+        return torch.hub.load("facebookresearch/deit:main", "deit_base_patch16_224", pretrained=True)
+    elif name == "deit_small":
+        return torch.hub.load("facebookresearch/deit:main", "deit_small_patch16_224", pretrained=True)
+    elif name == "deit_tiny":
+        return torch.hub.load("facebookresearch/deit:main", "deit_tiny_patch16_224", pretrained=True)
+    elif name == "deit_base_distilled":
+        return torch.hub.load("facebookresearch/deit:main", "deit_base_distilled_patch16_224", pretrained=True)
+    
     else:
         raise ValueError(f"Unknown transformer backbone: {name}")
-
 # =================================================================================================
 # Class weights
 # =================================================================================================
@@ -755,3 +760,88 @@ PAIRWISE_AUG_PRESETS = {
         erase_value=0.0,
     ),
 }
+
+
+def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay=0.75, base_lr=1e-4):
+    """
+    Creates parameter groups for Layer-wise Learning Rate Decay (LLRD).
+    
+    Args:
+        model: The network (must have .backbone).
+        layer_decay: The geometric decay rate (e.g., 0.8 means prev layer is 80% of current).
+        base_lr: The max LR (applied to the Head and final block).
+    """
+    parameter_group_names = {}
+    parameter_group_vars = {}
+
+    # 1. Inspect the Backbone Structure
+    # DINOv3/ViT usually has model.backbone.blocks
+    if hasattr(model, 'backbone') and hasattr(model.backbone, 'blocks'):
+        layers = model.backbone.blocks
+        num_layers = len(layers) + 2  # +1 for patch_embed, +1 for final norm
+    else:
+        # Fallback for CNNs or unknown backbones: just return simple groups
+        print("[LLRD] Backbone not recognized as ViT (no .blocks). Using standard optimizer.")
+        return [
+            {'params': [p for p in model.parameters() if p.requires_grad], 'lr': base_lr, 'weight_decay': weight_decay}
+        ]
+
+    # 2. Assign Weights to Groups based on Layer ID
+    # Scale scales down geometrically: [..., 1.0, decay, decay^2, ...]
+    # We assign standard "head" params to the highest LR (scale=1.0)
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        # Default assignment: Head / Classifier -> Max LR
+        group_name = "head"
+        scale = 1.0 
+
+        # Check if parameter belongs to backbone
+        if "backbone" in name:
+            if "patch_embed" in name or "cls_token" in name or "pos_embed" in name:
+                # Input Layer (Lowest LR)
+                group_name = "layer_0"
+                scale = layer_decay ** (num_layers)
+            elif "blocks" in name:
+                # Transformer Blocks (0 to N)
+                # Parse "blocks.5.attn..." to get layer index 5
+                try:
+                    # name format: backbone.blocks.5.weight
+                    parts = name.split(".")
+                    block_idx = int(parts[parts.index("blocks") + 1])
+                    # Layer N is closest to head (High LR). Layer 0 is furthest (Low LR).
+                    # Distance from end = (num_layers - 1) - block_idx
+                    dist = (len(layers) - 1) - block_idx
+                    scale = layer_decay ** (dist + 1)
+                    group_name = f"layer_{block_idx + 1}"
+                except (ValueError, IndexError):
+                    scale = layer_decay ** (num_layers // 2) # Fallback
+            elif "norm" in name:
+                # Final backbone norm -> close to head
+                group_name = "backbone_norm"
+                scale = layer_decay ** 0.5 # Slightly less than head
+            
+        # Create group if not exists
+        if group_name not in parameter_group_vars:
+            parameter_group_vars[group_name] = {
+                "weight_decay": 0.0 if (name in skip_list or "bias" in name or "norm" in name) else weight_decay,
+                "params": [],
+                "lr_scale": scale
+            }
+        
+        parameter_group_vars[group_name]["params"].append(param)
+
+    # 3. Format for Torch Optimizer
+    param_groups = []
+    for name, config in parameter_group_vars.items():
+        scaled_lr = base_lr * config["lr_scale"]
+        param_groups.append({
+            "params": config["params"],
+            "weight_decay": config["weight_decay"],
+            "lr": scaled_lr
+        })
+        # print(f"  LLRD Group '{name}': LR={scaled_lr:.2e} (scale={config['lr_scale']:.4f}) | {len(config['params'])} params")
+    
+    return param_groups
