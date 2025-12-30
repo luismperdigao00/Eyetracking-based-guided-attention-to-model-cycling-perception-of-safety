@@ -150,7 +150,7 @@ def arg_parse():
 
     # -------------------- LR & OPTIMIZATION ------------------
     parser.add_argument("--base_lr", type=float, default=5e-6)
-    parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
+    #parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--k", type=int, default=1, help="gradient accumulation steps")
     parser.add_argument("--rank_dropout", type=float, default=0.3)
@@ -170,28 +170,17 @@ def arg_parse():
     # -------------------- MODEL SETTINGS ---------------------
     parser.add_argument("--model", type=str, default="rcnn",
                         choices=["rsscnn", "sscnn", "rcnn"])
-    # -------------------- MODEL SETTINGS ---------------------
-    parser.add_argument("--model", type=str, default="rcnn",
-                        choices=["rsscnn", "sscnn", "rcnn"])
     
-    parser.add_argument("--backbone", type=str,
-                        default="vit_base_dino",
-                        choices=[
-                            # Legacy / CNNs
-                            "alex", "vgg", "dense", "resnet",
-                            "deit_base", "deit_small", "deit_base_distilled", "deit_tiny",
-                            "vit_base_dino", "vit_small", 
-                            "vit_dinov2_base", 
-                            
-                            # --- The New High-Performance Models ---
-                            "vit_base_dinov3",   # DINOv3 Base
-                            "vit_large_dinov3",  # DINOv3 Large (Stronger but heavier)
-                            "eva02_base",        # EVA-02 (Current SOTA)
-                            "siglip_so400m",     # SigLIP (Language-aligned)
-                            "dinov2_reg_base",   # DINOv2 + Registers
-                            "convnext_base",     # ConvNeXt (Modern VGG)
-                        ])
-
+    parser.add_argument("--backbone", type=str, default="vit_base_dinov3",
+        choices=[
+            "alex", "vgg", "dense", "resnet",
+            "deit_base", "deit_small", "deit_base_distilled", "deit_tiny",
+            "vit_base_dino", "vit_dinov2_base", "vit_small",
+            # Add ALL new ones:
+            "vit_base_dinov3", "vit_large_dinov3", 
+            "eva02_base", "siglip_so400m", 
+            "dinov2_reg_base", "convnext_base"
+        ])
     # === POOLING ARGUMENTS ===
     parser.add_argument("--pooling", type=str, default="cls",
                         choices=["cls", "mean", "max", "concat", "topk"],
@@ -339,7 +328,7 @@ def initialize_wandb(args):
             "num_ft_blocks": getattr(args, "num_ft_blocks", None),
             "base_lr": args.base_lr,
             "weight_decay": args.weight_decay,
-            "backbone_lr_scale": getattr(args, "backbone_lr_scale", None),
+            #"backbone_lr_scale": getattr(args, "backbone_lr_scale", None),
             "scheduler": args.scheduler,
             "warmup_frac": getattr(args, "warmup_frac", None),
             "eta_min": getattr(args, "eta_min", None),
@@ -495,15 +484,15 @@ def run_training_with_args(args, trial=None):
     # 4.0) Determine resolution based on backbone (Dynamic Resize)
     # ----------------------------------------------------------------------------------------------- #
     if "eva02" in args.backbone:
-        # EVA-02 is huge. 448 is best.
         target_crop = 448
-        resize_dim = 448 
+        resize_dim = 512 
     elif "dinov3" in args.backbone:
-        # DINOv3 (Base/Large) native is 256
         target_crop = 256
+        resize_dim = 292  # Optimized ratio (256/0.875)
+    elif "dinov2" in args.backbone:
+        target_crop = 224
         resize_dim = 256
     else:
-        # Standard ImageNet default
         target_crop = 224
         resize_dim = 256
 
@@ -632,21 +621,12 @@ def run_training_with_args(args, trial=None):
     use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
 
     TRANSFORMER_BACKBONES = [
-        "deit_base",
-        "deit_small",
-        "deit_tiny",
-        "deit_base_distilled",
-        "vit_base_dino",
-        "vit_dinov2_base",
-        "eva02_base",       
-        "vit_small",
-        "vit_base_dinov3",
-        "vit_large_dinov3",  
-        "siglip_so400m",    
-        "dinov2_reg_base",   
-        "convnext_base",     
+        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
+        "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small",
+        "vit_base_dinov3", 
+        # Add these so they use the Transformer Wrapper (pooling):
+        "vit_large_dinov3", "siglip_so400m", "dinov2_reg_base", "convnext_base"
     ]
-
     CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
 
     if args.backbone in TRANSFORMER_BACKBONES:

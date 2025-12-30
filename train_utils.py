@@ -205,8 +205,13 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
         if getattr(args, "num_ft_blocks", 1) != 1:
             _warn(warnings, "--finetune is OFF: --num_ft_blocks is ignored.")
     else:
-        if getattr(args, "num_ft_blocks", 1) < 1:
-            _err(errors, f"--num_ft_blocks must be >= 1 when finetuning (got {getattr(args, 'num_ft_blocks', None)}).")
+        # Finetune is ON
+        n_blocks = getattr(args, "num_ft_blocks", 1)
+        
+        if n_blocks == 0:
+            _warn(warnings, "[WARNING] --finetune is ON but --num_ft_blocks=0. The backbone will remain FROZEN (only head trains).")
+        elif n_blocks < 0:
+            _err(errors, f"--num_ft_blocks must be >= 0 (got {n_blocks}).")
 
     # ------------------------------------------------------------------
     # Pooling dependencies (New)

@@ -35,8 +35,7 @@ from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
 from utils.losses import compute_loss
 from utils.log import log
 
-from train_utils import print_run_plan  # add near top with other imports
-
+from train_utils import print_run_plan, get_parameter_groups
 
 class EarlyStopper:
     """Simple epoch-level early stopping helper."""
@@ -251,79 +250,74 @@ def _separate_decay(params: Iterable[Tuple[str, torch.nn.Parameter]]) -> Tuple[L
     return decay, no_decay
 
 
-def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_params, backbone_params):
+def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_params: list, backbone_params: list):
     """
-    Construct the optimizer with the correct parameter groups and training policy.
+    Constructs the optimizer with the correct training policy (LLRD, Weight Decay, etc.).
 
-    Inputs:
-      - args.base_lr            : "head LR" (main LR used for ranking/classification heads)
-      - args.backbone_lr_scale  : multiplier applied to base_lr for backbone finetuning (typically 0.1)
-      - args.weight_decay       : AdamW weight decay used only for "decay" groups
-      - args.finetune           : if False, backbone is frozen (requires_grad=False)
+    Data Science Context:
+    ---------------------
+    1. **Optimization Strategy**:
+       - **Transformers (ViT/DINO)**: work best with `AdamW`. They require 'Weight Decay' to 
+         prevent overfitting because they have huge capacity.
+       - **CNNs (VGG/ResNet)**: traditionally use `SGD` or `Adam`. We use `Adam` here for stability.
 
-    Two regimes:
-      1) Transformer backbone:
-         - Use AdamW (standard for ViTs).
-         - Build param groups to:
-             (a) separate decay vs no_decay
-             (b) optionally use different LRs for backbone vs head when finetuning
+    2. **Finetuning Policies**:
+       - **Frozen Backbone**: We only update the 'Head' (the classifier/ranker). The backbone is 
+         locked (requires_grad=False) to preserve pre-trained features.
+       - **Finetuning (Standard)**: We update everything. Usually, the backbone needs a smaller LR 
+         than the head to avoid destroying pre-trained knowledge (`backbone_lr_scale`).
+       - **Finetuning (LLRD)**: *Advanced.* We decay the LR layer-by-layer. Early layers (edges/textures) 
+         change very little; deep layers (concepts) change a lot. This is SOTA for ViTs.
 
-      2) CNN backbone:
-         - Use Adam (your project policy).
-         - In this implementation, weight_decay is set to 0.0 (so no L2 regularization here),
-           even if args.weight_decay is configured. (This is intentional based on your code.)
-
-    Important detail:
-      - For finetune=False we explicitly freeze backbone params (requires_grad=False).
-        The optimizer then only sees head parameters.
+    Args:
+        args: Argument parser containing hyperparameters (base_lr, weight_decay, etc.).
+        net: The model instance (used for LLRD group extraction).
+        is_transformer: Bool flag to switch between AdamW (ViT) and Adam (CNN).
+        head_params: List of parameters belonging to the classification/ranking heads.
+        backbone_params: List of parameters belonging to the feature extractor.
     """
     base_lr = args.base_lr
     weight_decay = args.weight_decay
 
+    # =========================================================================
+    # POLICY A: TRANSFORMERS (ViT, DINO, DeiT, EVA-02)
+    # =========================================================================
     if is_transformer:
-        print("[Optimizer] Using AdamW with parameter groups (Transformer backbone).")
+        print(f"[Optimizer] Mode: Transformer (AdamW)")
 
-        # ------------------------------------------------------------------
-        # Case A: Backbone is frozen → only train heads at base_lr
-        # ------------------------------------------------------------------
-        if not args.finetune:
-            # Freeze all backbone parameters; they will not receive gradients.
-            for _, param in backbone_params:
-                param.requires_grad = False
-
-            # Split head parameters into decay vs no_decay groups for AdamW.
-            head_decay, head_no_decay = _separate_decay(head_params)
-
-            # AdamW param_groups:
-            #   - decay group uses args.weight_decay
-            #   - no_decay group uses weight_decay = 0.0
-            optimizer = optim.AdamW(
-                [
-                    {"params": head_decay, "lr": base_lr, "weight_decay": weight_decay},
-                    {"params": head_no_decay, "lr": base_lr, "weight_decay": 0.0},
-                ],
-                betas=(0.9, 0.999),
-                eps=1e-8,
+        # 1. Advanced Finetuning: Layer-wise Learning Rate Decay (LLRD)
+        #    We use this ONLY if finetuning is ON. It preserves the "visual cortex" 
+        #    of the model while adapting the high-level concepts.
+        if args.finetune:
+            print(f"[Optimizer] Policy: Layer-wise Decay (LLRD) | Base LR: {base_lr:.2e}")
+            
+            # Use the helper to assign different LRs to every layer
+            optimizer_params = get_parameter_groups(
+                net, 
+                weight_decay=weight_decay, 
+                layer_decay=0.8,   # Standard geometric decay for DINO/ViT
+                base_lr=base_lr
+            )
+            
+            return optim.AdamW(
+                optimizer_params, 
+                lr=base_lr, 
+                weight_decay=weight_decay,
+                betas=(0.9, 0.999), 
+                eps=1e-8
             )
 
-        # ------------------------------------------------------------------
-        # Case B: Finetuning → train backbone + heads, usually with smaller LR on backbone
-        # ------------------------------------------------------------------
+        # 2. Frozen Backbone: Only train the Head
+        #    If finetune is False, the backbone params generally have requires_grad=False.
+        #    We still separate 'head_decay' vs 'head_no_decay' for proper regularization.
         else:
-            # Separate both backbone and head parameters into decay/no_decay sets.
+            print(f"[Optimizer] Policy: Frozen Backbone (Head Only) | Base LR: {base_lr:.2e}")
+            
+            # Helper to stop weight decay on Biases and LayerNorms (Standard Practice)
             head_decay, head_no_decay = _separate_decay(head_params)
-            backbone_decay, backbone_no_decay = _separate_decay(backbone_params)
 
-            # Scale backbone LR down (common finetuning practice for pretrained backbones).
-            backbone_lr = base_lr * args.backbone_lr_scale
-
-            # AdamW param_groups:
-            #   - backbone decay / no_decay at backbone_lr
-            #   - head decay / no_decay at base_lr
-            optimizer = optim.AdamW(
+            return optim.AdamW(
                 [
-                    {"params": backbone_decay, "lr": backbone_lr, "weight_decay": weight_decay},
-                    {"params": backbone_no_decay, "lr": backbone_lr, "weight_decay": 0.0},
                     {"params": head_decay, "lr": base_lr, "weight_decay": weight_decay},
                     {"params": head_no_decay, "lr": base_lr, "weight_decay": 0.0},
                 ],
@@ -331,42 +325,32 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
                 eps=1e-8,
             )
 
+    # =========================================================================
+    # POLICY B: CNNs (VGG, ResNet, etc.)
+    # =========================================================================
     else:
-        print("[Optimizer] Using Adam (CNN backbone).")
+        print(f"[Optimizer] Mode: CNN (Adam)")
 
-        # ------------------------------------------------------------------
-        # Case A: Backbone frozen → optimize only head parameters
-        # ------------------------------------------------------------------
-        if not args.finetune:
-            for _, param in backbone_params:
-                param.requires_grad = False
-
-            # Build a flat list of trainable head parameters (defensive: only those with requires_grad=True).
-            cnn_head_params = [param for (_, param) in head_params if param.requires_grad]
-
-            # Adam optimizer; weight_decay=0.0 by design in this pipeline.
-            optimizer = optim.Adam(
-                cnn_head_params,
-                lr=base_lr,
-                betas=(0.9, 0.999),
-                eps=1e-8,
-                weight_decay=1e-3,
-            )
-
-        # ------------------------------------------------------------------
-        # Case B: Finetune CNN → optimize backbone + heads together
-        # ------------------------------------------------------------------
+        # For CNNs, we historically use standard Adam without complex parameter groups.
+        # We also tend to disable weight decay in this specific codebase for CNNs 
+        # (based on your legacy settings), but you could enable it if needed.
+        
+        if args.finetune:
+            print(f"[Optimizer] Policy: Full Finetuning (Uniform LR) | Base LR: {base_lr:.2e}")
+            # Train everything (Head + Backbone) at the same LR
+            params_to_optimize = [p for p in net.parameters() if p.requires_grad]
         else:
-            cnn_all_params = [param for (_, param) in head_params + backbone_params if param.requires_grad]
-            optimizer = optim.Adam(
-                cnn_all_params,
-                lr=base_lr,
-                betas=(0.9, 0.999),
-                eps=1e-8,
-                weight_decay=0.0,
-            )
+            print(f"[Optimizer] Policy: Frozen Backbone (Head Only) | Base LR: {base_lr:.2e}")
+            # Train only the head
+            params_to_optimize = [p for (_, p) in head_params if p.requires_grad]
 
-    return optimizer
+        return optim.Adam(
+            params_to_optimize,
+            lr=base_lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0, # Often 0 for simple CNN finetuning, can be changed to args.weight_decay
+        )
 
 
 def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, base_lr: float):
@@ -1236,31 +1220,8 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # Split parameters into head vs backbone to enable differential learning rates / weight decay.
     head_params, backbone_params = _split_parameters(net_cfg)
     
-    # -------------------------------------------------------------------------
-    # OPTIMIZER CONSTRUCTION (Modified for LLRD)
-    # -------------------------------------------------------------------------
-    # If finetuning a Transformer, use Layer-wise Learning Rate Decay (LLRD).
-    if is_transformer and args.finetune:
-        print(f"[Optimizer] Using Layer-wise Learning Rate Decay (LLRD) | Base LR: {args.base_lr}")
-        # LLRD groups (Lower LR for early layers, Base LR for head)
-        optimizer_params = get_parameter_groups(
-            net_cfg, 
-            weight_decay=args.weight_decay, 
-            layer_decay=0.8,   # Standard decay rate for ViTs
-            base_lr=args.base_lr
-        )
-        # We use AdamW directly with the grouped parameters
-        optimizer = optim.AdamW(
-            optimizer_params, 
-            lr=args.base_lr, 
-            weight_decay=args.weight_decay
-        )
-    else:
-        # Fallback: Standard logic for Frozen models or CNNs
-        # (Uses args.backbone_lr_scale if finetuning is on but not LLRD)
-        optimizer = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
-
-    # -------------------------------------------------------------------------
+     # Construct optimizer (Logic is now encapsulated in the function)
+    optimizer = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
 
     scheduler, scheduler_type = _build_scheduler(
         args, optimizer, accum_steps, len(dataloader), args.base_lr

@@ -214,7 +214,7 @@ def compute_ranking_loss(
     label: Tensor = -1 * labels["label_r"]
 
     batch_size = int(label.size(0))
-
+    
     # 3) Numerical guards (lightweight debug)
     if torch.isnan(output_left).any() or torch.isnan(output_right).any():
         print("[DEBUG compute_ranking_loss] NaN in ranking outputs!", file=sys.stderr)
@@ -226,14 +226,14 @@ def compute_ranking_loss(
     mask_tie = (label == 0)
     n_nonties = int(mask_nontie.sum().item())
     n_ties = int(mask_tie.sum().item())
-
+    """
     if (n_nonties == 0) or (ties and n_ties == 0):
         print(
             f"[DEBUG compute_ranking_loss] batch_size={batch_size}, "
             f"n_nonties={n_nonties}, n_ties={n_ties}",
             file=sys.stderr,
         )
-
+    """
     # 5) Non-ties loss
     if n_nonties > 0:
         loss_nonties = criterion_ranking(
