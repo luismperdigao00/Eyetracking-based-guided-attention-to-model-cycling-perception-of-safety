@@ -248,9 +248,18 @@ class Transformer(nn.Module):
 
     def _extract_features(self, feats: Union[torch.Tensor, Dict]) -> torch.Tensor:
         """
-        Extracts and pools features, automatically handling both:
-        - ViT/DINO (3D: [Batch, Tokens, Dim])
-        - ConvNeXt/ResNet (4D: [Batch, Channels, Height, Width])
+        Extracts and pools features from the backbone output.
+
+        This function handles the diversity of backbone outputs (raw tensors vs dicts)
+        and applies the selected pooling strategy to convert patch tokens into a
+        global representation.
+
+        Args:
+            feats: Raw output from `backbone.forward_features(x)`. 
+                   Shape is typically [Batch, Tokens, Dim].
+
+        Returns:
+            Pooled feature vector of shape [Batch, self.feat_dim].
         """
         # 1. Standardization: Unwrap dictionary if necessary
         if isinstance(feats, dict):
@@ -259,64 +268,47 @@ class Transformer(nn.Module):
                     feats = feats[key]
                     break
         
-        # ------------------------------------------------------------------
-        # BRIDGE: Handle CNNs (ConvNeXt) inside Transformer Wrapper
-        # ------------------------------------------------------------------
-        # If input is 4D [B, C, H, W], we must flatten it to be "token-like".
-        if feats.dim() == 4:
-            B, C, H, W = feats.shape
-            # Flatten spatial dims: [B, C, H*W] -> Transpose to [B, T, C]
-            # This makes the pixels look like a sequence of tokens.
-            feats = feats.flatten(2).transpose(1, 2)
-            
-            # ConvNeXt does NOT have a [CLS] token at index 0.
-            # We create a "Pseudo-CLS" by averaging the whole map.
-            # This allows 'pooling=concat' to work (Global Avg + Spatial Avg).
-            cls_token = feats.mean(dim=1) 
-            patch_tokens = feats
-            
-            # Skip the standard token separation logic below
-            # because we already separated them manually above.
-            
-        # ------------------------------------------------------------------
-        # STANDARD: Handle ViTs (DINO, DeiT, EVA-02)
-        # ------------------------------------------------------------------
-        else:
-            # feats shape: [B, T, C] where T = num_prefix + num_patches
-            B, T, C = feats.shape
-            num_prefix = self._get_num_prefix_tokens()
-            
-            # The [CLS] token is always at index 0
-            cls_token = feats[:, 0]
-            
-            # The Patch tokens start after all prefix tokens
-            patch_tokens = feats[:, num_prefix:]
+        # 2. Check if already pooled (e.g., standard ResNet or some ViT configurations)
+        # If shape is [B, C], we cannot do patch-based pooling.
+        if feats.dim() == 2:
+            return feats
 
-        # ------------------------------------------------------------------
-        # POOLING STRATEGIES
-        # ------------------------------------------------------------------
+        # 3. Token Separation
+        # feats shape: [B, T, C] where T = num_prefix + num_patches
+        B, T, C = feats.shape
+        num_prefix = self._get_num_prefix_tokens()
+        
+        # The [CLS] token is always at index 0
+        cls_token = feats[:, 0]
+        
+        # The Patch tokens start after all prefix tokens (skipping registers if any)
+        patch_tokens = feats[:, num_prefix:] # Shape: [B, N_patches, C]
+
+        # 4. Pooling Strategy Implementation
         if self.pooling == "cls":
-            # Classic BERT/ViT strategy
+            # Classic BERT/ViT strategy: Use the learned classification token.
             return cls_token
         
         elif self.pooling == "mean":
-            # Global Average Pooling
+            # Global Average Pooling (GAP): Robust for frozen backbones.
+            # Averages all spatial information.
             return patch_tokens.mean(dim=1)
         
         elif self.pooling == "max":
-            # Max Pooling
+            # Max Pooling: Captures the most salient feature (e.g., specific hazard).
             return patch_tokens.max(dim=1)[0]
         
         elif self.pooling == "concat":
             # Hybrid: Combines global semantics (CLS) with spatial average (Mean).
-            # For ConvNeXt, this combines "Global Mean" with "Global Mean", 
-            # effectively doubling the vector size (safe redundancy).
-            # For DINO, this combines "Learned CLS" with "Spatial Mean" (Strongest).
+            # Result dim: 2 * C
             mean_pool = patch_tokens.mean(dim=1)
             return torch.cat([cls_token, mean_pool], dim=-1)
         
         elif self.pooling == "topk":
-            # Compute L2 norm per patch
+            # Sparse Average: Averages only the K patches with highest activation magnitude.
+            # Useful to ignore "boring" background patches (sky, road surface).
+            
+            # Compute L2 norm per patch: [B, N_patches]
             patch_norms = patch_tokens.norm(dim=-1)
             
             # Find indices of top-k patches
@@ -324,12 +316,14 @@ class Transformer(nn.Module):
             _, top_indices = patch_norms.topk(k, dim=1) # [B, k]
             
             # Gather selected tokens
-            top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, patch_tokens.size(-1))
+            # Expand indices to [B, k, C] for gathering
+            top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, C)
             selected_patches = torch.gather(patch_tokens, 1, top_indices_expanded)
             
             return selected_patches.mean(dim=1)
 
         raise ValueError(f"Unknown pooling mode: {self.pooling}")
+
     # ==============================================================================
     # Gaze Alignment: Attention Capture Hooks
     # ==============================================================================
