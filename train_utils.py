@@ -209,6 +209,14 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
             _err(errors, f"--num_ft_blocks must be >= 1 when finetuning (got {getattr(args, 'num_ft_blocks', None)}).")
 
     # ------------------------------------------------------------------
+    # Pooling dependencies (New)
+    # ------------------------------------------------------------------
+    pooling = getattr(args, "pooling", "cls")
+    if pooling == "topk":
+        if getattr(args, "pool_k", 1) < 1:
+            _err(errors, f"--pool_k must be >= 1 (got {getattr(args, 'pool_k', None)}).")
+            
+    # ------------------------------------------------------------------
     # Emit + optionally fail
     # ------------------------------------------------------------------
     if verbose:
@@ -529,8 +537,21 @@ def print_run_plan(
     print("\n[Task]")
     print(f"  model        : {args.model}")
     print(f"  backbone     : {args.backbone}")
+    
+    # --- NEW: Feature Pooling Info ---
+    print(f"  pooling      : {getattr(args, 'pooling', 'cls')}")
+    if getattr(args, 'pooling', 'cls') == 'topk':
+        print(f"  pool_k       : {getattr(args, 'pool_k', 10)}")
+
     print(f"  ties         : {args.ties}")
+    
+    # --- NEW: Attention/Gaze Info ---
     print(f"  gaze         : {args.gaze}")
+    if args.gaze != "off":
+        print(f"  attn_mode    : {getattr(args, 'attention_mode', 'last')}")
+        if getattr(args, 'attention_mode', 'last') == 'topk':
+            print(f"  attn_topk    : {getattr(args, 'attn_topk', 'all')}")
+
     print(f"  augment      : {args.augment}")
     print(f"  finetune     : {args.finetune}")
     if args.finetune:

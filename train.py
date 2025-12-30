@@ -178,6 +178,14 @@ def arg_parse():
                             "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small", "vit_base_dinov3",
                         ])
 
+    # === POOLING ARGUMENTS ===
+    parser.add_argument("--pooling", type=str, default="cls",
+                        choices=["cls", "mean", "max", "concat", "topk"],
+                        help="Feature pooling strategy (transformers only): cls | mean | max | concat | topk")
+    
+    parser.add_argument("--pool_k", type=int, default=10,
+                        help="Number of patches to keep when using --pooling topk")
+
     # -------------------- LOSSES ------------------------------
     parser.add_argument("--rank_w", type=float, default=1.0)
     parser.add_argument("--ties_w", type=float, default=1.0)
@@ -641,6 +649,8 @@ def run_training_with_args(args, trial=None):
         net = Net(
             backbone=backbone_model,
             model=args.model,
+            pooling=getattr(args, "pooling", "cls"),
+            pool_k=getattr(args, "pool_k", 10),
             num_classes=3 if args.ties else 2,
             finetune=args.finetune,
             num_ft_blocks=args.num_ft_blocks,
@@ -649,9 +659,8 @@ def run_training_with_args(args, trial=None):
             use_attn_hook=use_gaze_loss,
             return_attn=use_gaze_loss,
             attention_mode=args.attention_mode,
-            topk=args.attn_topk,
+            attn_topk=args.attn_topk,
         )
-
 
         net.attn_grad = use_gaze_loss
 
