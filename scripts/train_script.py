@@ -253,25 +253,29 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
         #    We use this ONLY if finetuning is ON. It preserves the "visual cortex" 
         #    of the model while adapting the high-level concepts.
         if args.finetune:
-            print(f"[Optimizer] Policy: Layer-wise Decay (LLRD) | Base LR: {base_lr:.2e}")
-            
-            # Use the helper to assign different LRs to every layer
-            # CRITICAL FIX: backbone_scale=0.1 ensures the backbone doesn't "explode"
+            # AUTO policy:
+            # - head_only / partial finetune => two-tier LR (stable)
+            # - full finetune               => real LLRD
+            layer_decay = float(getattr(args, "layer_decay", 0.9))
+            backbone_scale = float(getattr(args, "backbone_scale", 0.1))
+            partial_max_blocks = int(getattr(args, "partial_max_blocks", 4))
+        
             optimizer_params = get_parameter_groups(
-                net, 
-                weight_decay=weight_decay, 
-                layer_decay=0.8,    # Standard geometric decay for DINO/ViT
+                net,
                 base_lr=base_lr,
-                backbone_scale=0.1  # <--- THE GOLDEN RATIO (Head=5e-4, Backbone=5e-5)
-            )
-            
-            return optim.AdamW(
-                optimizer_params, 
-                lr=base_lr, 
                 weight_decay=weight_decay,
-                betas=(0.9, 0.999), 
-                eps=1e-8
+                layer_decay=layer_decay,
+                backbone_scale=backbone_scale,
+                partial_max_blocks=partial_max_blocks,
+                verbose=True,
             )
+        
+            return optim.AdamW(
+                optimizer_params,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+            )
+
 
         # 2. Frozen Backbone: Only train the Head
         #    If finetune is False, the backbone params generally have requires_grad=False.

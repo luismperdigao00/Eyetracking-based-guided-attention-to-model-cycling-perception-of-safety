@@ -9,6 +9,66 @@ import re
 from torchvision.transforms import functional as TF
 import random, math
 import torchvision.transforms.functional as F
+import torch
+import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
+import timm
+
+# =============================================================================================== #
+# Augmentation presets
+# =============================================================================================== #
+
+PAIRWISE_AUG_PRESETS = {
+    "light": dict(
+        # Paired invariances
+        hflip_p=0.5,
+        swap_p=0.5,
+
+        # Photometric
+        color_jitter_p=0,
+        jitter_brightness=0.10,
+        jitter_contrast=0.10,
+        jitter_saturation=0.10,
+        jitter_hue=0.03,
+        gray_p=0,
+
+        # Geometry
+        bottom_crop_p=0.0,
+        bottom_keep_h=(0.65, 0.75),
+        bottom_x_jitter_frac=0.04,
+
+        # Tensor
+        erase_p=0.0,
+        erase_scale=(0.05, 0.08),
+        erase_ratio=(0.3, 3.3),
+        erase_value=0.0,
+    ),
+
+    "heavy": dict(
+        # Paired invariances
+        hflip_p=0.35,
+        swap_p=0.50,
+
+        # Photometric
+        color_jitter_p=0.35,
+        jitter_brightness=0.25,
+        jitter_contrast=0.25,
+        jitter_saturation=0.25,
+        jitter_hue=0.08,
+        gray_p=0.10,
+
+        # Geometry
+        bottom_crop_p=0.10,
+        bottom_keep_h=(0.55, 0.75),
+        bottom_x_jitter_frac=0.06,
+
+        # Tensor
+        erase_p=0.10,
+        erase_scale=(0.05, 0.12),
+        erase_ratio=(0.3, 3.3),
+        erase_value=0.0,
+    ),
+}
 
 class ComparisonsDataset(Dataset):
     """Cycling Safety Perception dataset."""
@@ -169,32 +229,115 @@ class ComparisonsDataset(Dataset):
 
         return sample
 
-
-class CustomTransform:
+class DictTransform:
+    """
+    Wraps a standard image transform (Resize, Crop, etc.) so it can work 
+    on your dictionary-based dataset (image_l, image_r).
+    """
     def __init__(self, transform):
         self.transform = transform
 
-    def __call__(self, sample):
-        image_l, image_r = sample['image_l'], sample['image_r']
+    def __call__(self, data):
+        # Apply the transform to left and right images if they exist
+        if "image_l" in data:
+            data["image_l"] = self.transform(data["image_l"])
+        
+        if "image_r" in data:
+            data["image_r"] = self.transform(data["image_r"])
+            
+        # Note: We do NOT transform 'gaze' maps with standard image ops 
+        # (like Normalize) because gaze maps have different semantics.
+        return data
+        
+# ========================================================================= #
+# CONFIGURATION & PRESETS for Transformations
+# ========================================================================= #
 
+# Fallback defaults if 'timm' cannot find the model config
+DEFAULT_SPECS = {
+    "crop_pct": 0.875,
+    "input_size": (3, 224, 224),
+    "interpolation": "bilinear",
+    "mean": (0.485, 0.456, 0.406),
+    "std": (0.229, 0.224, 0.225),
+}
+def get_model_specs(backbone_name):
+    """Tries to load config from 'timm'. If not found, falls back to defaults."""
+    try:
+        dummy_model = timm.create_model(backbone_name, pretrained=False)
+        cfg = timm.data.resolve_data_config(dummy_model.pretrained_cfg)
         return {
-            'image_l': self.transform(image_l),
-            'image_r': self.transform(image_r),
-
-            'score_r': sample['score_r'],
-            'score_c': sample['score_c'],
-
-            'image_l_name': sample['image_l_name'],
-            'image_r_name': sample['image_r_name'],
-
-            # keep the new fields in the batch after transforms
-            'has_eyetracker': sample['has_eyetracker'],
-            'gaze_l': sample['gaze_l'],
-            'gaze_r': sample['gaze_r'],
-            #'survey_id': sample['survey_id'],
-            #'trial_id': sample['trial_id'],
+            "input_size": cfg.get("input_size", DEFAULT_SPECS["input_size"]),
+            "crop_pct": cfg.get("crop_pct", DEFAULT_SPECS["crop_pct"]),
+            "interpolation": cfg.get("interpolation", DEFAULT_SPECS["interpolation"]),
+            "mean": cfg.get("mean", DEFAULT_SPECS["mean"]),
+            "std": cfg.get("std", DEFAULT_SPECS["std"]),
         }
+    except Exception as e:
+        print(f"Warning: Could not auto-config '{backbone_name}'. Using defaults.")
+        if "eva02" in backbone_name:
+            specs = DEFAULT_SPECS.copy()
+            specs["input_size"] = (3, 448, 448)
+            specs["interpolation"] = "bicubic"
+            return specs
+        return DEFAULT_SPECS
 
+def _get_interp_mode(mode_str):
+    mapping = {
+        "nearest": InterpolationMode.NEAREST,
+        "bilinear": InterpolationMode.BILINEAR,
+        "bicubic": InterpolationMode.BICUBIC,
+        "lanczos": InterpolationMode.LANCZOS,
+    }
+    return mapping.get(str(mode_str).lower(), InterpolationMode.BILINEAR)
+
+def build_transforms(args, specs):
+    """
+    Constructs train and eval transforms, wrapped to handle Dictionaries.
+    """
+    # 1. Calculate Sizes
+    target_crop = specs["input_size"][-1] 
+    resize_dim = int(round(target_crop / specs["crop_pct"]))
+    resize_dim = max(resize_dim, target_crop)
+
+    interp_mode = _get_interp_mode(specs["interpolation"])
+    mean = specs["mean"]
+    std = specs["std"]
+
+    # 2. Build Standard Transforms (but wrapped!)
+    # We wrap each step in DictTransform so it can unpack the dict, 
+    # modify 'image_l'/'image_r', and repack it.
+    eval_tfms = transforms.Compose([
+        DictTransform(transforms.Resize(resize_dim, interpolation=interp_mode)),
+        DictTransform(transforms.CenterCrop(target_crop)),
+        DictTransform(transforms.ToTensor()),
+        DictTransform(transforms.Normalize(mean=mean, std=std)),
+    ])
+
+    # 3. Determine Training Logic
+    use_gaze = (args.gaze != "off" and float(getattr(args, "attn_w", 0.0)) > 0.0)
+    augment_level = getattr(args, "augment", "none")
+    enable_pairwise_aug = (augment_level in PAIRWISE_AUG_PRESETS) and (not use_gaze)
+
+    if enable_pairwise_aug:
+        # Assuming PairwiseAugmentationPipeline handles dicts internally (it usually does)
+        from your_augmentation_module import PairwiseAugmentationPipeline 
+        train_tfms = PairwiseAugmentationPipeline(
+            augment=True,
+            ties=args.ties,
+            disable_aug_when_gaze=True,
+            allow_swap_when_gaze=False,
+            resize_short=resize_dim,
+            out_size=target_crop,
+            **PAIRWISE_AUG_PRESETS[augment_level]
+        )
+        print(f"Training Policy: Pairwise Augmentation ({augment_level})")
+    else:
+        train_tfms = eval_tfms
+        reason = "Gaze Alignment Active" if use_gaze else "Augment=None"
+        print(f"Training Policy: Deterministic ({reason})")
+
+    return train_tfms, eval_tfms
 
 # =============================================================================
 # PairwiseAugmentationPipeline

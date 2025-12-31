@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import numpy as np
 import wandb
-from data import ComparisonsDataset, CustomTransform, PairwiseAugmentationPipeline
+from data import ComparisonsDataset, get_model_specs, build_transforms, PairwiseAugmentationPipeline
 from torchvision import transforms
 
 from train_utils import (
@@ -21,9 +21,7 @@ from train_utils import (
     compute_class_weights_from_df,
     print_augmentation_plan,
     print_run_plan,
-    resolve_batch_size,
-    PAIRWISE_AUG_PRESETS
-)
+    )
 
 import logging
 from datetime import date
@@ -171,16 +169,28 @@ def arg_parse():
     parser.add_argument("--model", type=str, default="rcnn",
                         choices=["rsscnn", "sscnn", "rcnn"])
     
-    parser.add_argument("--backbone", type=str, default="vit_base_dinov3",
+    parser.add_argument("--backbone", type=str, default="dinov3_vitb16",
         choices=[
+            # --- The "Power 5" (Strict 224x224 -> 14x14 Output) ---
+            "dinov3_vitb16",             # 1. DINOv3 (Dense Specialist)
+            "beitv2_base_patch16_224",   # 2. BEiT v2 (Masked Modeling / Structure)
+            "deit3_base_patch16_224",    # 3. DeiT III (Supervised Benchmark)
+            "siglip_base_patch16_224",   # 4. SigLIP (Semantic Expert)
+            "vit_base_patch16_clip_224", # 5. CLIP (Robust / Wildcard)
+
+            # --- Modern High-Performance Alternates ---
+            "dinov2_reg_base",           # DINOv2 + Registers
+            "eva02_base",                # EVA-02 (Requires 448px for best results)
+            "convnext_base",             # ConvNeXt (Modern CNN)
+            
+            # --- Legacy / Standard Models ---
+            "vit_base_dino",             # DINO v1
+            "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
+            "vit_small",
             "alex", "vgg", "dense", "resnet",
-            "deit_base", "deit_small", "deit_base_distilled", "deit_tiny",
-            "vit_base_dino", "vit_dinov2_base", "vit_small",
-            # Add ALL new ones:
-            "vit_base_dinov3", "vit_large_dinov3", 
-            "eva02_base", "siglip_so400m", 
-            "dinov2_reg_base", "convnext_base"
-        ])
+        ],
+        help="Model backbone to use. Default: dinov3_vitb16"
+    )
     # === POOLING ARGUMENTS ===
     parser.add_argument("--pooling", type=str, default="cls",
                         choices=["cls", "mean", "max", "concat", "topk"],
@@ -365,7 +375,7 @@ def run_training_with_args(args, trial=None):
 
     # Central consistency / dependency checks
     validate_and_normalize_args(args, strict=False, verbose=True)
-    
+
     #args.batch_size = resolve_batch_size(args)
     print("=== Args ===")
     print(args, "\n")
@@ -388,7 +398,7 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     print("Reading input data...")
     comparisons_df = read_data(args)
-    
+
     # This summary is intentionally focused on "what data will be used from now on".
     # (Detailed plan/architecture is printed later by RUN PLAN.)
     print("\n=== Effective Dataset (after all filters, before split) ===")
@@ -397,7 +407,7 @@ def run_training_with_args(args, trial=None):
     print(f"Gaze mode        : {args.gaze}  (rows kept depend on has_eyetracker + gaze setting)")
     print(f"Ties enabled     : {args.ties}  (ties=False removes score==0 rows)")
     print(f"Final row count  : {len(comparisons_df):,}")
-    
+
     # Score distribution AFTER filtering (this is the distribution you will actually train on)
     if "score" in comparisons_df.columns:
         print("\nScore distribution (post-filtering):")
@@ -405,34 +415,32 @@ def run_training_with_args(args, trial=None):
         total_rows = len(comparisons_df)
         for s, c in score_counts.items():
             print(f"  score={s:>2}: {c:>6,} ({(100.0*c/total_rows):5.2f}%)")
-    
+
     # Eyetracker availability AFTER filtering (helps explain what gaze mode kept/removed)
     if "has_eyetracker" in comparisons_df.columns:
         print("\nEyetracker availability (post-filtering):")
         et_counts = comparisons_df["has_eyetracker"].value_counts(dropna=False)
         for k, v in et_counts.items():
             print(f"  {str(k):>5}: {v:>6,} ({(100.0*v/len(comparisons_df)):5.2f}%)")
-    
+
     # Minimal sanity peek (do not spam; run plan later covers the rest)
     print("\nExample rows (post-filtering):")
     print(comparisons_df.head(3))
     print("========================================================\n")
-    
-    
+
     # =============================================================================================== #
     # 3) TRAIN/VAL/TEST SPLIT
     # =============================================================================================== #
     X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
     X_train, X_val = train_test_split(X_train, test_size=0.13, random_state=args.seed)
-    
+
     total = len(comparisons_df)
     print("=== Splits (on the filtered dataset above) ===")
     print(f"- Train: {len(X_train):,}  [{len(X_train)/total:.2%}]")
     print(f"- Val  : {len(X_val):,}  [{len(X_val)/total:.2%}]")
     print(f"- Test : {len(X_test):,}  [{len(X_test)/total:.2%}]")
     print("========================================================\n")
-    
-    
+
     # =============================================================================================== #
     # 3b) LABEL DISTRIBUTION PER SPLIT + CLASS WEIGHTS (TRAIN ONLY)
     # =============================================================================================== #
@@ -445,14 +453,14 @@ def run_training_with_args(args, trial=None):
             pct = 100.0 * cls_count / total_part
             print(f"    score={cls_val:>2d}: {cls_count:>6,} ({pct:5.2f}%)")
     print("============================================================")
-    
+
     # Class weights are computed ONLY from the training split
     args.class_weights = compute_class_weights_from_df(
         X_train["score_classification"],
         use_ties=args.ties,
         enable_weights=args.use_class_weights,
     )
-    
+
     # Optional: a compact confirmation (no duplication with RUN PLAN)
     if args.use_class_weights and args.class_weights is not None:
         cw = args.class_weights.detach().cpu().numpy().tolist()
@@ -462,114 +470,67 @@ def run_training_with_args(args, trial=None):
     print()
 
     # =============================================================================================== #
-    # 4) TRANSFORMS
+    # 3c) BACKBONE FAMILY
     # =============================================================================================== #
-    # Policy:
-    #   - eval_tfms: deterministic preprocessing used for validation/test (and also used as fallback for train)
-    #   - train_tfms:
-    #       * if args.augment is ON AND gaze-alignment loss is NOT active -> use pairwise augmentations
-    #       * otherwise -> fall back to eval_tfms for deterministic behavior
-    #
-    # Why disable augmentation when gaze alignment is active?
-    #   - Your gaze alignment loss assumes spatial correspondence between (image ↔ gaze map).
-    #   - Random crops / flips / geometry / color jitter would invalidate this correspondence unless you also
-    #     transform the gaze maps identically.
-    #   - So you currently choose the safe policy: do not augment if gaze alignment is being used.
+
+    TRANSFORMER_BACKBONES = [
+        # --- The "Power 5" ---
+        "dinov3_vitb16",
+        "beitv2_base_patch16_224",
+        "deit3_base_patch16_224",
+        "siglip_base_patch16_224",
+        "vit_base_patch16_clip_224",
+
+        # --- Modern Transformers ---
+        "eva02_base",
+        "dinov2_reg_base",
+        
+        # --- Legacy Transformers ---
+        "vit_base_dino", 
+        "vit_small",
+        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
+        
+        # Note: ConvNeXt is technically a CNN, but if you treat it as 
+        # distinct from standard "resnet" logic, you might keep it separate.
+        # However, purely structurally, it belongs in CNN_BACKBONES 
+        # unless your wrapper handles it specifically.
+        "convnext_base",
+    ]
+    
+    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
     # =============================================================================================== #
-    
-    # "use_gaze_alignment" means: run has gaze supervision and the loss weight is > 0
-    use_gaze_alignment = (args.gaze != "off" and float(getattr(args, "attn_w", 0.0)) > 0.0)
-    
-    # ----------------------------------------------------------------------------------------------- #
-    # 4.0) Determine resolution based on backbone (Dynamic Resize)
-    # ----------------------------------------------------------------------------------------------- #
-    if "eva02" in args.backbone:
-        target_crop = 448
-        resize_dim = 512 
-    elif "dinov3" in args.backbone:
-        target_crop = 256
-        resize_dim = 292  # Optimized ratio (256/0.875)
-    elif "dinov2" in args.backbone:
-        target_crop = 224
-        resize_dim = 256
-    else:
-        target_crop = 224
-        resize_dim = 256
+    # 4) TRANSFORMS & MODEL CONFIG
+    # =============================================================================================== #
+    # We now offload the complexity of "timm" configs, gaze logic, and augmentations to train_utils.
+    # This ensures train.py remains readable and focused on the training loop.
+    # =============================================================================================== #
 
-    print(f"Transform config -> Resize: {resize_dim}, Crop: {target_crop} (Backbone: {args.backbone})")
+    # 4.1) Retrieve Model Specifications
+    # Automatically gets the correct resolution (224/384/448), interpolation (bicubic/bilinear),
+    # and mean/std for your specific backbone (ViT, ResNet, EVA-02, etc.).
+    model_specs = get_model_specs(args.backbone)
 
-    # ----------------------------------------------------------------------------------------------- #
-    # 4.1) Deterministic evaluation preprocessing (used for val/test, and as train fallback)
-    # ----------------------------------------------------------------------------------------------- #
-    # Equivalent to: Resize(short side) -> CenterCrop(target) -> ToTensor -> Normalize(ImageNet stats)
-    # Note: you wrap each torchvision transform with CustomTransform, presumably because your Dataset
-    # stores images in dicts and CustomTransform applies transforms to the correct dict keys.
-    eval_tfms = transforms.Compose(
-        [
-            CustomTransform(transforms.Resize(resize_dim)),
-            CustomTransform(transforms.CenterCrop(target_crop)),
-            CustomTransform(transforms.ToTensor()),
-            CustomTransform(
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                )
-            ),
-        ]
-    )
-    
-    # ----------------------------------------------------------------------------------------------- #
-    # 4.2) Training transforms selection logic
-    # ----------------------------------------------------------------------------------------------- #
-    # Default: no augmentation -> match eval preprocessing (deterministic)
-    train_tfms = eval_tfms
-    
-    # Enable PairwiseAugmentationPipeline only when:
-    #   (a) user asked for augmentation, and
-    #   (b) gaze-alignment loss is not active (otherwise misalignment risk)
-    augment_level = getattr(args, "augment", "none")
-    enable_pairwise_aug = (augment_level in ("light", "heavy")) and (not use_gaze_alignment)
+    # 4.2) Build Transforms
+    # This function internally handles:
+    #   1. Deterministic val/test transforms (Resize -> CenterCrop -> Norm).
+    #   2. Training policy:
+    #      - If Gaze Alignment is ON -> Forces deterministic transforms (safety).
+    #      - If Augment is ON (and Gaze OFF) -> Uses PairwiseAugmentationPipeline.
+    train_tfms, eval_tfms = build_transforms(args, model_specs)
 
-    
-    if enable_pairwise_aug:
-        # ------------------------------------------------------------------------------------------- #
-        # 4.3) Pairwise augmentation config (applies to TRAIN ONLY)
-        # ------------------------------------------------------------------------------------------- #
-        # The pipeline applies *paired* operations to both images of a comparison.
-        # Key invariance operations:
-        #   - Horizontal flip (paired): keeps label same
-        #   - Swap left/right (paired): label is inverted for ranking, remapped for classification
-        #
-        # Mild photometric operations:
-        #   - Color jitter (paired): small changes to brightness/contrast/saturation/hue
-        #   - Grayscale (paired)
-        #
-        # Rare geometry operation:
-        #   - Bottom-band crop (paired): small chance, acts like "sky removal"
-        #
-        # Tensor-level regularization:
-        #   - Random erasing (paired): small chance
-        #
-        # IMPORTANT: You currently disable augmentation whenever gaze alignment is used. Therefore
-        # the gaze-related parameters below are effectively inert in this branch, but kept for clarity.
-        train_tfms = PairwiseAugmentationPipeline(
-            augment=True,
-            ties=args.ties,
-    
-            disable_aug_when_gaze=True,
-            allow_swap_when_gaze=False,
-    
-            resize_short=resize_dim,
-            out_size=target_crop,
-    
-            **PAIRWISE_AUG_PRESETS[augment_level],
-        )
-    else:
-        train_tfms = eval_tfms
+    # 4.3) Logging
+    print(f"\n[Transforms Setup]")
+    print(f"Backbone:      {args.backbone}")
+    print(f"Input Size:    {model_specs['input_size']}")
+    print(f"Crop %:        {model_specs['crop_pct']}")
+    print(f"Interpolation: {model_specs['interpolation']}")
+    print(f"Training Mode: {'Pairwise Augmentation' if getattr(train_tfms, 'augment', False) else 'Deterministic (Standard)'}")
+    print("-" * 60)
+
     # =============================================================================================== #
     # 5) DATA LOADERS
     # =============================================================================================== #
-    use_gaze = (args.gaze != 'off')
+    use_gaze = (args.gaze != "off")
 
     train_set = ComparisonsDataset(
         dataframe=X_train,
@@ -617,17 +578,9 @@ def run_training_with_args(args, trial=None):
             device = torch.device(f"cuda:{args.cuda_id}")
     else:
         device = torch.device("cpu")
-    print('Device:', device)
-    use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
+    print("Device:", device)
 
-    TRANSFORMER_BACKBONES = [
-        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
-        "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small",
-        "vit_base_dinov3", 
-        # Add these so they use the Transformer Wrapper (pooling):
-        "vit_large_dinov3", "siglip_so400m", "dinov2_reg_base", "convnext_base"
-    ]
-    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
+    use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
 
     if args.backbone in TRANSFORMER_BACKBONES:
         print("Using TRANSFORMER model (nets.transformer).")
@@ -663,7 +616,6 @@ def run_training_with_args(args, trial=None):
             attention_mode=args.attention_mode,
             attn_topk=args.attn_topk,
         )
-
         net.attn_grad = use_gaze_loss
 
     elif args.backbone in CNN_BACKBONES:
@@ -686,28 +638,26 @@ def run_training_with_args(args, trial=None):
         print("\nResuming training.")
         checkpoint_name = os.path.join(args.model_dir, f"{args.resume_checkpoint}")
         print("Loading model:", checkpoint_name)
-    
+
         state = torch.load(checkpoint_name, map_location=device)
-    
+
         # If current model is DataParallel, it expects "module." keys.
         is_dp = isinstance(net, torch.nn.DataParallel)
-    
+
         # If checkpoint keys have "module." but model is not DP, strip them.
         if not is_dp and any(k.startswith("module.") for k in state.keys()):
             state = {k.replace("module.", "", 1): v for k, v in state.items()}
-    
+
         # If model is DP but checkpoint keys do not have "module.", add them.
         if is_dp and not any(k.startswith("module.") for k in state.keys()):
             state = {f"module.{k}": v for k, v in state.items()}
-    
+
         net.load_state_dict(state, strict=True)
         print()
-
 
     # =============================================================================================== #
     # 7) RUN PLAN (centralized)
     # =============================================================================================== #
-    
     print_run_plan(
         args,
         train_df=X_train,
@@ -725,7 +675,7 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 8) TRAIN
     # =============================================================================================== #
-    run_name = ''
+    run_name = ""
     if args.log_wandb and wandb.run is not None:
         run_name = wandb.run.name
     print("Training:", run_name)
@@ -749,6 +699,6 @@ def run_training_with_args(args, trial=None):
     return best_val_acc
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = arg_parse().parse_args()
     run_training_with_args(args)

@@ -21,6 +21,11 @@ import torch
 from torch import nn
 import timm
 
+import torch
+import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
+import timm
+
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -236,94 +241,180 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     return ArgsCheckReport(warnings=warnings, errors=errors)
     
 # =============================================================================================== #
-# Backbone factory (DeiT via torch.hub, others via timm)
+# Backbone factory
 # =============================================================================================== #
+def resolve_preprocess_from_model(backbone_model, *, verbose: bool = False):
+    """
+    Resolve preprocessing parameters from an instantiated timm model.
+    This guarantees consistency with the actual model img_size/default_cfg.
+    """
+    target_crop = 224
+    crop_pct = 0.875
+    mean = (0.485, 0.456, 0.406)
+    std = (0.229, 0.224, 0.225)
+    interpolation = "bilinear"
+
+    try:
+        from timm.data import resolve_data_config
+        cfg = resolve_data_config({}, model=backbone_model)
+
+        input_size = cfg.get("input_size", (3, 224, 224))
+        target_crop = int(input_size[-1])
+        crop_pct = float(cfg.get("crop_pct", crop_pct))
+        mean = tuple(cfg.get("mean", mean))
+        std = tuple(cfg.get("std", std))
+        interpolation = str(cfg.get("interpolation", interpolation))
+
+    except Exception as e:
+        if verbose:
+            print(f"[WARN] resolve_preprocess_from_model fallback to ImageNet defaults: {type(e).__name__}: {e}")
+
+    resize_dim = int(round(target_crop / max(crop_pct, 1e-6)))
+
+    if verbose:
+        print(
+            f"[preprocess] resolved from model -> crop={target_crop}, resize={resize_dim}, "
+            f"crop_pct={crop_pct:.3f}, interp={interpolation}, mean={mean}, std={std}"
+        )
+
+    return target_crop, resize_dim, mean, std, interpolation, crop_pct
+
+    
+import timm
+import torch
 
 def build_transformer_backbone(name: str):
     """
-    Build a transformer-style backbone.
+    Build a transformer-style backbone from timm.
+    
+    CRITICAL CONFIGURATION:
+      - global_pool="": Forces the model to return the raw feature map (Batch, SeqLen, Dim)
+                        instead of a pooled vector. 
+      - img_size=224:   Ensures we get exactly 14x14 patches (224/16 = 14) for 
+                        gaze alignment.
     """
-    # --------------------------
-    # 1. EVA-02 (The "Giant Slayer")
-    # --------------------------
-    # Requires 448x448 for best results. Powerful semantic features.
-    if name == "eva02_base":
+    
+    # =========================================================================
+    # 1. DINOv3 (The New State-of-the-Art)
+    # =========================================================================
+    if name == "dinov3_vitb16":
+        # DINOv3 Base. Explicitly forcing 224 ensures 14x14 output.
+        # Native resolution is often 256, but 224 works fine for finetuning.
+        return timm.create_model(
+            "vit_base_patch16_dinov3.lvd1689m", 
+            pretrained=True, 
+            num_classes=0, 
+            img_size=224,     
+            global_pool="",
+        )
+
+    # =========================================================================
+    # 2. BEiT v2 (The DINOv1 Replacement)
+    # =========================================================================
+    elif name == "beitv2_base_patch16_224":
+        # Masked Image Modeling (MIM) specialist.
+        # Uses .in1k_ft_in22k weights for best performance.
+        return timm.create_model(
+            "beitv2_base_patch16_224.in1k_ft_in22k",
+            pretrained=True,
+            num_classes=0,
+            img_size=224,
+            global_pool="",
+        )
+
+    # =========================================================================
+    # 3. DeiT III (The Supervised Benchmark)
+    # =========================================================================
+    elif name == "deit3_base_patch16_224":
+        # "Revenge of the ViT" - Strongest supervised baseline.
+        return timm.create_model(
+            "deit3_base_patch16_224.fb_in22k_ft_in1k",
+            pretrained=True,
+            num_classes=0,
+            img_size=224,
+            global_pool="",
+        )
+
+    # =========================================================================
+    # 4. SigLIP (The Semantic Expert)
+    # =========================================================================
+    elif name == "siglip_base_patch16_224":
+        # Better than CLIP for zero-shot and semantics.
+        return timm.create_model(
+            "vit_base_patch16_siglip_224",
+            pretrained=True,
+            num_classes=0,
+            img_size=224,
+            global_pool="",
+        )
+
+    # =========================================================================
+    # 5. CLIP (The Robust "Wildcard")
+    # =========================================================================
+    elif name == "vit_base_patch16_clip_224":
+        # Standard OpenAI CLIP weights. Robust to noisy data.
+        return timm.create_model(
+            "vit_base_patch16_clip_224.openai",
+            pretrained=True,
+            num_classes=0,
+            img_size=224,
+            global_pool="",
+        )
+
+    # =========================================================================
+    # Legacy / Other Backbones
+    # =========================================================================
+    
+    # EVA-02 (Requires 448px for native performance, outputs 32x32 map)
+    elif name == "eva02_base":
         return timm.create_model(
             "eva02_base_patch14_448.mim_in22k_ft_in1k",
-            pretrained=True,
-            num_classes=0,
+            pretrained=True, 
+            num_classes=0, 
             img_size=448, 
+            global_pool=""
         )
 
-    # --------------------------
-    # 2. SigLIP (The "Language Expert")
-    # --------------------------
-    # Good for abstract concepts like "safety". 
-    elif name == "siglip_so400m":
-        return timm.create_model(
-            "vit_so400m_patch14_siglip_224",
-            pretrained=True,
-            num_classes=0,
+    # DINO (v1) - The classic fallback
+    elif name == "vit_base_dino" or name == "vit_base_patch16_224.dino":
+         return timm.create_model(
+            "vit_base_patch16_224.dino", 
+            pretrained=True, 
+            num_classes=0, 
+            img_size=224, 
+            global_pool=""
         )
 
-    # --------------------------
-    # 3. DINOv2 + Registers (The "Stable DINO")
-    # --------------------------
-    # Cleaner attention maps than DINOv1/v3. 
-    # Has 4 register tokens (handled by your new transformer.py).
+    # DINOv2 with Registers (Patch 14 -> 16x16 output at 224px)
     elif name == "dinov2_reg_base":
         return timm.create_model(
             "vit_base_patch14_reg4_dinov2.lvd142m",
             pretrained=True,
             num_classes=0,
-            img_size=224, # Native 518, but 224 works well with RoPE
+            img_size=224, 
+            global_pool="",
         )
 
-    # --------------------------
-    # 4. ConvNeXt (The "CNN King")
-    # --------------------------
-    # Can be used inside the Transformer wrapper to benefit from "concat" pooling!
+    # ConvNeXt
     elif name == "convnext_base":
         return timm.create_model(
             "convnext_base.fb_in22k_ft_in1k",
             pretrained=True,
             num_classes=0,
+            global_pool="",
         )
-
-    # --------------------------
-    # 5. DINOv3 (Base & Large)
-    # --------------------------
-    elif name == "vit_base_dinov3":
-        return timm.create_model(
-            "vit_base_patch16_dinov3.lvd1689m",
-            pretrained=True,
-            num_classes=0,
-            img_size=256,
-        )
-    elif name == "vit_large_dinov3":
-        return timm.create_model(
-            "vit_large_patch16_dinov3.lvd1689m",
-            pretrained=True,
-            num_classes=0,
-            img_size=256,
-        )
-
-    # --------------------------
-    # Legacy / Other
-    # --------------------------
-    elif name == "vit_base_dino": # DINOv1
-        return torch.hub.load("facebookresearch/dino:main", "dino_vitb16", pretrained=True)
-    elif name == "deit_base":
-        return torch.hub.load("facebookresearch/deit:main", "deit_base_patch16_224", pretrained=True)
-    elif name == "deit_small":
-        return torch.hub.load("facebookresearch/deit:main", "deit_small_patch16_224", pretrained=True)
-    elif name == "deit_tiny":
-        return torch.hub.load("facebookresearch/deit:main", "deit_tiny_patch16_224", pretrained=True)
-    elif name == "deit_base_distilled":
-        return torch.hub.load("facebookresearch/deit:main", "deit_base_distilled_patch16_224", pretrained=True)
-    
+        
     else:
-        raise ValueError(f"Unknown transformer backbone: {name}")
+        # Fallback for generic timm names (allows you to try others easily)
+        try:
+            return timm.create_model(
+                name, 
+                pretrained=True, 
+                num_classes=0, 
+                global_pool=""
+            )
+        except Exception:
+            raise ValueError(f"Unknown transformer backbone: {name}")
 # =================================================================================================
 # Class weights
 # =================================================================================================
@@ -710,130 +801,183 @@ def resolve_batch_size(args):
     else:
         return 32
 
-# =============================================================================================== #
-# Augmentation presets
-# =============================================================================================== #
-
-PAIRWISE_AUG_PRESETS = {
-    "light": dict(
-        # Paired invariances
-        hflip_p=0.5,
-        swap_p=0.5,
-
-        # Photometric
-        color_jitter_p=0,
-        jitter_brightness=0.10,
-        jitter_contrast=0.10,
-        jitter_saturation=0.10,
-        jitter_hue=0.03,
-        gray_p=0,
-
-        # Geometry
-        bottom_crop_p=0.0,
-        bottom_keep_h=(0.65, 0.75),
-        bottom_x_jitter_frac=0.04,
-
-        # Tensor
-        erase_p=0.0,
-        erase_scale=(0.05, 0.08),
-        erase_ratio=(0.3, 3.3),
-        erase_value=0.0,
-    ),
-
-    "heavy": dict(
-        # Paired invariances
-        hflip_p=0.35,
-        swap_p=0.50,
-
-        # Photometric
-        color_jitter_p=0.35,
-        jitter_brightness=0.25,
-        jitter_contrast=0.25,
-        jitter_saturation=0.25,
-        jitter_hue=0.08,
-        gray_p=0.10,
-
-        # Geometry
-        bottom_crop_p=0.10,
-        bottom_keep_h=(0.55, 0.75),
-        bottom_x_jitter_frac=0.06,
-
-        # Tensor
-        erase_p=0.10,
-        erase_scale=(0.05, 0.12),
-        erase_ratio=(0.3, 3.3),
-        erase_value=0.0,
-    ),
-}
 
 
-def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay=0.8, base_lr=1e-4, backbone_scale=0.1):
+def get_parameter_groups(
+    model: nn.Module,
+    *,
+    base_lr: float,
+    weight_decay: float,
+    layer_decay: float = 0.9,
+    backbone_scale: float = 0.1,
+    partial_max_blocks: int = 4,
+    verbose: bool = True,
+):
     """
-    Creates parameter groups for Layer-wise Learning Rate Decay (LLRD).
-    
-    Args:
-        backbone_scale (float): Global multiplier for the backbone. 
-                                If base_lr=5e-4 and scale=0.1, 
-                                Head = 5e-4, Backbone Top = 5e-5.
-    """
-    parameter_group_names = {}
-    parameter_group_vars = {}
+    Build optimizer parameter groups with an AUTO policy:
 
-    if hasattr(model, 'backbone') and hasattr(model.backbone, 'blocks'):
-        layers = model.backbone.blocks
-        num_layers = len(layers) + 2 
+    - If only the head trains: head-only groups (no LLRD).
+    - If only a few transformer blocks are unfrozen (<= partial_max_blocks): TWO-TIER LR
+        * head lr = base_lr
+        * backbone lr = base_lr * backbone_scale (uniform across unfrozen blocks)
+    - If many blocks are unfrozen: TRUE LLRD over unfrozen transformer blocks
+        * top unfrozen block gets base_lr * backbone_scale
+        * deeper blocks get geometric decay: lr *= layer_decay^(distance_from_top)
+
+    Notes:
+      - This function ONLY includes parameters with requires_grad=True.
+      - Biases and Norm params get weight_decay=0 (standard practice).
+      - Assumes your wrapper exposes `model.backbone.blocks` for ViT-like models.
+    """
+    if base_lr <= 0:
+        raise ValueError(f"base_lr must be > 0 (got {base_lr})")
+    if backbone_scale <= 0:
+        raise ValueError(f"backbone_scale must be > 0 (got {backbone_scale})")
+    if not (0.0 < layer_decay <= 1.0):
+        raise ValueError(f"layer_decay must be in (0,1] (got {layer_decay})")
+    if partial_max_blocks < 1:
+        raise ValueError(f"partial_max_blocks must be >= 1 (got {partial_max_blocks})")
+
+    # ------------------------------------------------------------------
+    # Identify backbone + blocks (ViT-like)
+    # ------------------------------------------------------------------
+    backbone = getattr(model, "backbone", None)
+    blocks = getattr(backbone, "blocks", None) if backbone is not None else None
+
+    # If we can't identify blocks, fall back to a simple scheme:
+    # head vs rest (if name contains 'backbone'), no LLRD.
+    if blocks is None or not isinstance(blocks, (list, nn.ModuleList)) or len(blocks) == 0:
+        if verbose:
+            print("[Optimizer] get_parameter_groups: backbone blocks not found -> fallback (no LLRD).")
+
+        head_decay, head_no_decay, bb_decay, bb_no_decay = [], [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_no_decay = ("bias" in name) or ("norm" in name)
+            is_backbone = ("backbone" in name)
+
+            if is_backbone:
+                (bb_no_decay if is_no_decay else bb_decay).append(p)
+            else:
+                (head_no_decay if is_no_decay else head_decay).append(p)
+
+        bb_lr = base_lr * backbone_scale
+
+        groups = []
+        if head_decay:
+            groups.append({"params": head_decay, "lr": base_lr, "weight_decay": weight_decay})
+        if head_no_decay:
+            groups.append({"params": head_no_decay, "lr": base_lr, "weight_decay": 0.0})
+        if bb_decay:
+            groups.append({"params": bb_decay, "lr": bb_lr, "weight_decay": weight_decay})
+        if bb_no_decay:
+            groups.append({"params": bb_no_decay, "lr": bb_lr, "weight_decay": 0.0})
+
+        return groups
+
+    # ------------------------------------------------------------------
+    # Determine which transformer blocks are actually trainable
+    # ------------------------------------------------------------------
+    trainable_block_idxs = []
+    for i, blk in enumerate(blocks):
+        if any(p.requires_grad for p in blk.parameters()):
+            trainable_block_idxs.append(i)
+
+    n_trainable_blocks = len(trainable_block_idxs)
+
+    # Detect head-only training (common when finetune is off or num_ft_blocks=0)
+    if n_trainable_blocks == 0:
+        mode = "head_only"
+    elif n_trainable_blocks <= partial_max_blocks:
+        mode = "partial"
     else:
-        print("[LLRD] Backbone not recognized as ViT. Using standard optimizer.")
-        return [{'params': [p for p in model.parameters() if p.requires_grad], 'lr': base_lr, 'weight_decay': weight_decay}]
+        mode = "full"
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
+    if verbose:
+        print(
+            f"[Optimizer] get_parameter_groups: mode={mode} | "
+            f"trainable_blocks={n_trainable_blocks}/{len(blocks)} | "
+            f"base_lr={base_lr:.2e} | bb_top_lr={base_lr * backbone_scale:.2e} | "
+            f"layer_decay={layer_decay:.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    # Helper: choose weight decay
+    # ------------------------------------------------------------------
+    def _wd_for(name: str) -> float:
+        # No weight decay for biases and norms
+        if ("bias" in name) or ("norm" in name):
+            return 0.0
+        return float(weight_decay)
+
+    # ------------------------------------------------------------------
+    # Build groups
+    # ------------------------------------------------------------------
+    groups_map = {}  # key: (group_name, lr, wd) -> dict
+
+    def _add_param(group_name: str, lr: float, wd: float, p: torch.nn.Parameter):
+        key = (group_name, float(lr), float(wd))
+        if key not in groups_map:
+            groups_map[key] = {"params": [], "lr": float(lr), "weight_decay": float(wd)}
+        groups_map[key]["params"].append(p)
+
+    bb_top_lr = base_lr * backbone_scale
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
             continue
-            
-        # 1. Default: Head gets Maximum LR (Scale = 1.0)
-        group_name = "head"
-        scale = 1.0 
 
-        # 2. Backbone Logic
-        if "backbone" in name:
-            # Apply the global backbone reduction (e.g., 0.1)
-            # This ensures Head >> Backbone Top
-            base_scale = backbone_scale 
-            
-            if "patch_embed" in name or "cls_token" in name or "pos_embed" in name:
-                group_name = "layer_0"
-                scale = base_scale * (layer_decay ** num_layers)
-            elif "blocks" in name:
-                try:
-                    parts = name.split(".")
-                    block_idx = int(parts[parts.index("blocks") + 1])
-                    dist = (len(layers) - 1) - block_idx
-                    # Apply LLRD on top of the base_scale
-                    scale = base_scale * (layer_decay ** (dist + 1))
-                    group_name = f"layer_{block_idx + 1}"
-                except (ValueError, IndexError):
-                    scale = base_scale * (layer_decay ** (num_layers // 2))
-            elif "norm" in name:
-                group_name = "backbone_norm"
-                scale = base_scale * (layer_decay ** 0.5)
-            
-        if group_name not in parameter_group_vars:
-            parameter_group_vars[group_name] = {
-                "weight_decay": 0.0 if (name in skip_list or "bias" in name or "norm" in name) else weight_decay,
-                "params": [],
-                "lr_scale": scale
-            }
-        
-        parameter_group_vars[group_name]["params"].append(param)
+        wd = _wd_for(name)
 
-    param_groups = []
-    for name, config in parameter_group_vars.items():
-        scaled_lr = base_lr * config["lr_scale"]
-        param_groups.append({
-            "params": config["params"],
-            "weight_decay": config["weight_decay"],
-            "lr": scaled_lr
-        })
-        # print(f"  LLRD Group '{name}': LR={scaled_lr:.2e} | Params: {len(config['params'])}")
-    
-    return param_groups
+        # Head params (anything not in backbone namespace)
+        if "backbone" not in name:
+            _add_param("head", base_lr, wd, p)
+            continue
+
+        # Backbone params
+        # - Patch/embed tokens and pos/cls embeddings go to "layer_0" with lowest LR (in full mode)
+        # - Norm typically trains with the top LR (or slightly reduced), but we keep it simple.
+        if mode == "head_only":
+            # If we're here, these backbone params must be trainable (rare), but treat as bb_top_lr
+            _add_param("backbone", bb_top_lr, wd, p)
+            continue
+
+        if mode == "partial":
+            # Uniform backbone LR for stability in partial finetuning.
+            _add_param("backbone", bb_top_lr, wd, p)
+            continue
+
+        # mode == "full": apply LLRD over transformer blocks.
+        # Map each block i -> distance from top trainable block
+        # Topmost block (largest index) should have distance 0.
+        # Only blocks that are trainable matter, but we compute distance based on indices.
+        if "blocks" in name:
+            try:
+                parts = name.split(".")
+                bidx = int(parts[parts.index("blocks") + 1])
+
+                # distance from last block index (top)
+                top_idx = max(trainable_block_idxs) if trainable_block_idxs else (len(blocks) - 1)
+                dist = max(0, top_idx - bidx)
+
+                lr = bb_top_lr * (layer_decay ** dist)
+                _add_param(f"block_{bidx}", lr, wd, p)
+                continue
+            except Exception:
+                # If parsing fails, treat as top backbone params
+                _add_param("backbone_misc", bb_top_lr, wd, p)
+                continue
+
+        # Non-block backbone parameters:
+        # - patch_embed / pos_embed / cls_token usually want a smaller LR in full finetune
+        if any(k in name for k in ("patch_embed", "pos_embed", "cls_token")):
+            lr = bb_top_lr * (layer_decay ** (len(blocks)))  # smallest-ish
+            _add_param("embeddings", lr, wd, p)
+        else:
+            # backbone norm / other: treat as top lr
+            _add_param("backbone_other", bb_top_lr, wd, p)
+
+    return list(groups_map.values())
+
+
