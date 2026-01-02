@@ -543,7 +543,7 @@ def run_training_with_args(args, trial=None):
         use_seg=args.use_seg,
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
 
@@ -589,15 +589,10 @@ def run_training_with_args(args, trial=None):
     
     CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
     
-
-    
     # TRANSFORMER PATH
     if args.backbone in TRANSFORMER_BACKBONES:
         print(f"Using TRANSFORMER architecture: {args.backbone}")
         from nets.transformer import Transformer as Net
-
-        # Build the specific timm backbone (e.g., dinov3, beit, etc.)
-        backbone_model = build_transformer_backbone(args.backbone)
 
         # Instantiate the Siamese Transformer Wrapper
         net = Net(
