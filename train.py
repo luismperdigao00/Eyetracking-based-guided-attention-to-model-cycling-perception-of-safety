@@ -14,7 +14,6 @@ import numpy as np
 import wandb
 from data import (
     ComparisonsDataset,
-    get_model_specs,
     build_eval_transforms,
     build_train_transforms,
     Augmentation,
@@ -22,7 +21,7 @@ from data import (
 
 from train_utils import (
     validate_and_normalize_args,
-    build_transformer_backbone,
+    resolve_backbone,
     compute_class_weights_from_df,
     print_run_plan,
     )
@@ -483,15 +482,23 @@ def run_training_with_args(args, trial=None):
     #   - if args.augment is "light" or "heavy" -> apply the pairwise Augmentation
     #   - otherwise -> train preprocessing equals evaluation preprocessing
     # =============================================================================================== #
+
+    # Resolve everything once
+    backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
     
-    model_specs = get_model_specs(args.backbone)
+    # Build transforms from specs
     eval_tfms, eval_meta = build_eval_transforms(model_specs)
-    
     aug_obj, train_meta = build_train_transforms(args, eval_meta)
+    
     if aug_obj is None:
         train_tfms = eval_tfms
-    else:
+    elif callable(aug_obj):
         train_tfms = aug_obj
+    else:
+        raise TypeError(
+            f"Unexpected train transform object: {type(aug_obj)}"
+        )
+    args.expected_img_size = int(model_specs["img_size"])
     
     args.transforms_meta = {
         "backbone": args.backbone,
@@ -501,6 +508,7 @@ def run_training_with_args(args, trial=None):
         "train_transform_class": train_tfms.__class__.__name__,
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
+    
 
     # =============================================================================================== #
     # 5) DATA LOADERS
@@ -580,55 +588,65 @@ def run_training_with_args(args, trial=None):
     ]
     
     CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
+    
 
-    # --------------------------------------
-
+    
+    # TRANSFORMER PATH
     if args.backbone in TRANSFORMER_BACKBONES:
-        print("Using TRANSFORMER model (nets.transformer).")
+        print(f"Using TRANSFORMER architecture: {args.backbone}")
         from nets.transformer import Transformer as Net
-    elif args.backbone in CNN_BACKBONES:
-        print("Using CNN model (nets.cnn).")
-        from nets.cnn import CNN as Net
-    else:
-        raise Exception("Invalid model. To check available models run with -h.")
 
-    cnn_backbones = {
-        "alex": models.alexnet,
-        "vgg": models.vgg19,
-        "dense": models.densenet121,
-        "resnet": models.resnet50,
-    }
-
-    if args.backbone in TRANSFORMER_BACKBONES:
+        # Build the specific timm backbone (e.g., dinov3, beit, etc.)
         backbone_model = build_transformer_backbone(args.backbone)
 
+        # Instantiate the Siamese Transformer Wrapper
         net = Net(
             backbone=backbone_model,
             model=args.model,
+            # Pooling & Architecture
             pooling=getattr(args, "pooling", "cls"),
             pool_k=getattr(args, "pool_k", 10),
             num_classes=3 if args.ties else 2,
+            # Training Dynamics
             finetune=args.finetune,
             num_ft_blocks=args.num_ft_blocks,
             rank_dropout=args.rank_dropout,
             cross_dropout=args.cross_dropout,
+            # Gaze & Attention
             use_attn_hook=use_gaze_loss,
             return_attn=use_gaze_loss,
             attention_mode=args.attention_mode,
             attn_topk=args.attn_topk,
         )
+        # Dynamically enable attention gradients if gaze loss is active
         net.attn_grad = use_gaze_loss
 
+    # CNN PATH
     elif args.backbone in CNN_BACKBONES:
+        print(f"Using CNN architecture: {args.backbone}")
+        from nets.cnn import CNN as Net
+
+        # Map CLI names to torchvision constructors
+        cnn_factory = {
+            "alex": models.alexnet,
+            "vgg": models.vgg19,
+            "dense": models.densenet121,
+            "resnet": models.resnet50,
+        }
+
+        # Instantiate the Siamese CNN Wrapper
         net = Net(
-            backbone=cnn_backbones[args.backbone],
+            backbone=cnn_factory[args.backbone],
             model=args.model,
             finetune=args.finetune,
             num_classes=3 if args.ties else 2,
         )
-    else:
-        raise Exception("Invalid model. To check available models run with -h.")
 
+    else:
+        known_models = TRANSFORMER_BACKBONES + CNN_BACKBONES
+        raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known_models}")
+
+    # Move to device
     net.to(device)
 
     if args.cuda and args.multi_gpu:
@@ -659,6 +677,7 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 7) RUN PLAN (centralized)
     # =============================================================================================== #
+    """    
     print_run_plan(
         args,
         train_df=X_train,
@@ -672,6 +691,7 @@ def run_training_with_args(args, trial=None):
         optimizer=None,
         scheduler=None,
     )
+    """
 
     # =============================================================================================== #
     # 8) TRAIN
@@ -681,12 +701,27 @@ def run_training_with_args(args, trial=None):
         run_name = wandb.run.name
     print("\n[Wandb]")
     print(f"  Run Name     : {run_name}")
-    print("=" * 100 + "\n")
     
     if trial is not None:
         trial.set_user_attr("wandb_run_name", run_name)
 
-    best_val_acc = train(device, net, train_loader, val_loader, test_loader, args, logger, trial=trial)
+    best_val_acc = train(
+        device,
+        net,
+        train_loader,
+        val_loader,
+        test_loader,
+        args,
+        logger,
+        trial=trial,
+        train_df=X_train,
+        val_df=X_val,
+        test_df=X_test,
+        train_tfms=train_tfms,
+        eval_tfms=eval_tfms,
+    )
+
+
 
     # -------- GPU / memory cleanup BETWEEN trials --------
     try:

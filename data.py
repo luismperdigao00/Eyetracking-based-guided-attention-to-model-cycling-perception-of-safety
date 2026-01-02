@@ -15,6 +15,7 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 import timm
 
+
 class ComparisonsDataset(Dataset):
     """Cycling Safety Perception dataset."""
 
@@ -195,106 +196,6 @@ class DictTransform:
         return data
 
 
-# ========================================================================= #
-# CONFIGURATION & PRESETS for Transformations
-# ========================================================================= #
-
-# Default ImageNet-style fallback (used only if timm config cannot be resolved)
-DEFAULT_SPECS = {
-    "input_size": (3, 224, 224),
-    "crop_pct": 0.9,
-    "interpolation": "bicubic",
-    "mean": (0.485, 0.456, 0.406),
-    "std": (0.229, 0.224, 0.225),
-}
-
-# -----------------------------------------------------------------------------------------------
-# Backbone alias → timm model id mapping
-# -----------------------------------------------------------------------------------------------
-BACKBONE_ALIAS_TO_TIMM_ID = {
-    # 1) DINOv3
-    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",
-
-    # 2) BEiT v2
-    "beitv2_base_patch16_224": "beitv2_base_patch16_224.in1k_ft_in22k",
-
-    # 3) DeiT III
-    "deit3_base_patch16_224": "deit3_base_patch16_224.fb_in22k_ft_in1k",
-
-    # 4) SigLIP
-    "siglip_base_patch16_224": "vit_base_patch16_siglip_224",
-
-    # 5) CLIP
-    "vit_base_patch16_clip_224": "vit_base_patch16_clip_224.openai",
-
-    # EVA-02 (native 448 in your codebase)
-    "eva02_base": "eva02_base_patch14_448.mim_in22k_ft_in1k",
-}
-
-
-def get_model_specs(backbone_name: str):
-    """
-    Resolve preprocessing specs (mean/std, crop_pct, interpolation, input_size) for a backbone.
-
-    Critical:
-      - Your sweeps/CLI use aliases (e.g., "vit_base_patch16_clip_224") that are not valid timm IDs.
-      - If we fail to resolve config, we silently use DEFAULT_SPECS (ImageNet mean/std),
-        which is wrong for CLIP/SigLIP and can wreck performance.
-
-    This function maps alias → timm ID before calling timm.
-    """
-    import timm
-
-    # 0) Map alias → timm id (if applicable)
-    timm_id = BACKBONE_ALIAS_TO_TIMM_ID.get(backbone_name, backbone_name)
-
-    try:
-        # We do NOT need pretrained weights to resolve preprocessing config
-        dummy_model = timm.create_model(timm_id, pretrained=False)
-        cfg = timm.data.resolve_data_config(dummy_model.pretrained_cfg)
-
-        specs = {
-            "input_size": cfg.get("input_size", DEFAULT_SPECS["input_size"]),
-            "crop_pct": cfg.get("crop_pct", DEFAULT_SPECS["crop_pct"]),
-            "interpolation": cfg.get("interpolation", DEFAULT_SPECS["interpolation"]),
-            "mean": cfg.get("mean", DEFAULT_SPECS["mean"]),
-            "std": cfg.get("std", DEFAULT_SPECS["std"]),
-        }
-
-        # Your codebase trains transformers at 224 except EVA-02 at 448.
-        if backbone_name == "eva02_base" or "eva02" in backbone_name:
-            specs["input_size"] = (3, 448, 448)
-            specs["interpolation"] = specs.get("interpolation") or "bicubic"
-        else:
-            specs["input_size"] = (3, 224, 224)
-
-        return specs
-
-    except Exception:
-        print(
-            f"Warning: Could not auto-config '{backbone_name}' (timm id='{timm_id}'). Using defaults."
-        )
-        specs = dict(DEFAULT_SPECS)
-
-        # Preserve your EVA-02 behavior
-        if backbone_name == "eva02_base" or "eva02" in backbone_name:
-            specs["input_size"] = (3, 448, 448)
-            specs["interpolation"] = "bicubic"
-        else:
-            specs["input_size"] = (3, 224, 224)
-
-        return specs
-
-
-def _get_interp_mode(mode_str):
-    mapping = {
-        "nearest": InterpolationMode.NEAREST,
-        "bilinear": InterpolationMode.BILINEAR,
-        "bicubic": InterpolationMode.BICUBIC,
-        "lanczos": InterpolationMode.LANCZOS,
-    }
-    return mapping.get(str(mode_str).lower(), InterpolationMode.BILINEAR)
-
 # =============================================================================================== #
 # Augmentation presets
 # =============================================================================================== #
@@ -313,8 +214,8 @@ AUG_PRESETS = {
     "light": dict(
         hflip_p=0.35,
         swap_p=0.50,
-        crop_p=0.30,
-        crop_keep_area=0.85,
+        crop_p=0.50,
+        crop_keep_area=0.75,
         rotation_p=0.0,
         max_rotation_deg=0.0,
         color_jitter_p=0.0,
@@ -348,6 +249,22 @@ AUG_PRESETS = {
     ),
 }
 
+def _get_interp_mode(mode_str):
+    if mode_str is None:
+        raise ValueError("Interpolation mode is None; backbone config may be incomplete.")
+
+    mode_str = str(mode_str).lower()
+    mapping = {
+        "nearest": InterpolationMode.NEAREST,
+        "bilinear": InterpolationMode.BILINEAR,
+        "bicubic": InterpolationMode.BICUBIC,
+        "lanczos": InterpolationMode.LANCZOS,
+    }
+
+    if mode_str not in mapping:
+        raise ValueError(f"Unknown interpolation mode '{mode_str}'")
+
+    return mapping[mode_str]
 
 def build_eval_transforms(specs: dict):
     """Build deterministic evaluation preprocessing.
@@ -629,7 +546,7 @@ class Augmentation:
         sample["score_c"] = torch.tensor(score_c, dtype=torch.long)
         return sample
 
-
+    
 def build_train_transforms(args, eval_meta: dict):
     """Build the training transform based on args.augment.
 

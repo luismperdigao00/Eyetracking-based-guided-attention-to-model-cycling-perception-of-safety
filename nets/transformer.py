@@ -71,6 +71,7 @@ class Transformer(nn.Module):
 
         self.model = str(model).lower().strip()
         self.backbone = backbone
+        self.transformer = backbone
 
         # Pooling configuration
         self.pooling = str(pooling).lower().strip()
@@ -168,38 +169,43 @@ class Transformer(nn.Module):
     # Backbone output inspection
     # ---------------------------------------------------------------------
     def _inspect_backbone_structure(self) -> Tuple[int, int]:
-        """
-        Infer:
-          - feature dimension (embedding dim for token features)
-          - number of prefix tokens (CLS and register tokens)
-
-        The inspection uses a single dummy forward pass at 224x224 to avoid
-        relying on backbone-specific attributes (embed_dim, num_features, etc.).
-        """
-        device = next(self.backbone.parameters()).device
-        dummy = torch.zeros(1, 3, 224, 224, device=device)
-
-        with torch.no_grad():
-            feats = self._forward_backbone(dummy)
-
-        feats = self._unwrap_backbone_output(feats)
-
-        # Token features: [B, T, C]
-        if isinstance(feats, torch.Tensor) and feats.dim() == 3:
-            _, T, C = feats.shape
-
-            # For patch16 models at 224x224, expected patch count is 14*14=196.
-            expected_patches = (224 // 16) ** 2
-            prefix = max(0, T - expected_patches)
-            return int(C), int(prefix)
-
-        # Conv-like features: [B, C, H, W] or already pooled [B, C]
-        if isinstance(feats, torch.Tensor) and feats.dim() == 4:
-            return int(feats.shape[1]), 0
-        if isinstance(feats, torch.Tensor) and feats.dim() == 2:
-            return int(feats.shape[1]), 0
-
-        raise ValueError(f"Unexpected backbone output type/shape: {type(feats)} / {getattr(feats, 'shape', None)}")
+            """
+            Infer feature dimension and number of prefix tokens dynamically.
+            Uses timm attributes if available, falling back to inspection only if needed.
+            """
+            # 1. Try to get prefix tokens directly from timm backbone (Most robust)
+            if hasattr(self.backbone, "num_prefix_tokens"):
+                num_prefix = self.backbone.num_prefix_tokens
+            else:
+                # Fallback: assume 1 CLS token if not specified
+                num_prefix = 1
+                if hasattr(self.backbone, "global_pool") and self.backbone.global_pool == 'avg':
+                     num_prefix = 0 # some CNN-like transformers might have 0
+    
+            # 2. Run dummy forward to get embedding dimension (C)
+            # We use a tiny image just to check channel dim; sequence length T doesn't matter here
+            # because we already trusted num_prefix_tokens above.
+            device = next(self.backbone.parameters()).device
+            dummy = torch.zeros(1, 3, 224, 224, device=device)
+            
+            with torch.no_grad():
+                feats = self._forward_backbone(dummy)
+            
+            feats = self._unwrap_backbone_output(feats)
+    
+            # [B, T, C] -> Return C, num_prefix
+            if isinstance(feats, torch.Tensor) and feats.dim() == 3:
+                return int(feats.shape[2]), int(num_prefix)
+    
+            # [B, C, H, W] -> Return C, 0
+            if isinstance(feats, torch.Tensor) and feats.dim() == 4:
+                return int(feats.shape[1]), 0
+                
+            # [B, C] -> Return C, 0
+            if isinstance(feats, torch.Tensor) and feats.dim() == 2:
+                return int(feats.shape[1]), 0
+    
+            raise ValueError(f"Unexpected output: {getattr(feats, 'shape', 'unknown')}")
 
     # ---------------------------------------------------------------------
     # Backbone forward wrappers
@@ -467,6 +473,25 @@ class Transformer(nn.Module):
 
         return self._cls_map_from_attention(self._last_attn)
 
+    def train(self, mode: bool = True):
+            """
+            Override train mode to ensure frozen backbones stay in eval mode.
+            This prevents Stochastic Depth (DropPath) and Dropout from corrupting
+            features when the backbone weights are frozen.
+            """
+            super().train(mode)
+            
+            # If we are NOT finetuning (frozen backbone), we must force the 
+            # backbone to eval mode so it produces deterministic features.
+            # Check if 'finetune' attribute exists (it's set in __init__)
+            is_finetuning = getattr(self, "finetune", False) # or logic based on requires_grad
+            
+            # Double-check against the actual parameters to be safe
+            # (If user manually set requires_grad=False but passed finetune=True incorrectly)
+            has_grad = any(p.requires_grad for p in self.backbone.parameters())
+            
+            if mode and (not is_finetuning or not has_grad):
+                self.backbone.eval()
     # ---------------------------------------------------------------------
     # Forward branches and fusion head
     # ---------------------------------------------------------------------
