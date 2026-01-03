@@ -232,19 +232,25 @@ class DictTransform:
 # Light augmentation:
 #   - paired horizontal flip
 #   - label-aware left/right swap
-#   - paired random crop keeping ~85% of area
+#   - paired random crop (FIXED MODE): translation only, NO scale change (no zoom)
 #
 # Heavy augmentation:
 #   - includes light ops
-#   - adds paired color jitter, grayscale, random erasing
-#   - adds small-angle rotation
+#   - paired random crop (MILD ZOOM): allows scale variation between 0.85x and 1.0x
+#   - adds paired small-angle rotation
+#   - adds UNPAIRED color jitter (force lighting invariance)
+#   - adds paired grayscale, random erasing
 
 AUG_PRESETS = {
     "light": dict(
         hflip_p=0.35,
         swap_p=0.50,
+        
+        # CROP POLICY: Fixed (Translation Only)
         crop_p=0.50,
-        crop_keep_area=0.75,
+        crop_mode="fixed",    # <--- NEW: No zooming
+        min_zoom=1.0,         # <--- NEW: Unused in fixed mode, but explicit
+
         rotation_p=0.0,
         max_rotation_deg=0.0,
         color_jitter_p=0.0,
@@ -261,15 +267,22 @@ AUG_PRESETS = {
     "heavy": dict(
         hflip_p=0.35,
         swap_p=0.50,
-        crop_p=0.60,
-        crop_keep_area=0.75,
+        
+        # CROP POLICY: Mild Zoom (Controlled Scale Jitter)
+        crop_p=0.50,
+        crop_mode="mild_zoom", # <--- NEW: Controlled magnification
+        min_zoom=0.85,         # <--- NEW: Random crop 85%-100% of size (max ~1.17x zoom)
+
         rotation_p=0.25,
         max_rotation_deg=5.0,
+        
+        # PHOTOMETRIC: (Now Unpaired in Augmentation class)
         color_jitter_p=0.45,
         jitter_brightness=0.25,
         jitter_contrast=0.25,
         jitter_saturation=0.20,
         jitter_hue=0.08,
+        
         gray_p=0.10,
         erase_p=0.15,
         erase_scale=(0.03, 0.12),
@@ -333,15 +346,18 @@ def build_eval_transforms(specs: dict):
 
     return eval_tfms, meta
 
-
 class Augmentation:
     """
-    Paired augmentation pipeline for pairwise comparisons.
-
-    Key guarantees:
-      - No aspect-ratio warping (no direct HxW -> out_size x out_size resize).
-      - Paired crops are always valid for both images (size-aligned first).
-      - All resizes use the configured interpolation (no hardcoded bilinear).
+    Manages the paired augmentation pipeline for Siamese networks in pairwise comparison tasks.
+    
+    This class enforces a strict distinction between geometric and photometric transformations:
+      1. Geometric operations (crops, flips, rotations) are 'paired' (identical parameters 
+         for Left and Right) to ensure the physical comparison remains valid.
+      2. Photometric operations (color jitter) are 'unpaired' (independent) to force 
+         the model to learn invariance to lighting and exposure differences.
+    
+    It also addresses scale consistency by avoiding 'zoom gaps'—crops are taken directly 
+    at the target resolution rather than being resized post-crop.
     """
 
     def __init__(
@@ -349,43 +365,47 @@ class Augmentation:
         augment: bool,
         ties: bool,
 
-        # Geometry
+        # Geometry Config
         resize_short: int,
         out_size: int,
         interpolation,
 
-        # Normalization
+        # Normalization Config
         mean: tuple,
         std: tuple,
 
-        # Paired invariances
+        # Paired Geometric Invariances
         hflip_p: float = 0.25,
         swap_p: float = 0.50,
 
-        # Paired crop
+        # Crop Policy
         crop_p: float = 0.30,
-        crop_keep_area: float = 0.85,
+        crop_mode: str = "fixed",      # "fixed" (translation only) or "mild_zoom" (controlled scale jitter)
+        min_zoom: float = 0.90,        # Lower bound for crop scale (0.90 = up to ~1.11x magnification)
 
-        # Paired small rotation
+        # Rotation
         rotation_p: float = 0.0,
         max_rotation_deg: float = 0.0,
 
-        # Paired photometric
+        # Unpaired Photometric Invariances
         color_jitter_p: float = 0.0,
         jitter_brightness: float = 0.0,
         jitter_contrast: float = 0.0,
         jitter_saturation: float = 0.0,
         jitter_hue: float = 0.0,
 
-        # Paired grayscale
+        # Paired Grayscale (Semantic decision)
         gray_p: float = 0.0,
 
-        # Paired random erasing (on tensors)
+        # Paired Random Erasing (Tensor domain)
         erase_p: float = 0.0,
         erase_scale=(0.02, 0.20),
         erase_ratio=(0.30, 3.30),
         erase_value: float = 0.0,
     ):
+        """
+        Initializes the pipeline configuration.
+        """
         self.augment = bool(augment)
         self.ties = bool(ties)
 
@@ -400,7 +420,12 @@ class Augmentation:
         self.swap_p = float(swap_p)
 
         self.crop_p = float(crop_p)
-        self.crop_keep_area = float(crop_keep_area)
+        self.crop_mode = str(crop_mode).lower().strip()
+        if self.crop_mode not in ("fixed", "mild_zoom"):
+            self.crop_mode = "fixed"
+
+        self.min_zoom = float(min_zoom)
+        self.min_zoom = max(0.50, min(1.0, self.min_zoom))  # Safety clamp to prevent extreme upsampling
 
         self.rotation_p = float(rotation_p)
         self.max_rotation_deg = float(max_rotation_deg)
@@ -414,8 +439,8 @@ class Augmentation:
         self.gray_p = float(gray_p)
 
         self.erase_p = float(erase_p)
-
-        # Accept presets as tuples, but also tolerate old min/max fields if present elsewhere
+        
+        # Resolve tuple vs list inputs for erasing configuration
         if isinstance(erase_scale, (tuple, list)) and len(erase_scale) == 2:
             self.erase_scale_min = float(erase_scale[0])
             self.erase_scale_max = float(erase_scale[1])
@@ -434,25 +459,25 @@ class Augmentation:
 
     def _score_r_to_score_c(self, score_r: int) -> int:
         """
-        Convert ranking label (-1,0,+1) into classification encoding.
-        Keeps your existing convention:
-            - with ties:  {-1,0,+1} -> {0,1,2}
-            - no ties:    {-1,+1}   -> {0,1}
+        Converts a ranking score (-1, 0, 1) into a classification index compatible with CrossEntropyLoss.
+        If ties are disabled, maps {-1, 1} -> {0, 1}.
+        If ties are enabled, maps {-1, 0, 1} -> {0, 1, 2}.
         """
         if self.ties:
-            return int(score_r) + 1  # -1->0, 0->1, +1->2
+            return int(score_r) + 1
         return 0 if int(score_r) < 0 else 1
 
     def _resize_short_side(self, pil_img: Image.Image) -> Image.Image:
-        """Resize so that the shorter side equals self.resize_short (aspect ratio preserved)."""
-        # torchvision TF.resize with an int preserves aspect ratio by design.
+        """
+        Resizes an image such that its shorter side matches `self.resize_short`, preserving aspect ratio.
+        """
         return TF.resize(pil_img, self.resize_short, interpolation=self.interpolation)
 
     @staticmethod
     def _center_crop_to_common_size(image_l: Image.Image, image_r: Image.Image):
         """
-        Make both images share the same (W,H) by center-cropping to the minimum
-        width/height across the pair. This prevents invalid paired crop boxes.
+        Standardizes the dimensions of the input pair. Both images are center-cropped to the 
+        minimum common width and height to ensure subsequent paired crops are valid on both.
         """
         wl, hl = image_l.size
         wr, hr = image_r.size
@@ -464,54 +489,28 @@ class Augmentation:
             image_r = TF.center_crop(image_r, [h, w])
         return image_l, image_r, w, h
 
-    def _sample_keep_area_crop(self, w: int, h: int):
-        """Sample a crop box (left, top, crop_w, crop_h) keeping a fixed fraction of area."""
-        keep = max(0.10, min(1.0, float(self.crop_keep_area)))
-        scale = math.sqrt(keep)
-        crop_w = max(1, min(w, int(round(w * scale))))
-        crop_h = max(1, min(h, int(round(h * scale))))
-
-        # Ensure crop is valid.
-        crop_w = min(crop_w, w)
-        crop_h = min(crop_h, h)
-
-        if crop_w == w and crop_h == h:
-            return 0, 0, w, h
-
-        left = random.randint(0, w - crop_w)
-        top = random.randint(0, h - crop_h)
-        return left, top, crop_w, crop_h
-
-    def _apply_paired_color_jitter(self, image_l: Image.Image, image_r: Image.Image):
-        """Apply identical photometric jitter factors to both images."""
-        # Brightness
-        if self.jitter_brightness > 0:
-            b = 1.0 + random.uniform(-self.jitter_brightness, self.jitter_brightness)
-            image_l = TF.adjust_brightness(image_l, b)
-            image_r = TF.adjust_brightness(image_r, b)
-
-        # Contrast
-        if self.jitter_contrast > 0:
-            c = 1.0 + random.uniform(-self.jitter_contrast, self.jitter_contrast)
-            image_l = TF.adjust_contrast(image_l, c)
-            image_r = TF.adjust_contrast(image_r, c)
-
-        # Saturation
-        if self.jitter_saturation > 0:
-            s = 1.0 + random.uniform(-self.jitter_saturation, self.jitter_saturation)
-            image_l = TF.adjust_saturation(image_l, s)
-            image_r = TF.adjust_saturation(image_r, s)
-
-        # Hue
-        if self.jitter_hue > 0:
-            h = random.uniform(-self.jitter_hue, self.jitter_hue)
-            image_l = TF.adjust_hue(image_l, h)
-            image_r = TF.adjust_hue(image_r, h)
-
-        return image_l, image_r
+    def _apply_unpaired_color_jitter(self, image_l: Image.Image, image_r: Image.Image):
+        """
+        Applies photometric distortion (jitter) independently to each image.
+        
+        By using different random parameters for Left vs Right, the model is forced to learn
+        features robust to lighting and exposure mismatches, preventing it from relying on
+        identical histograms as a shortcut.
+        """
+        jitter = transforms.ColorJitter(
+            brightness=self.jitter_brightness,
+            contrast=self.jitter_contrast,
+            saturation=self.jitter_saturation,
+            hue=self.jitter_hue
+        )
+        # The transform is called separately, generating unique random parameters for each image.
+        return jitter(image_l), jitter(image_r)
 
     def _sample_erasing_rect(self, H: int, W: int, max_tries: int = 10):
-        """Sample a valid erasing rectangle (top, left, eh, ew) for a tensor image."""
+        """
+        Attempts to generate a valid random rectangle (top, left, height, width) for tensor erasing.
+        Returns None if valid parameters cannot be found within max_tries.
+        """
         for _ in range(max_tries):
             area = H * W
             erase_area = area * random.uniform(self.erase_scale_min, self.erase_scale_max)
@@ -527,7 +526,10 @@ class Augmentation:
         return None
 
     def _paired_erase(self, x_l: torch.Tensor, x_r: torch.Tensor):
-        """Apply the same erasing rectangle to both tensors (in-place)."""
+        """
+        Applies the same Random Erasing rectangle to both tensors. This is a geometric occlusion,
+        so it must be paired to avoid occluding the subject in one image but not the other.
+        """
         _, H, W = x_l.shape
         rect = self._sample_erasing_rect(H, W)
         if rect is None:
@@ -537,85 +539,143 @@ class Augmentation:
         x_r[:, top : top + eh, left : left + ew] = self.erase_value
         return x_l, x_r
 
+    def _paired_random_crop_fixed(self, image_l: Image.Image, image_r: Image.Image):
+        """
+        Performs a paired RandomCrop at the exact output resolution.
+        
+        This method avoids the 'zoom gap' by ensuring no resizing occurs after the crop.
+        It strictly selects a window of size `out_size` from the input images, preserving
+        the original scale of objects (1:1 with validation).
+        """
+        w, h = image_l.size
+        th = tw = self.out_size
+
+        # Guard: If input is smaller than crop size, resize up to safe minimum first.
+        if w < tw or h < th:
+            new_short = max(self.resize_short, self.out_size)
+            image_l = TF.resize(image_l, new_short, interpolation=self.interpolation)
+            image_r = TF.resize(image_r, new_short, interpolation=self.interpolation)
+            image_l, image_r, w, h = self._center_crop_to_common_size(image_l, image_r)
+
+        i = random.randint(0, h - th)
+        j = random.randint(0, w - tw)
+        return TF.crop(image_l, i, j, th, tw), TF.crop(image_r, i, j, th, tw)
+
+    def _paired_random_crop_mild_zoom(self, image_l: Image.Image, image_r: Image.Image):
+        """
+        Performs a paired RandomResizedCrop with strictly bounded magnification.
+        
+        It selects a crop size between `min_zoom * size` and `1.0 * size`.
+        - If 1.0 is selected, the crop is 1:1 scale (identical to fixed mode).
+        - If min_zoom is selected, the crop is stretched to fill the output, creating a mild zoom-in.
+        
+        This introduces controlled scale augmentation without allowing extreme close-ups.
+        """
+        w, h = image_l.size
+        min_side = min(w, h)
+
+        # Bounded crop size: from [min_zoom * min_side] up to [min_side]
+        lo = max(self.out_size, int(round(self.min_zoom * min_side)))
+        hi = min_side
+        if lo > hi:
+            lo = hi
+
+        crop_side = random.randint(lo, hi)
+
+        i = random.randint(0, h - crop_side)
+        j = random.randint(0, w - crop_side)
+
+        image_l = TF.crop(image_l, i, j, crop_side, crop_side)
+        image_r = TF.crop(image_r, i, j, crop_side, crop_side)
+
+        image_l = TF.resize(image_l, [self.out_size, self.out_size], interpolation=self.interpolation)
+        image_r = TF.resize(image_r, [self.out_size, self.out_size], interpolation=self.interpolation)
+        return image_l, image_r
+
     def __call__(self, sample: dict) -> dict:
+        """
+        Executes the augmentation pipeline on a dictionary sample containing PIL images.
+        Handles paired inputs, ensuring geometric consistency and applying configured transformations.
+        """
         image_l = sample["image_l"]
         image_r = sample["image_r"]
         score_r = int(sample["score_r"])
         score_c = int(sample.get("score_c", self._score_r_to_score_c(score_r)))
-    
+
         do_aug = bool(self.augment)
-    
-        # This pipeline expects PIL inputs for geometric/photometric augmentation.
+
+        # Determine if inputs are PIL images (needing geometric transforms) or already tensors.
         pil_inputs = (not torch.is_tensor(image_l)) and (not torch.is_tensor(image_r))
+        
         if pil_inputs:
-            # 1) Resize (short side) with consistent interpolation
+            # 1. Base Resize: Short side resize to standard working resolution.
             image_l = self._resize_short_side(image_l)
             image_r = self._resize_short_side(image_r)
-    
-            # 2) Ensure both images share exact same size before any paired crop
-            image_l, image_r, w, h = self._center_crop_to_common_size(image_l, image_r)
-    
-            # 3) Paired invariances / geometry
+            
+            # 2. Alignment: Ensure identical dimensions before paired cropping.
+            image_l, image_r, _, _ = self._center_crop_to_common_size(image_l, image_r)
+
+            # 3. Geometric Augmentations (PAIRED)
+            # Horizontal Flip: Must be paired to preserve scene semantics (e.g., traffic side).
             if do_aug and (random.random() < self.hflip_p):
                 image_l = TF.hflip(image_l)
                 image_r = TF.hflip(image_r)
-    
-            # Paired crop policy:
-            # - if crop triggers: random keep-area crop, then resize to out_size
-            # - else: center crop to out_size (no warping)
+
+            # Random Crop: Must be paired so both images show the same relative viewport.
             if do_aug and (random.random() < self.crop_p):
-                left, top, cw, ch = self._sample_keep_area_crop(w, h)
-                image_l = TF.crop(image_l, top, left, ch, cw)
-                image_r = TF.crop(image_r, top, left, ch, cw)
-                image_l = TF.resize(image_l, [self.out_size, self.out_size], interpolation=self.interpolation)
-                image_r = TF.resize(image_r, [self.out_size, self.out_size], interpolation=self.interpolation)
+                if self.crop_mode == "mild_zoom":
+                    image_l, image_r = self._paired_random_crop_mild_zoom(image_l, image_r)
+                else:
+                    image_l, image_r = self._paired_random_crop_fixed(image_l, image_r)
             else:
+                # Fallback to Center Crop (deterministic/eval mode behavior).
                 image_l = TF.center_crop(image_l, [self.out_size, self.out_size])
                 image_r = TF.center_crop(image_r, [self.out_size, self.out_size])
-    
+
+            # Rotation: Must be paired to keep horizons aligned.
             if do_aug and (self.rotation_p > 0.0) and (random.random() < self.rotation_p):
                 angle = random.uniform(-self.max_rotation_deg, self.max_rotation_deg)
                 image_l = TF.rotate(image_l, angle=angle, interpolation=self.interpolation, expand=False)
                 image_r = TF.rotate(image_r, angle=angle, interpolation=self.interpolation, expand=False)
-    
+
+            # 4. Photometric Augmentations (UNPAIRED)
+            # Color Jitter: Applied independently to force invariance to lighting conditions.
             if do_aug and (random.random() < self.color_jitter_p):
-                image_l, image_r = self._apply_paired_color_jitter(image_l, image_r)
-    
-            # Paired grayscale (same decision for both images)
+                image_l, image_r = self._apply_unpaired_color_jitter(image_l, image_r)
+
+            # Grayscale: Paired (binary decision), prevents one image being BW and other Color.
             if do_aug and (self.gray_p > 0.0) and (random.random() < self.gray_p):
                 image_l = TF.rgb_to_grayscale(image_l, num_output_channels=3)
                 image_r = TF.rgb_to_grayscale(image_r, num_output_channels=3)
-    
-            # Paired swap (label-consistent)
+
+            # Swap: Paired logic to maintain label consistency.
             if do_aug and (random.random() < self.swap_p):
                 image_l, image_r = image_r, image_l
                 score_r = -score_r
                 score_c = self._score_r_to_score_c(score_r)
-    
-            # To tensor
+
+            # Convert to Tensor
             x_l = TF.to_tensor(image_l)
             x_r = TF.to_tensor(image_r)
-    
         else:
-            # If tensors are already provided, assume geometry has been handled upstream.
+            # Handle case where inputs were already tensors (skip PIL ops).
             x_l = image_l if torch.is_tensor(image_l) else TF.to_tensor(image_l)
             x_r = image_r if torch.is_tensor(image_r) else TF.to_tensor(image_r)
-    
-        # 4) Paired erasing (tensor domain)
+
+        # 5. Tensor-Level Augmentations
+        # Random Erasing: Paired geometric occlusion.
         if do_aug and (random.random() < self.erase_p):
             x_l, x_r = self._paired_erase(x_l, x_r)
-    
-        # 5) Normalize (shared convention with eval)
+
+        # Normalization
         x_l = TF.normalize(x_l, mean=self.mean, std=self.std)
         x_r = TF.normalize(x_r, mean=self.mean, std=self.std)
-    
+
         sample["image_l"] = x_l
         sample["image_r"] = x_r
         sample["score_r"] = torch.tensor(score_r, dtype=torch.long)
         sample["score_c"] = torch.tensor(score_c, dtype=torch.long)
         return sample
-
-
     
 def build_train_transforms(args, eval_meta: dict):
     """Build the training transform based on args.augment.

@@ -8,6 +8,14 @@ class CNN(nn.Module):
     """
     Pairwise CNN model for ranking and/or classification.
 
+    This module wraps a standard convolutional backbone (e.g., ResNet) to provide:
+      1. Spatial feature maps for CAM-like attention extraction (Gaze supervision).
+      2. Flattened feature vectors for Ranking and Classification heads.
+    
+    To preserve spatial information (7x7 grid) while preventing parameter explosion in 
+    the linear heads, the backbone is sliced to remove its native pooling layer, and 
+    Global Average Pooling is applied manually after feature extraction.
+
     Modes (self.model):
       - 'rcnn'  : Ranking loss only
       - 'sscnn' : Classification loss only
@@ -21,13 +29,18 @@ class CNN(nn.Module):
         # ------------------------------------------------------------------
         # Backbone: get convolutional feature extractor
         # ------------------------------------------------------------------
-        # torchvision-style models (alexnet, vgg, densenet, resnet)
+        # We strip the final FC and Pooling layers to access the spatial grid.
         try:
             # Models with .features (e.g., alexnet, vgg, densenet)
             self.cnn = backbone(weights='DEFAULT').features
         except AttributeError:
-            # Models like resnet: use everything except the final pooling+fc
-            self.cnn = nn.Sequential(*list(backbone(weights='DEFAULT').children())[:-1])
+            # Models like resnet: use everything except the final Pooling (layer [-1]) and FC (layer [-1])
+            # Slicing [:-2] ensures we get [B, C, 7, 7] instead of [B, C, 1, 1].
+            self.cnn = nn.Sequential(*list(backbone(weights='DEFAULT').children())[:-2])
+
+        # Manual Global Pooling to reduce [B, C, H, W] -> [B, C, 1, 1] before flattening.
+        # This keeps the Linear layer input size fixed to C (e.g., 2048), avoiding parameter explosion.
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
         # Optionally freeze backbone
         if not finetune:
@@ -39,18 +52,21 @@ class CNN(nn.Module):
         # ------------------------------------------------------------------
         with torch.no_grad():
             dummy = torch.randn(1, 3, 224, 224)
-            feat = self.cnn(dummy)  # [1, C, H, W] or [1, C]
+            feat = self.cnn(dummy)  # Expected: [1, C, H, W]
+            
             if feat.dim() == 2:
-                # e.g., some backbones may already pool to [B, C]
+                # Fallback: backbone already pools (uncommon with current slicing)
                 C = feat.size(1)
                 H = W = 1
+                self.flat_dim = C
             else:
                 _, C, H, W = feat.size()
+                # We pool before flattening, so input dim is C, not C*H*W
+                self.flat_dim = C
 
         self.cnn_channels = C
         self.cnn_h = H
         self.cnn_w = W
-        self.flat_dim = C * H * W
 
         # ------------------------------------------------------------------
         # Ranking head (single-branch)
@@ -78,17 +94,22 @@ class CNN(nn.Module):
     # ----------------------------------------------------------------------
     def _forward_backbone(self, x: torch.Tensor):
         """
-        Run CNN backbone and return feature map [B,C,H,W] and flattened features [B,flat_dim].
+        Run CNN backbone and return:
+          1. feat_map: Spatial features [B, C, H, W] for Attention extraction.
+          2. flat: Pooled and flattened features [B, C] for Dense layers.
         """
-        feat = self.cnn(x)  # usually [B, C, H, W] or [B, C, 1, 1]
+        feat = self.cnn(x)
+        
         if feat.dim() == 2:
-            # [B, C] -> treat as [B, C, 1, 1]
+            # Handle edge case where backbone output is already 2D
             feat_map = feat.unsqueeze(-1).unsqueeze(-1)
+            flat = feat
         else:
             feat_map = feat
-
-        B = feat_map.size(0)
-        flat = feat_map.view(B, -1)
+            # Apply manual global pooling to condense spatial dimensions
+            pooled = self.global_pool(feat)
+            flat = pooled.flatten(1)
+            
         return feat_map, flat
 
     def _extract_cam_like_attn(self, feat_map: torch.Tensor) -> torch.Tensor:
@@ -98,10 +119,12 @@ class CNN(nn.Module):
         - Upsample to 14x14 (to match gaze maps)
         - Normalize to form a probability distribution per sample
         """
-        # feat_map: [B,C,H,W]
-        cam = feat_map.mean(dim=1, keepdim=True)  # [B,1,H,W]
+        # feat_map: [B, C, H, W]
+        cam = feat_map.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        
+        # Bilinear interpolate to standard Gaze grid size
         cam = F.interpolate(cam, size=(14, 14), mode='bilinear', align_corners=False)
-        cam = cam.squeeze(1)  # [B,14,14]
+        cam = cam.squeeze(1)  # [B, 14, 14]
 
         # L1 normalize per sample
         B = cam.shape[0]
@@ -123,16 +146,16 @@ class CNN(nn.Module):
             'attn_map': [B,14,14]  (CNN-based CAM approximation)
           }
         """
-        feat_map, flat = self._forward_backbone(batch)  # [B,C,H,W], [B,flat_dim]
+        feat_map, flat = self._forward_backbone(batch)  # [B, C, H, W], [B, C]
 
         # Ranking head
         x = self.rank_fc_1(flat)
         x = self.rank_relu(x)
         x = self.rank_drop(x)
-        score = self.rank_fc_out(x)  # [B,1]
+        score = self.rank_fc_out(x)  # [B, 1]
 
         # CAM-like attention map for KL loss (if used)
-        attn_map = self._extract_cam_like_attn(feat_map)  # [B,14,14]
+        attn_map = self._extract_cam_like_attn(feat_map)  # [B, 14, 14]
 
         return {'output': score, 'attn_map': attn_map}
 
@@ -144,15 +167,15 @@ class CNN(nn.Module):
         Forward pass for classification using concatenated features.
         Returns:
           {
-            'output': logits [B,num_classes],
-            'features_left':  [B,flat_dim],
-            'features_right': [B,flat_dim],
+            'output': logits [B, num_classes],
+            'features_left':  [B, C],
+            'features_right': [B, C],
           }
         """
         feat_map_l, flat_l = self._forward_backbone(batch_left)
         feat_map_r, flat_r = self._forward_backbone(batch_right)
 
-        x = torch.cat((flat_l, flat_r), dim=1)  # [B, 2*flat_dim]
+        x = torch.cat((flat_l, flat_r), dim=1)  # [B, 2*C]
         x = self.cross_fc_1(x)
         x = self.cross_relu_1(x)
         x = self.cross_drop_1(x)

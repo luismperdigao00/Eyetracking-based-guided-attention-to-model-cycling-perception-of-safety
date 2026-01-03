@@ -385,17 +385,10 @@ def compute_class_weights_from_df(
 def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     """
     Print a concise, behavior-accurate summary of the transform policy.
-
-    The function reports:
-      - Backbone-specific preprocessing parameters if available (input size, crop pct, interpolation)
-      - Evaluation preprocessing (deterministic)
-      - Training policy:
-          * augmentation disabled -> train == eval
-          * augmentation enabled  -> paired, label-aware augmentation callable
     """
 
     # ------------------------------------------------------------------
-    # Backbone specs and resolved eval geometry (preferred source: metadata)
+    # Backbone specs and resolved eval geometry
     # ------------------------------------------------------------------
     tm = getattr(args, "transforms_meta", None)
     if isinstance(tm, dict) and isinstance(tm.get("model_specs", None), dict):
@@ -417,7 +410,7 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     print("\n================ AUGMENTATION PLAN ================")
 
     # ------------------------------------------------------------------
-    # Read augment level (supports backward compatibility)
+    # Read augment level
     # ------------------------------------------------------------------
     augment_level = getattr(args, "augment", "none")
     if isinstance(augment_level, bool):
@@ -427,9 +420,6 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     if augment_level not in ("none", "light", "heavy"):
         augment_level = "none"
 
-    # ------------------------------------------------------------------
-    # Case 1: augmentation OFF
-    # ------------------------------------------------------------------
     if augment_level == "none":
         print("Data augmentation : OFF")
         print("Train transforms  : deterministic (same as eval preprocessing)")
@@ -458,7 +448,7 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     pa = train_tfms  # alias
 
     # ------------------------------------------------------------------
-    # Paired structure and label behavior
+    # Pairwise structure
     # ------------------------------------------------------------------
     print("\n[Pairwise structure]")
     print(f"  - Horizontal flip        : p={getattr(pa, 'hflip_p', 0.0):g}")
@@ -471,53 +461,67 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None):
         print("  - Binary labels          : label inverted on swap")
 
     # ------------------------------------------------------------------
-    # Geometric augmentation (paired)
+    # Geometric augmentation (PAIRED)
     # ------------------------------------------------------------------
+    print("\n[Geometric augmentation] (Paired)")
+    
+    # Report Crop Mode details
     crop_p = getattr(pa, "crop_p", 0.0)
-    crop_keep = getattr(pa, "crop_keep_area", None)
-    rotation_p = getattr(pa, "rotation_p", 0.0)
-    max_rot = getattr(pa, "max_rotation_deg", None)
-
-    print("\n[Geometric augmentation] (paired)")
-    if crop_keep is not None:
-        print(f"  - Random crop            : p={crop_p:g}, keep_area≈{float(crop_keep):.2f}")
+    crop_mode = getattr(pa, "crop_mode", "fixed")
+    
+    if crop_mode == "fixed":
+        print(f"  - Random crop            : p={crop_p:g} (Mode: FIXED / Translation only)")
+    elif crop_mode == "mild_zoom":
+        min_z = getattr(pa, "min_zoom", 1.0)
+        print(f"  - Random crop            : p={crop_p:g} (Mode: MILD ZOOM, scale {min_z:.2f}-1.0)")
     else:
-        print(f"  - Random crop            : p={crop_p:g}")
+        print(f"  - Random crop            : p={crop_p:g} (Mode: {crop_mode})")
 
-    if rotation_p and rotation_p > 0.0 and max_rot is not None:
-        print(f"  - Small rotation         : p={rotation_p:g}, ±{float(max_rot):g}°")
+    # Rotation
+    rotation_p = getattr(pa, "rotation_p", 0.0)
+    max_rot = getattr(pa, "max_rotation_deg", 0.0)
+    if rotation_p > 0.0 and max_rot > 0:
+        print(f"  - Small rotation         : p={rotation_p:g}, ±{max_rot:g}°")
     else:
         print("  - Small rotation         : OFF")
 
     # ------------------------------------------------------------------
-    # Photometric augmentation (paired)
+    # Photometric augmentation (MIXED)
     # ------------------------------------------------------------------
+    print("\n[Photometric augmentation]")
+    
+    # Color Jitter is now UNPAIRED (Independent)
     cj_p = getattr(pa, "color_jitter_p", 0.0)
-    gray_p = getattr(pa, "gray_p", 0.0)
+    if cj_p > 0:
+        print(f"  - Color jitter           : p={cj_p:g} (UNPAIRED / Independent)")
+    else:
+        print(f"  - Color jitter           : OFF")
 
-    print("\n[Photometric augmentation] (paired)")
-    print(f"  - Color jitter           : p={cj_p:g}")
-    print(f"  - Grayscale              : p={gray_p:g}")
+    # Grayscale remains PAIRED
+    gray_p = getattr(pa, "gray_p", 0.0)
+    if gray_p > 0:
+        print(f"  - Grayscale              : p={gray_p:g} (Paired)")
+    else:
+        print(f"  - Grayscale              : OFF")
 
     # ------------------------------------------------------------------
-    # Tensor augmentation (paired)
+    # Tensor augmentation (PAIRED)
     # ------------------------------------------------------------------
     erase_p = getattr(pa, "erase_p", 0.0)
-    erase_scale = getattr(pa, "erase_scale", None)
-
-    print("\n[Tensor augmentation] (paired)")
-    print(f"  - Random erasing         : p={erase_p:g}")
-    if erase_scale is not None:
-        print(f"    • erased area range    : {float(erase_scale[0]):.2f}–{float(erase_scale[1]):.2f}")
+    print("\n[Tensor augmentation] (Paired)")
+    if erase_p > 0:
+        scale = getattr(pa, "erase_scale_min", 0.02), getattr(pa, "erase_scale_max", 0.2)
+        print(f"  - Random erasing         : p={erase_p:g}")
+        print(f"    • erased area range    : {scale[0]:.2f}–{scale[1]:.2f}")
+    else:
+        print(f"  - Random erasing         : OFF")
 
     # ------------------------------------------------------------------
     # Effective preprocessing steps
     # ------------------------------------------------------------------
     print("\n[Deterministic steps]")
-    print("  - Resize(short side) → Crop/Resize(out_size) → ToTensor → Normalize")
-
+    print("  - Resize(short side) → Crop(out_size) → ToTensor → Normalize")
     print("==================================================\n")
-
 
 
 # =================================================================================================

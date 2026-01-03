@@ -245,69 +245,131 @@ def _build_optimizer(
     backbone_params: list,
 ) -> Tuple[torch.optim.Optimizer, Dict]:
     """
-    Optimizer builder: SAME LR for everything.
+    Optimizer builder with family-specific policies.
 
-    Rules:
-      - One LR everywhere: head + backbone + all backbone layers.
-      - finetune=True  -> optimize all trainable params in net
-      - finetune=False -> optimize head-only trainable params
-      - Weight decay handling (recommended):
-           * decay applied to weights
-           * no_decay (wd=0) for bias + norm (+ len_sig per your convention)
+    Policies:
+      A) Transformers: Single LR (AdamW).
+         - Uses the simplified policy provided: one LR for head + backbone.
+      
+      B) CNNs: Split LR (Adam).
+         - Head params get High LR (100x base).
+         - Backbone params get Low LR (1x base).
+         - This gap is crucial because CNN backbones are pre-trained (need gentle updates),
+           while random heads need aggressive updates to learn.
 
+    Common Rules:
+      - finetune=True  -> optimize backbone + head
+      - finetune=False -> optimize head only
+      - Weight decay   -> applied to weights, disabled for bias/norm
     """
     base_lr = float(getattr(args, "base_lr"))
     weight_decay = float(getattr(args, "weight_decay", 0.0))
     finetune = bool(getattr(args, "finetune", False))
 
-    # -------------------------
-    # Select target parameters
-    # -------------------------
-    if finetune:
-        # All trainable parameters (head + backbone), same LR
-        target_named = [(n, p) for (n, p) in net.named_parameters() if p.requires_grad]
-        mode = "all_trainable_single_lr"
+    # =========================================================================
+    # TRANSFORMERS (Single LR, AdamW)
+    # =========================================================================
+    if is_transformer:
+        # -------------------------
+        # Select target parameters
+        # -------------------------
+        if finetune:
+            # All trainable parameters (head + backbone)
+            target_named = [(n, p) for (n, p) in net.named_parameters() if p.requires_grad]
+            mode = "transformer_all_single_lr"
+        else:
+            # Head-only trainable parameters
+            target_named = [(n, p) for (n, p) in head_params if p.requires_grad]
+            mode = "transformer_head_only"
+
+        # -------------------------
+        # Split decay / no_decay
+        # -------------------------
+        decay_params, no_decay_params = _separate_decay(target_named)
+
+        # -------------------------
+        # Optimizer (AdamW standard for ViTs)
+        # -------------------------
+        optimizer = optim.AdamW(
+            [
+                {"params": decay_params, "lr": base_lr, "weight_decay": weight_decay},
+                {"params": no_decay_params, "lr": base_lr, "weight_decay": 0.0},
+            ],
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+
+        optimizer_info = {
+            "family": "transformer",
+            "optimizer": "AdamW",
+            "mode": mode,
+            "base_lr": base_lr,
+            "weight_decay": weight_decay,
+        }
+        return optimizer, optimizer_info
+
+    # =========================================================================
+    # CNNs (Split LR, Adam)
+    # =========================================================================
     else:
-        # Head-only trainable parameters
-        target_named = [(n, p) for (n, p) in head_params if p.requires_grad]
-        mode = "head_only_single_lr"
+        # -------------------------
+        # Define LR Multipliers
+        # -------------------------
+        # Head needs much higher LR than the pre-trained backbone
+        HEAD_LR_MULT = 100.0
+        head_lr = base_lr * HEAD_LR_MULT
+        backbone_lr = base_lr
 
-    # -------------------------
-    # Split decay / no_decay
-    # -------------------------
-    decay_params, no_decay_params = _separate_decay(target_named)
+        # -------------------------
+        # 1. Prepare Head Groups (Always optimized)
+        # -------------------------
+        target_head = [(n, p) for (n, p) in head_params if p.requires_grad]
+        head_decay, head_no_decay = _separate_decay(target_head)
 
-    # -------------------------
-    # Optimizer choice
-    # -------------------------
-    opt_class = optim.AdamW if is_transformer else optim.AdamW
+        groups = []
+        # Group 1: Head (Decay)
+        if head_decay:
+            groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay})
+        # Group 2: Head (No Decay)
+        if head_no_decay:
+            groups.append({"params": head_no_decay, "lr": head_lr, "weight_decay": 0.0})
 
-    optimizer = opt_class(
-        [
-            {"params": decay_params, "lr": base_lr, "weight_decay": weight_decay},
-            {"params": no_decay_params, "lr": base_lr, "weight_decay": 0.0},
-        ],
-        betas=(0.9, 0.999),
-        eps=1e-8,
-    )
+        # -------------------------
+        # 2. Prepare Backbone Groups (Only if finetune)
+        # -------------------------
+        if finetune:
+            target_bb = [(n, p) for (n, p) in backbone_params if p.requires_grad]
+            bb_decay, bb_no_decay = _separate_decay(target_bb)
 
-    # -------------------------
-    # Info for run plan logging
-    # -------------------------
-    optimizer_info = {
-        "family": "transformer" if is_transformer else "cnn",
-        "optimizer": optimizer.__class__.__name__,
-        "mode": mode,
-        "single_lr": True,
-        "base_lr": base_lr,
-        "weight_decay": weight_decay,
-        "n_params_decay": int(sum(p.numel() for p in decay_params)),
-        "n_params_no_decay": int(sum(p.numel() for p in no_decay_params)),
-        "n_tensors_decay": int(len(decay_params)),
-        "n_tensors_no_decay": int(len(no_decay_params)),
-    }
+            # Group 3: Backbone (Decay)
+            if bb_decay:
+                groups.append({"params": bb_decay, "lr": backbone_lr, "weight_decay": weight_decay})
+            # Group 4: Backbone (No Decay)
+            if bb_no_decay:
+                groups.append({"params": bb_no_decay, "lr": backbone_lr, "weight_decay": 0.0})
+            
+            mode = "cnn_split_lr"
+        else:
+            mode = "cnn_head_only"
 
-    return optimizer, optimizer_info
+        # -------------------------
+        # Optimizer (Adam usually more stable for ResNet fine-tuning than AdamW)
+        # -------------------------
+        optimizer = optim.Adam(
+            groups,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+
+        optimizer_info = {
+            "family": "cnn",
+            "optimizer": "Adam",
+            "mode": mode,
+            "backbone_lr": backbone_lr,
+            "head_lr": head_lr,
+            "weight_decay": weight_decay,
+        }
+        return optimizer, optimizer_info
 
 def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, base_lr: float):
     """

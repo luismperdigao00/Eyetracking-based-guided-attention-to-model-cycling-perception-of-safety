@@ -110,13 +110,32 @@ class Transformer(nn.Module):
         # ------------------------------------------------------------------
         self.feat_norm = nn.LayerNorm(self.feat_dim)
         self.pair_norm = nn.LayerNorm(self.feat_dim * 2)
-
+        """
         # Ranking head (per-image)
         self.rank_fc_1 = nn.Linear(self.feat_dim, 4096)
+        #self.rank_fc_1 = nn.Linear(self.feat_dim, 32)
         self.rank_relu = nn.ReLU()
         self.rank_drop = nn.Dropout(float(rank_dropout))
         self.rank_fc_out = nn.Linear(4096, 1)
-
+        #self.rank_fc_out = nn.Linear(32, 1)
+        
+        # Fusion head (pairwise classification)
+        self.cross_fc_1 = nn.Linear(self.feat_dim * 2, 512)
+        self.cross_relu_1 = nn.ReLU()
+        self.cross_drop_1 = nn.Dropout(float(cross_dropout))
+        
+        self.cross_fc_2 = nn.Linear(512, 512)
+        self.cross_relu_2 = nn.ReLU()
+        self.cross_drop_2 = nn.Dropout(float(cross_dropout))
+        
+        self.cross_fc_3 = nn.Linear(512, int(num_classes))
+        """
+        # Ranking head (per-image)
+        self.rank_fc_1 = nn.Linear(self.feat_dim, 1024)
+        self.rank_relu = nn.ReLU()
+        self.rank_drop = nn.Dropout(float(rank_dropout))
+        self.rank_fc_out = nn.Linear(1024, 1)
+        
         # Fusion head (pairwise classification)
         self.cross_fc_1 = nn.Linear(self.feat_dim * 2, 512)
         self.cross_relu_1 = nn.ReLU()

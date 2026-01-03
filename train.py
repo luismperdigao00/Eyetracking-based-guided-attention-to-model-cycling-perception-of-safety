@@ -9,7 +9,6 @@ import os
 from glob import glob
 import pickle
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import numpy as np
 import wandb
 from data import (
@@ -32,6 +31,7 @@ from scripts.train_script import train
 import warnings
 import gc
 import timm
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
 warnings.filterwarnings("ignore")
 
@@ -434,8 +434,30 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 3) TRAIN/VAL/TEST SPLIT
     # =============================================================================================== #
-    X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
-    X_train, X_val = train_test_split(X_train, test_size=0.13, random_state=args.seed)
+    # 1. Define the Grouping Variable
+    # Ideally 'trial_id' represents a unique user session or trip. 
+    # If 'trial_id' is not spatial, use the image filename itself to be 100% strict.
+    groups = comparisons_df['survey_id'] 
+    
+    # Check if we have enough groups
+    n_groups = len(groups.unique())
+    print(f"Splitting based on {n_groups} unique trials/groups to prevent leakage.")
+    
+    # 2. Perform Grouped Split (Train vs Test)
+    splitter = GroupShuffleSplit(test_size=0.2, n_splits=1, random_state=args.seed)
+    train_idx, test_idx = next(splitter.split(comparisons_df, groups=groups))
+    
+    X_train = comparisons_df.iloc[train_idx]
+    X_test = comparisons_df.iloc[test_idx]
+    
+    # 3. Perform Grouped Split (Train vs Val) - reusing the logic on X_train
+    # We need to re-extract groups for the new X_train subset
+    train_groups = X_train['trial_id']
+    splitter_val = GroupShuffleSplit(test_size=0.13, n_splits=1, random_state=args.seed)
+    sub_train_idx, sub_val_idx = next(splitter_val.split(X_train, groups=train_groups))
+    
+    X_val = X_train.iloc[sub_val_idx]
+    X_train = X_train.iloc[sub_train_idx]
 
     total = len(comparisons_df)
     print("=== Splits (on the filtered dataset above) ===")
@@ -543,9 +565,9 @@ def run_training_with_args(args, trial=None):
         use_seg=args.use_seg,
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=False)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
 
     # =============================================================================================== #
     # 6) DEVICE & MODEL
