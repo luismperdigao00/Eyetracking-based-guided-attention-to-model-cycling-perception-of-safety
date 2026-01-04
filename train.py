@@ -151,7 +151,7 @@ def arg_parse():
 
     # -------------------- LR & OPTIMIZATION ------------------
     parser.add_argument("--base_lr", type=float, default=5e-6)
-    #parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
+    parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--k", type=int, default=1, help="gradient accumulation steps")
     parser.add_argument("--rank_dropout", type=float, default=0.3)
@@ -434,6 +434,7 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 3) TRAIN/VAL/TEST SPLIT
     # =============================================================================================== #
+    """
     # 1. Define the Grouping Variable
     # Ideally 'trial_id' represents a unique user session or trip. 
     # If 'trial_id' is not spatial, use the image filename itself to be 100% strict.
@@ -452,13 +453,16 @@ def run_training_with_args(args, trial=None):
     
     # 3. Perform Grouped Split (Train vs Val) - reusing the logic on X_train
     # We need to re-extract groups for the new X_train subset
-    train_groups = X_train['trial_id']
+    train_groups = X_train['survey_id']
     splitter_val = GroupShuffleSplit(test_size=0.13, n_splits=1, random_state=args.seed)
     sub_train_idx, sub_val_idx = next(splitter_val.split(X_train, groups=train_groups))
     
     X_val = X_train.iloc[sub_val_idx]
     X_train = X_train.iloc[sub_train_idx]
-
+    """
+    X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
+    X_train, X_val  = train_test_split(X_train       , test_size=0.13, random_state=args.seed)
+    
     total = len(comparisons_df)
     print("=== Splits (on the filtered dataset above) ===")
     print(f"- Train: {len(X_train):,}  [{len(X_train)/total:.2%}]")

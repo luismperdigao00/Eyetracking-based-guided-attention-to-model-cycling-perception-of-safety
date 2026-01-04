@@ -247,7 +247,7 @@ AUG_PRESETS = {
         swap_p=0.50,
         
         # CROP POLICY: Fixed (Translation Only)
-        crop_p=0.50,
+        crop_p=0,
         crop_mode="fixed",    # <--- NEW: No zooming
         min_zoom=1.0,         # <--- NEW: Unused in fixed mode, but explicit
 
