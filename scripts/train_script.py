@@ -187,35 +187,36 @@ def _build_metrics_output(args, forward_dict: Dict[str, Dict[str, torch.Tensor]]
 # Optimizer / scheduler helpers
 # --------------------------------------------------------------------------------------------------------------------
 
-def _split_parameters(net: torch.nn.Module) -> Tuple[List[Tuple[str, torch.nn.Parameter]], List[Tuple[str, torch.nn.Parameter]]]:
+def _split_parameters(
+    net: torch.nn.Module
+) -> Tuple[List[Tuple[str, torch.nn.Parameter]], List[Tuple[str, torch.nn.Parameter]]]:
     """
     Split parameters into two logical groups: "heads" vs "backbone".
 
-    Why:
-      - Your models have lightweight task-specific heads (ranking and/or classification)
-        on top of a large pretrained backbone (CNN or ViT).
-      - You often want different training behavior for these groups:
-          * freeze backbone and train only heads
-          * or finetune backbone with a smaller LR than heads
+    Correct rule for your codebase:
+      - Any parameter that belongs to `net.backbone` is "backbone".
+      - Everything else is "head" (ranking/classification layers, fusion norms, etc.).
 
-    How:
-      - We iterate over net.named_parameters() and use name patterns to decide.
-      - Any parameter whose name contains one of:
-            ["rank_fc", "cross_fc"]
-        is considered part of the "head" (ranking head + cross-branch classifier).
-      - Everything else is treated as "backbone".
-
-    Note:
-      - This relies on your model naming conventions. If you rename layers
-        in nets/transformer.py or nets/cnn.py, adjust these keys accordingly.
+    This is robust to:
+      - Transformer wrappers that include trainable modules outside the backbone
+        (e.g., pair_norm, feat_norm).
+      - DataParallel/DistributedDataParallel, where parameter names are prefixed with "module.".
     """
-    head_params, backbone_params = [], []
+    head_params: List[Tuple[str, torch.nn.Parameter]] = []
+    backbone_params: List[Tuple[str, torch.nn.Parameter]] = []
+
     for name, param in net.named_parameters():
-        # Heads are identified by substring matches in the parameter name.
-        if any(key in name for key in ["rank_fc", "cross_fc"]):
-            head_params.append((name, param))
-        else:
+        if not param.requires_grad:
+            continue
+
+        # Handle DataParallel prefixing
+        is_backbone = name.startswith("backbone.") or name.startswith("module.backbone.")
+
+        if is_backbone:
             backbone_params.append((name, param))
+        else:
+            head_params.append((name, param))
+
     return head_params, backbone_params
 
 
@@ -375,7 +376,7 @@ def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, ba
     Build the LR scheduler used by the Ignite training loop.
 
     Key concept: "optimizer steps" vs "dataloader iterations"
-      - You support gradient accumulation (args.k).
+      - The program support gradient accumulation (args.k).
       - That means optimizer.step() happens only every accum_steps iterations.
       - Schedulers that step per-optimizer-step must be configured using the number of *optimizer steps*,
         not raw dataloader batches.

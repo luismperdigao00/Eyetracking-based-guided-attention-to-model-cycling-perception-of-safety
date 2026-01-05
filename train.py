@@ -172,28 +172,42 @@ def arg_parse():
     parser.add_argument("--model", type=str, default="rcnn",
                         choices=["rsscnn", "sscnn", "rcnn"])
     
-    parser.add_argument("--backbone", type=str, default="dinov3_vitb16",
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="dinov3_vitb16",
         choices=[
-            #---(Strict 224x224 -> 14x14 Output) ---
+            # --- Strict 224x224 (≈14x14 token grid for ViT-B/16) ---
             "dinov3_vitb16",             # 1. DINOv3 (Dense Specialist)
             "beitv2_base_patch16_224",   # 2. BEiT v2 (Masked Modeling / Structure)
             "deit3_base_patch16_224",    # 3. DeiT III (Supervised Benchmark)
             "siglip_base_patch16_224",   # 4. SigLIP (Semantic Expert)
-            "vit_base_patch16_clip_224", # 5. CLIP (Robust / Wildcard)
-
+            "vit_base_patch16_clip_224", # 5. CLIP ViT-B/16 (Robust / Wildcard)
+    
             # --- Modern High-Performance Alternates ---
-            "dinov2_reg_base",           # DINOv2 + Registers
-            "eva02_base",                # EVA-02 (Requires 448px for best results)
+            "dinov2_base",               # NEW: DINOv2 (no registers)
+            "dinov2_reg_base",           # DINOv2 + registers
+            "eva02_base",                # EVA-02 (448px recommended)
             "convnext_base",             # ConvNeXt (Modern CNN)
-            
-            # --- Legacy / Standard Models ---
+    
+            # --- Canonical / Legacy Transformers ---
+            "vit_base_patch16_224",      # NEW: Original ViT-B/16 (21k -> 1k)
             "vit_base_dino",             # DINO v1
-            "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
             "vit_small",
-            "alex", "vgg", "dense", "resnet",
+            "deit_base",
+            "deit_small",
+            "deit_tiny",
+            "deit_base_distilled",
+    
+            # --- CNN Baselines ---
+            "alex",
+            "vgg",
+            "dense",
+            "resnet",
         ],
-        help="Model backbone to use. Default: dinov3_vitb16"
+        help="Model backbone to use. Default: dinov3_vitb16",
     )
+
     # === POOLING ARGUMENTS ===
     parser.add_argument("--pooling", type=str, default="cls",
                         choices=["cls", "mean", "max", "concat", "topk"],
@@ -601,17 +615,22 @@ def run_training_with_args(args, trial=None):
         "deit3_base_patch16_224",
         "siglip_base_patch16_224",
         "vit_base_patch16_clip_224",
-
-        # --- Modern Transformers ---
+    
+        # --- Modern High-Performance Transformers ---
+        "dinov2_base",        # NEW: DINOv2 (no registers)
+        "dinov2_reg_base",    # DINOv2 + registers
         "eva02_base",
-        "dinov2_reg_base",
-        
-        # --- Legacy Transformers ---
-        "vit_base_dino", 
+    
+        # --- Legacy / Canonical Transformers ---
+        "vit_base_patch16_224",  # NEW: Original ViT-B/16 (21k -> 1k)
+        "vit_base_dino",
         "vit_small",
-        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
-        
+        "deit_base",
+        "deit_small",
+        "deit_tiny",
+        "deit_base_distilled",
     ]
+
     
     CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
     
@@ -741,7 +760,10 @@ def run_training_with_args(args, trial=None):
         train_tfms=train_tfms,
         eval_tfms=eval_tfms,
     )
-
+    
+    net_for_hooks = net.module if isinstance(net, torch.nn.DataParallel) else net
+    if hasattr(net_for_hooks, "remove_attention_hooks"):
+        net_for_hooks.remove_attention_hooks()
 
 
     # -------- GPU / memory cleanup BETWEEN trials --------

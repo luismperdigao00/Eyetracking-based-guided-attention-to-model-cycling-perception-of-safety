@@ -36,7 +36,7 @@ import torchvision.models as tv_models
 
 from data import ComparisonsDataset, DictTransform
 from scripts.test_script import test
-from train_utils import build_transformer_backbone
+from train_utils import resolve_backbone
 
 warnings.filterwarnings("ignore")
 pd.options.mode.chained_assignment = None
@@ -303,39 +303,53 @@ def read_data(args) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 # Model construction
 # -----------------------------
 def build_model(args):
-    TRANSFORMER_BACKBONES = {
-        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
-        "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small", 
-        "vit_base_dinov3", "dinov3_vitb16", 
-        "beitv2_base_patch16_224", "deit3_base_patch16_224", 
-        "siglip_base_patch16_224", "vit_base_patch16_clip_224",
-        "dinov2_reg_base", "convnext_base"
-    }
+    TRANSFORMER_BACKBONES = [
+        # --- The "Power 5" ---
+        "dinov3_vitb16",
+        "beitv2_base_patch16_224",
+        "deit3_base_patch16_224",
+        "siglip_base_patch16_224",
+        "vit_base_patch16_clip_224",
+    
+        # --- Modern High-Performance Transformers ---
+        "dinov2_base",        # NEW: DINOv2 (no registers)
+        "dinov2_reg_base",    # DINOv2 + registers
+        "eva02_base",
+    
+        # --- Legacy / Canonical Transformers ---
+        "vit_base_patch16_224",  # NEW: Original ViT-B/16 (21k -> 1k)
+        "vit_base_dino",
+        "vit_small",
+        "deit_base",
+        "deit_small",
+        "deit_tiny",
+        "deit_base_distilled",
+    ]
     CNN_BACKBONES = {"alex", "vgg", "dense", "resnet"}
 
     if args.backbone in TRANSFORMER_BACKBONES:
         from nets.transformer import Transformer as Net
 
-        backbone_model = build_transformer_backbone(args.backbone)
+        backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
         use_gaze_loss = (args.gaze != "off" and float(getattr(args, "attn_w", 0.0)) > 0.0)
 
         net = Net(
             backbone=backbone_model,
             model=args.model,
-            # --- START FIX ---
-            pooling=args.pooling,      # Pass the pooling arg
-            pool_k=args.pool_k,        # Pass the pool_k arg
-            # --- END FIX ---
+            # Pooling & Architecture
+            pooling=getattr(args, "pooling", "cls"),
+            pool_k=getattr(args, "pool_k", 10),
             num_classes=3 if args.ties else 2,
+            # Training Dynamics
             finetune=args.finetune,
             num_ft_blocks=args.num_ft_blocks,
             rank_dropout=args.rank_dropout,
             cross_dropout=args.cross_dropout,
-            use_attn_hook=(args.gaze != "off"),
+            # Gaze & Attention
+            use_attn_hook=use_gaze_loss,
             return_attn=use_gaze_loss,
-            # You might also want to pass these if they are in your args:
-            # attention_mode=getattr(args, "attention_mode", "last"), 
-            # attn_topk=getattr(args, "attn_topk", None)
+            #attention_mode=args.attention_mode,
+            #attn_topk=args.attn_topk,
         )
         net.attn_grad = use_gaze_loss
         return net
