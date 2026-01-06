@@ -15,12 +15,16 @@ from data import (
     ComparisonsDataset,
     build_eval_transforms,
     build_train_transforms,
+    ResizeCenterCropAlignGaze,
     Augmentation,
+    _get_interp_mode,
+
 )
 
 from train_utils import (
     validate_and_normalize_args,
     resolve_backbone,
+    infer_vit_grid_size,
     compute_class_weights_from_df,
     print_run_plan,
     )
@@ -32,6 +36,8 @@ import warnings
 import gc
 import timm
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
+import os
+
 
 warnings.filterwarnings("ignore")
 
@@ -224,6 +230,9 @@ def arg_parse():
     parser.add_argument("--label_smoothing", type=float, default=0)
     parser.add_argument("--attn_w", type=float, default=1.0)
     parser.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps")
+    parser.add_argument("--gaze_map_size", default="auto", help="Gaze map size selection: 'auto' or integer (e.g. 14, 16).")
+    parser.add_argument("--gaze_subdir_fmt", default="{s}x{s}", help="Subfolder format under gaze_root (default: '14x14', '16x16', ...).")
+
 
     # -------------------- MISC -------------------------------
     parser.add_argument("--seed", type=int, default=5)
@@ -232,83 +241,127 @@ def arg_parse():
 
 
 def read_data(args):
-    # -------- Load --------
+    # ------------------------------------------------------------------
+    # 0) LOAD
+    # ------------------------------------------------------------------
     try:
-        comparisons_df = pickle.load(open(args.comparisons, 'rb'))
+        comparisons_df = pickle.load(open(args.comparisons, "rb"))
     except Exception:
         comparisons_df = pd.read_pickle(args.comparisons)
 
-    # -------- Select columns that actually exist --------
+    print(f"[read_data] Loaded raw rows: {len(comparisons_df):,}")
+    print(f"[read_data] Raw columns: {list(comparisons_df.columns)}")
+
+    # ------------------------------------------------------------------
+    # 1) KEEP ONLY COLUMNS THAT EXIST
+    # ------------------------------------------------------------------
     cols_we_need = [
-        'score',
-        'image_l', 'image_r',
-        'dataset',
-        'has_eyetracker',
-        'npy_file_l', 'npy_file_r',
-        'survey_id', 'trial_id',
+        "score",
+        "image_l", "image_r",
+        "dataset",
+        "has_eyetracker",
+        "npy_file_l", "npy_file_r",
+        "survey_id", "trial_id",
     ]
     existing_cols = [c for c in cols_we_need if c in comparisons_df.columns]
     comparisons_df = comparisons_df[existing_cols].copy()
 
-    # -------- OPTIONAL: print which datasets exist --------
-    if 'dataset' in comparisons_df.columns:
-        print("Available city datasets in this file:")
-        print(comparisons_df['dataset'].value_counts())
-        print()
+    print(f"[read_data] Columns kept: {existing_cols}")
+    print(f"[read_data] Rows after column selection: {len(comparisons_df):,}")
 
-    # -------- filter by city / dataset source --------
-    if 'dataset' in comparisons_df.columns:
-        cities_arg = getattr(args, 'cities', 'all')
-        if cities_arg.lower() != 'all':
-            selected_cities = [c.strip() for c in cities_arg.split(',') if c.strip()]
-            print(f"Filtering to cities: {selected_cities}")
+    # ------------------------------------------------------------------
+    # 2) CITY / DATASET FILTER
+    # ------------------------------------------------------------------
+    if "dataset" in comparisons_df.columns:
+        print("\n[read_data] Available datasets:")
+        print(comparisons_df["dataset"].value_counts())
+
+        cities_arg = getattr(args, "cities", "all")
+        if cities_arg.lower() != "all":
+            selected_cities = [c.strip() for c in cities_arg.split(",") if c.strip()]
+            print(f"\n[read_data] Filtering to cities: {selected_cities}")
 
             before = len(comparisons_df)
-            comparisons_df = comparisons_df[comparisons_df['dataset'].isin(selected_cities)].copy()
+            comparisons_df = comparisons_df[
+                comparisons_df["dataset"].isin(selected_cities)
+            ].copy()
             after = len(comparisons_df)
 
+            print(f"[read_data] Rows after city filter: {after}/{before}")
             if after == 0:
-                print("[WARN] City filter resulted in 0 rows. "
-                      "Check your --cities argument and the 'dataset' values in the pickle.")
-            else:
-                print(f"City filter kept {after}/{before} rows.")
+                print("[WARN] City filter removed all rows.")
 
-    # -------- Ensure filenames have .jpg suffix --------
-    if 'image_l' in comparisons_df.columns:
-        comparisons_df['image_l'] = comparisons_df['image_l'].astype(str).apply(
-            lambda x: x if x.lower().endswith('.jpg') else f'{x}.jpg'
-        )
-    if 'image_r' in comparisons_df.columns:
-        comparisons_df['image_r'] = comparisons_df['image_r'].astype(str).apply(
-            lambda x: x if x.lower().endswith('.jpg') else f'{x}.jpg'
-        )
+    # ------------------------------------------------------------------
+    # 3) IMAGE FILENAME NORMALIZATION
+    # ------------------------------------------------------------------
+    for side in ("image_l", "image_r"):
+        if side in comparisons_df.columns:
+            comparisons_df[side] = (
+                comparisons_df[side]
+                .astype(str)
+                .apply(lambda x: x if x.lower().endswith(".jpg") else f"{x}.jpg")
+            )
 
-    if 'has_eyetracker' in comparisons_df.columns:
-        comparisons_df['has_eyetracker'] = (
-            comparisons_df['has_eyetracker']
-            .replace({'True': True, 'False': False, 'true': True, 'false': False})
+    # ------------------------------------------------------------------
+    # 4) GAZE FLAG NORMALIZATION + FILTERING
+    # ------------------------------------------------------------------
+    if "has_eyetracker" in comparisons_df.columns:
+        comparisons_df["has_eyetracker"] = (
+            comparisons_df["has_eyetracker"]
+            .replace({"True": True, "False": False, "true": True, "false": False})
             .fillna(False)
             .astype(bool)
         )
 
-        if args.gaze == 'only':
-            comparisons_df = comparisons_df[comparisons_df['has_eyetracker']].copy()
-            if comparisons_df.empty:
-                print("[WARN] --gaze only: 0 rows with has_eyetracker==True after filtering.")
-        
-        #elif args.gaze == 'off':
-        #    comparisons_df = comparisons_df[~comparisons_df['has_eyetracker']].copy()
-        #    if comparisons_df.empty:
-        #        print("[WARN] --gaze off: 0 rows with has_eyetracker==False after filtering.")
+        print(
+            "\n[read_data] has_eyetracker distribution:",
+            comparisons_df["has_eyetracker"].value_counts(dropna=False).to_dict(),
+        )
 
-    # -------- Labels / ties --------
+        if args.gaze == "only":
+            before = len(comparisons_df)
+            comparisons_df = comparisons_df[comparisons_df["has_eyetracker"]].copy()
+            after = len(comparisons_df)
+
+            print(f"[read_data] Rows after gaze=only filter: {after}/{before}")
+            if after == 0:
+                print("[WARN] --gaze only removed all rows.")
+
+    # ------------------------------------------------------------------
+    # 5) LABEL HANDLING / TIES
+    # ------------------------------------------------------------------
+    if "score" not in comparisons_df.columns:
+        raise ValueError("[read_data] Missing required column: 'score'")
+
     if not args.ties:
-        comparisons_df = comparisons_df[comparisons_df['score'] != 0].copy()
-        comparisons_df['score_classification'] = comparisons_df['score'].replace({-1: 0, +1: 1})
+        before = len(comparisons_df)
+        comparisons_df = comparisons_df[comparisons_df["score"] != 0].copy()
+        after = len(comparisons_df)
+
+        print(f"\n[read_data] Rows after ties=False filter: {after}/{before}")
+        if after == 0:
+            print("[WARN] ties=False removed all rows.")
+
+        comparisons_df["score_classification"] = comparisons_df["score"].replace(
+            {-1: 0, +1: 1}
+        )
     else:
-        comparisons_df['score_classification'] = comparisons_df['score'] + 1
+        comparisons_df["score_classification"] = comparisons_df["score"] + 1
+
+    # ------------------------------------------------------------------
+    # 6) FINAL SANITY CHECK
+    # ------------------------------------------------------------------
+    print("\n[read_data] FINAL ROW COUNT:", len(comparisons_df))
+    if len(comparisons_df) > 0:
+        print(
+            "[read_data] Final score distribution:",
+            comparisons_df["score"].value_counts(dropna=False).to_dict(),
+        )
+    else:
+        print("[FATAL] Dataset is EMPTY after all filters.")
 
     return comparisons_df
+
 
 
 def initialize_logging():
@@ -425,7 +478,7 @@ def run_training_with_args(args, trial=None):
     print(f"Ties enabled     : {args.ties}  (ties=False removes score==0 rows)")
     print(f"Final row count  : {len(comparisons_df):,}")
 
-    # Score distribution AFTER filtering (this is the distribution you will actually train on)
+    # Score distribution AFTER filtering (this is the distribution it's suupose to train on)
     if "score" in comparisons_df.columns:
         print("\nScore distribution (post-filtering):")
         score_counts = comparisons_df["score"].value_counts().sort_index()
@@ -476,7 +529,25 @@ def run_training_with_args(args, trial=None):
     """
     X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
     X_train, X_val  = train_test_split(X_train       , test_size=0.13, random_state=args.seed)
+    """
+    splits_dir = "splits"
+    os.makedirs(splits_dir, exist_ok=True)
     
+    split_prefix = os.path.splitext(os.path.basename(args.comparisons))[0]
+    
+    train_path = os.path.join(splits_dir, f"{split_prefix}_train.pkl")
+    val_path   = os.path.join(splits_dir, f"{split_prefix}_val.pkl")
+    test_path  = os.path.join(splits_dir, f"{split_prefix}_test.pkl")
+    
+    X_train.to_pickle(train_path)
+    X_val.to_pickle(val_path)
+    X_test.to_pickle(test_path)
+    
+    print("\n[SPLITS] Saved train/val/test splits:")
+    print(" -", train_path)
+    print(" -", val_path)
+    print(" -", test_path)
+    """
     total = len(comparisons_df)
     print("=== Splits (on the filtered dataset above) ===")
     print(f"- Train: {len(X_train):,}  [{len(X_train)/total:.2%}]")
@@ -523,21 +594,54 @@ def run_training_with_args(args, trial=None):
     #   - otherwise -> train preprocessing equals evaluation preprocessing
     # =============================================================================================== #
 
-    # Resolve everything once
+    # Resolve backbone and specs once
     backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
     
-    # Build transforms from specs
-    eval_tfms, eval_meta = build_eval_transforms(model_specs)
-    aug_obj, train_meta = build_train_transforms(args, eval_meta)
+    # 1) Determine gaze grid size (backbone-specific, e.g., 14x14)
+    grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
     
-    if aug_obj is None:
+    # Optional override from CLI
+    if str(args.gaze_map_size).lower() != "auto":
+        forced = int(args.gaze_map_size)
+        grid_h, grid_w = forced, forced
+    
+    args.gaze_grid_size = (int(grid_h), int(grid_w))
+    args.gaze_map_size_int = int(grid_h) 
+
+    # 2) Decide whether gaze supervision loss is used
+    use_gaze_requested = (args.gaze != "off")
+    #use_gaze = (args.gaze != "off")
+    use_gaze_loss = (
+        args.model == "rsscnn"
+        and use_gaze_requested
+        and float(args.attn_w) > 0.0
+    )
+    use_gaze = use_gaze_loss
+    
+    # 3) Build eval transforms (Always deterministic + aligned gaze)
+    eval_tfms, eval_meta = build_eval_transforms(
+        model_specs,
+        gaze_grid_size=args.gaze_grid_size,
+        enable_gaze=use_gaze_requested,
+    )
+
+    # 4) Build training transforms
+    aug_obj, train_meta = build_train_transforms(
+        args, 
+        eval_meta
+    )
+    
+    if use_gaze_loss:
         train_tfms = eval_tfms
-    elif callable(aug_obj):
-        train_tfms = aug_obj
+        train_meta = dict(train_meta)
+        train_meta["forced_deterministic_reason"] = "gaze_supervision_active"
     else:
-        raise TypeError(
-            f"Unexpected train transform object: {type(aug_obj)}"
-        )
+        if aug_obj is None:
+            # Case B: Augmentation is OFF. Use standard deterministic pipeline.
+            train_tfms = eval_tfms
+        else:
+            train_tfms = aug_obj
+    
     args.expected_img_size = int(model_specs["img_size"])
     
     args.transforms_meta = {
@@ -548,8 +652,6 @@ def run_training_with_args(args, trial=None):
         "train_transform_class": train_tfms.__class__.__name__,
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
-    
-
     # =============================================================================================== #
     # 5) DATA LOADERS
     # =============================================================================================== #
@@ -563,7 +665,10 @@ def run_training_with_args(args, trial=None):
         gaze_root=args.gaze_root,
         use_gaze=use_gaze,
         use_seg=args.use_seg,
+        map_size=args.gaze_map_size_int,
+        gaze_subdir_fmt=args.gaze_subdir_fmt,
     )
+    
     val_set = ComparisonsDataset(
         dataframe=X_val,
         root_dir=args.dataset,
@@ -572,7 +677,10 @@ def run_training_with_args(args, trial=None):
         gaze_root=args.gaze_root,
         use_gaze=use_gaze,
         use_seg=args.use_seg,
+        map_size=args.gaze_map_size_int,
+        gaze_subdir_fmt=args.gaze_subdir_fmt,
     )
+    
     test_set = ComparisonsDataset(
         dataframe=X_test,
         root_dir=args.dataset,
@@ -581,7 +689,10 @@ def run_training_with_args(args, trial=None):
         gaze_root=args.gaze_root,
         use_gaze=use_gaze,
         use_seg=args.use_seg,
+        map_size=args.gaze_map_size_int,
+        gaze_subdir_fmt=args.gaze_subdir_fmt,
     )
+
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=False)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
@@ -603,7 +714,7 @@ def run_training_with_args(args, trial=None):
         device = torch.device("cpu")
     print("Device:", device)
 
-    use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
+    #use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
 
     
     # ------BACKBONE FAMILIES--------
@@ -757,7 +868,7 @@ def run_training_with_args(args, trial=None):
         train_df=X_train,
         val_df=X_val,
         test_df=X_test,
-        train_tfms=train_tfms,
+        train_tfms=train_tfms,   
         eval_tfms=eval_tfms,
     )
     

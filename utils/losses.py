@@ -9,7 +9,7 @@ This module centralizes:
   - Classification loss (CrossEntropy) for discrete label prediction
   - Optional gaze/attention alignment loss via symmetric KL divergence
 
-It is designed to be called from your training loop with:
+It is designed to be called from the training loop with:
     total_loss = compute_loss(args, network_output_dict, labels)
 
 Label conventions in this project:
@@ -23,7 +23,7 @@ Important compatibility detail (legacy behavior):
         label = -1 * labels["label_r"]
     so that (output_left, output_right, label) is consistent with historical training runs.
 
-Expected network_output_dict structure (as produced by your models):
+Expected network_output_dict structure:
   - network_output_dict["left"]["output"]   : Tensor [B] or [B,1]
   - network_output_dict["right"]["output"]  : Tensor [B] or [B,1]
   - network_output_dict["logits"]["output"] : Tensor [B, C] (if classification head exists)
@@ -99,7 +99,7 @@ class TieHuberLoss(nn.Module):
     """
     Robust symmetric loss around 0 to encourage ties.
 
-    For tie pairs we want:
+    For tie pairs:
         diff = s_left - s_right ≈ 0
 
     Huber-like penalty around 0:
@@ -323,7 +323,7 @@ def attention_kl_loss(
 
     Args:
         attn_left/attn_right: predicted attention maps [B,H,W] (not necessarily normalized)
-        gaze_left/gaze_right: gaze probability maps [B,H,W] (we normalize defensively)
+        gaze_left/gaze_right: gaze probability maps [B,H,W] 
         has_mask: optional [B] indicating which samples have gaze data (1) vs missing (0)
 
     Returns:
@@ -354,7 +354,7 @@ def compute_loss(args, network_output_dict: dict, labels: dict) -> Tensor:
     """
     Compute the training loss.
 
-    Supported models (as currently used in your codebase):
+    Supported models:
       - 'rcnn'   : ranking-only (non-ties + optional ties)
       - 'sscnn'  : classification-only
       - 'rsscnn' : classification + ranking + optional gaze KL

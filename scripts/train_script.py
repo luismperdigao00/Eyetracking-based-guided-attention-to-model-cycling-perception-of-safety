@@ -24,7 +24,6 @@ import optuna
 import torch
 import torch.optim as optim
 import wandb
-# AMP (Automatic Mixed Precision) utilities
 from torch.cuda.amp import autocast, GradScaler
 from torch import nn
 
@@ -86,7 +85,7 @@ def _prepare_batch(data: Dict[str, torch.Tensor], device: torch.device) -> Tuple
     """
     Prepare a single mini-batch produced by the DataLoader.
 
-    Your DataLoader yields a *dict-like* batch containing (at minimum):
+    The DataLoader yields a *dict-like* batch containing (at minimum):
         - "image_l": Tensor [B, 3, H, W]   (left image)
         - "image_r": Tensor [B, 3, H, W]   (right image)
 
@@ -141,10 +140,10 @@ def _build_metrics_output(args, forward_dict: Dict[str, Dict[str, torch.Tensor]]
             rcnn   -> ranking scores only
             sscnn  -> classification logits only
             rsscnn -> both ranking scores + classification logits
-        - To keep the metric attachment code clean, we standardize what the step
+        - To keep the metric attachment code clean, it's standardize what the step
           returns per model type.
 
-    Input forward_dict structure (from your models, e.g., nets/transformer.py):
+    Input forward_dict structure (e.g., nets/transformer.py):
         - forward_dict["left"]["output"]   : Tensor [B, 1] or [B]  (ranking score for left)
         - forward_dict["right"]["output"]  : Tensor [B, 1] or [B]  (ranking score for right)
         - forward_dict["logits"]["output"] : Tensor [B, C]         (classification logits)
@@ -193,7 +192,7 @@ def _split_parameters(
     """
     Split parameters into two logical groups: "heads" vs "backbone".
 
-    Correct rule for your codebase:
+    Correct rule for the codebase:
       - Any parameter that belongs to `net.backbone` is "backbone".
       - Everything else is "head" (ranking/classification layers, fusion norms, etc.).
 
@@ -426,10 +425,6 @@ def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, ba
             Behavior:
               - During warmup: linear ramp from 0 → 1 over warmup_iters steps
               - After warmup: cosine decay from 1 → (eta_min/base_lr)
-
-            Notes:
-              - base_lr here is used to convert eta_min (absolute) into a factor.
-              - We protect divisions with max(1, ...) to avoid zero division.
             """
             # Linear warmup phase: increase LR proportionally with step index.
             if warmup_iters > 0 and step < warmup_iters:
@@ -466,12 +461,11 @@ def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, ba
     # ------------------------------------------------------------------
     elif scheduler_type == "onecycle":
         # OneCycleLR requires max_lr per param group.
-        # We set max_lr to the optimizer's current LR per group, so the schedule
+        # It's set max_lr to the optimizer's current LR per group, so the schedule
         # oscillates around those group-specific settings.
         max_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
         # pct_start controls fraction of the cycle spent increasing LR.
-        # Here, we reuse warmup_frac as the "increase" fraction (common in your sweep configs).
         warmup_frac = max(0.0, min(1.0, args.warmup_frac))
         pct_start = warmup_frac if warmup_frac > 0 else 0.3
 
@@ -490,7 +484,7 @@ def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, ba
     elif scheduler_type == "warm_restarts":
         # Warm restarts: cosine cycles of length T_0, multiplied by T_mult each restart.
         # IMPORTANT: This scheduler uses "scheduler.step()" calls as its time steps.
-        # In your training loop, you call scheduler.step() every optimizer update
+        # In the training loop, it's called scheduler.step() every optimizer update
         # (except for plateau), so T_0 is interpreted in optimizer-step units.
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
@@ -504,8 +498,6 @@ def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, ba
     # ------------------------------------------------------------------
     elif scheduler_type == "plateau":
         # Plateau scheduler steps on a validation metric (here: mode="max" for accuracy).
-        # In your training loop, you do NOT call scheduler.step() each iteration for plateau;
-        # instead you call it at epoch end with val accuracy.
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="max",
@@ -881,9 +873,8 @@ def _attach_epoch_end_step(trainer: Engine, optimizer, accum_steps: int, scaler:
     Flush a partially accumulated gradient at epoch end.
 
     With gradient accumulation, optimizer.step() runs only every accum_steps iterations.
-    If the epoch ends mid-window, we must apply one final step.
+    If the epoch ends mid-window, it's aplied one final step.
 
-    IMPORTANT: Under AMP, we must use scaler.step(...) (not optimizer.step()).
     """
     @trainer.on(Events.EPOCH_COMPLETED)
     def step_on_epoch_end(engine):
@@ -1244,7 +1235,6 @@ def train(
     
     # IMPORTANT (DataParallel):
     # If net is torch.nn.DataParallel, attributes such as `.transformer` live under net.module.
-    # We unwrap ONLY for configuration/optimizer construction.
     net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
     
     # Transformer-aware configuration: used to apply parameter-group policies (e.g., LR scaling).
@@ -1283,8 +1273,8 @@ def train(
     # ------------------------------------------------------------------------------------------------
     # AMP (Automatic Mixed Precision)
     # ------------------------------------------------------------------------------------------------
-    # AMP should be explicitly controlled by args.amp (you said you already have it in CLI).
-    # We also require CUDA and an actual CUDA device.
+    # AMP should be explicitly controlled by args.amp.
+    # It's required CUDA and an actual CUDA device.
     use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
     
     # GradScaler dynamically scales the loss to prevent fp16 underflow.

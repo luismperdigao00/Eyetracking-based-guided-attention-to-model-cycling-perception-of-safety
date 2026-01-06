@@ -90,7 +90,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
         _err(errors, f"--max_epochs must be >= 1 (got {getattr(args, 'max_epochs', None)})")
 
     # ------------------------------------------------------------------
-    # Ties margin default (your original check)
+    # Ties margin default 
     # ------------------------------------------------------------------
     if getattr(args, "ranking_margin_ties", None) is None:
         args.ranking_margin_ties = args.ranking_margin
@@ -108,7 +108,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
         _err(errors, f"--ranking_margin_ties must be >= 0 when ties are enabled (got {args.ranking_margin_ties}).")
 
     # ------------------------------------------------------------------
-    # Scheduler sanity checks (your original checks + stronger validation)
+    # Scheduler sanity checks 
     # ------------------------------------------------------------------
     scheduler = getattr(args, "scheduler", "warmup_cosine")
 
@@ -171,7 +171,6 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
         if getattr(args, "ranking_margin", 0.0) != 0.3:
             _warn(warnings, "--model sscnn: --ranking_margin is ignored.")
         if getattr(args, "attn_w", 0.0) not in (0.0, 0) and getattr(args, "gaze", "off") != "off":
-            # In your code, SSCNN doesn't return attn maps; gaze KL is not applicable.
             _warn(warnings, "--model sscnn: gaze alignment loss is not applicable; --attn_w will be ignored.")
 
     # Ranking-only model ignores classification knobs
@@ -182,7 +181,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
             _warn(warnings, "--model rcnn: --label_smoothing is ignored (no CE loss).")
 
     # ------------------------------------------------------------------
-    # Gaze dependencies (consistency with your pipeline behavior)
+    # Gaze dependencies
     # ------------------------------------------------------------------
     gaze_mode = getattr(args, "gaze", "use")
     attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
@@ -196,7 +195,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
         if attn_w < 0:
             _err(errors, f"--attn_w must be >= 0 (got {attn_w}).")
 
-        # In your code, gaze alignment only makes sense if the model returns attn maps.
+        # In the code, gaze alignment only makes sense if the model returns attn maps.
         # That is true for rcnn/rsscnn when return_attn is enabled.
         if model not in ("rcnn", "rsscnn") and attn_w > 0:
             _warn(warnings, f"--gaze {gaze_mode} with --attn_w>0 but model={model}; gaze KL is not used.")
@@ -261,7 +260,7 @@ DEFAULT_SPECS = {
 # Backbone alias → timm model id mapping
 # -----------------------------------------------------------------------------------------------
 BACKBONE_ALIAS_TO_TIMM_ID = {
-    # --- The "Power 5" (Your Core Models) ---
+    # --- The "Power 5"  ---
     "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",
     "beitv2_base_patch16_224": "beitv2_base_patch16_224.in1k_ft_in22k",
     "deit3_base_patch16_224": "deit3_base_patch16_224.fb_in22k_ft_in1k",
@@ -309,7 +308,6 @@ def resolve_backbone(backbone_alias: str, *, pretrained: bool = True, strict: bo
       - alias -> timm_id
       - timm_id -> pretrained preprocessing specs
       - (optionally) instantiate model with native img_size
-
     Returns:
       model, specs
     """
@@ -337,17 +335,58 @@ def resolve_backbone(backbone_alias: str, *, pretrained: bool = True, strict: bo
 
     # 2) Build the actual model consistent with specs
     img_size = specs["img_size"]
-    kwargs = dict(pretrained=pretrained, num_classes=0, img_size=img_size)
+    
+    # --- FIX START: Force vanilla attention ---
+    kwargs = dict(
+        pretrained=pretrained, 
+        num_classes=0, 
+        img_size=img_size,
+        exportable=True,  # <--- CRITICAL: Forces vanilla attention layers (hook-friendly)
+    )
+    # --- FIX END ---
 
     try:
         model = timm.create_model(timm_id, **kwargs)
     except TypeError:
-        # If model doesn't accept img_size, drop it
+        # If model doesn't accept specific kwargs (like img_size or exportable), drop them safely
+        # Note: most modern timm models support exportable=True, but we handle the edge case.
         kwargs.pop("img_size", None)
-        model = timm.create_model(timm_id, **kwargs)
+        try:
+            model = timm.create_model(timm_id, **kwargs)
+        except TypeError:
+            # Fallback: remove exportable if that was the issue (unlikely but safe)
+            kwargs.pop("exportable", None)
+            model = timm.create_model(timm_id, **kwargs)
 
     return model, specs
-    
+
+def infer_vit_grid_size(backbone_model, model_specs: dict) -> tuple[int, int]:
+    # Prefer explicit in specs if present
+    img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
+
+    patch = None
+
+    # timm ViT / DeiT: patch_embed.patch_size exists
+    pe = getattr(backbone_model, "patch_embed", None)
+    if pe is not None and hasattr(pe, "patch_size"):
+        p = pe.patch_size
+        patch = int(p[0] if isinstance(p, (tuple, list)) else p)
+
+    # Some models expose patch_size directly
+    if patch is None and hasattr(backbone_model, "patch_size"):
+        p = backbone_model.patch_size
+        patch = int(p[0] if isinstance(p, (tuple, list)) else p)
+
+    if patch is None:
+        raise RuntimeError("Could not infer patch size from backbone; add patch_size to resolve_backbone specs.")
+
+    if img_size % patch != 0:
+        # Still compute, but warn-worthy: token grids could be non-integer if resize/crop differs.
+        raise RuntimeError(f"img_size ({img_size}) not divisible by patch_size ({patch}).")
+
+    g = img_size // patch
+    return (g, g)
+
 # =================================================================================================
 # Class weights
 # =================================================================================================
