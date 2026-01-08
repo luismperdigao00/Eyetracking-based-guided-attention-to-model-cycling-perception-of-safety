@@ -129,55 +129,81 @@ def _prepare_batch(data: Dict[str, torch.Tensor], device: torch.device) -> Tuple
     return (input_left, input_right), labels
 
 
-def _build_metrics_output(args, forward_dict: Dict[str, Dict[str, torch.Tensor]], labels: Dict[str, torch.Tensor], loss: torch.Tensor) -> Dict[str, torch.Tensor]:
+def _build_metrics_output(
+    args,
+    forward_dict: Dict[str, Dict[str, torch.Tensor]],
+    labels: Dict[str, torch.Tensor],
+    loss: torch.Tensor,
+    parts: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Convert (model outputs + labels + loss) into a flat dictionary suitable for
-    Ignite's `output_transform` in metrics.
+    Per-batch metrics dictionary returned by an Ignite engine step.
 
-    Why this exists:
-        - Ignite metrics consume the *output of the engine step*.
-        - Different model heads expose different outputs:
-            rcnn   -> ranking scores only
-            sscnn  -> classification logits only
-            rsscnn -> both ranking scores + classification logits
-        - To keep the metric attachment code clean, it's standardize what the step
-          returns per model type.
-
-    Input forward_dict structure (e.g., nets/transformer.py):
-        - forward_dict["left"]["output"]   : Tensor [B, 1] or [B]  (ranking score for left)
-        - forward_dict["right"]["output"]  : Tensor [B, 1] or [B]  (ranking score for right)
-        - forward_dict["logits"]["output"] : Tensor [B, C]         (classification logits)
-
-    Output dictionary keys are intentionally aligned with train_script.py:
-        - "loss" is numeric for RunningAverage (it passes loss.item()).
-        - ranking metrics expect: ("rank_left", "rank_right", "label"/"label_r")
-        - classification metrics expect: ("logits", "label"/"label_c")
+    Keys per batch:
+      - Always:
+          loss
+      - rcnn:
+          rank_left, rank_right, label
+      - sscnn:
+          logits, label
+      - rsscnn:
+          rank_left, rank_right, logits, label_r, label_c,
+          loss_kl, loss_kl_weighted, w_kl_eff, gaze_count
     """
-    
+    # loss: scalar float per batch
+    out: Dict[str, Any] = {"loss": float(loss.item())}
+
     if args.model == "rcnn":
-        return {
-            "loss": loss.item(),
+        # rank_left/rank_right: tensors per batch
+        # label: ranking labels per batch (label_r)
+        out.update({
             "rank_left": forward_dict["left"]["output"],
             "rank_right": forward_dict["right"]["output"],
             "label": labels["label_r"],
-        }
+        })
+        return out
 
     if args.model == "sscnn":
-        return {
-            "loss": loss.item(),
+        # logits: classification logits per batch
+        # label: class labels per batch (label_c)
+        out.update({
             "logits": forward_dict["logits"]["output"],
             "label": labels["label_c"].long(),
-        }
+        })
+        return out
 
     if args.model == "rsscnn":
-        return {
-            "loss": loss.item(),
+        # rank_left/rank_right: ranking scores per batch
+        # logits: classification logits per batch
+        # label_r/label_c: targets per batch
+        out.update({
             "rank_left": forward_dict["left"]["output"],
             "rank_right": forward_dict["right"]["output"],
             "logits": forward_dict["logits"]["output"],
             "label_r": labels["label_r"],
             "label_c": labels["label_c"],
-        }
+        })
+
+        # loss_kl/loss_kl_weighted: scalar floats per batch
+        # w_kl_eff: effective KL weight per batch
+        # gaze_count: number of gaze-supervised samples per batch
+        if parts is not None:
+            loss_kl = parts.get("loss_kl", 0.0)
+            loss_kl_weighted = parts.get("loss_kl_weighted", 0.0)
+
+            out["loss_kl"] = float(loss_kl.detach().item()) if torch.is_tensor(loss_kl) else float(loss_kl)
+            out["loss_kl_weighted"] = (
+                float(loss_kl_weighted.detach().item()) if torch.is_tensor(loss_kl_weighted) else float(loss_kl_weighted)
+            )
+            out["w_kl_eff"] = float(parts.get("w_kl_eff", 0.0))
+            out["gaze_count"] = int(parts.get("gaze_count", 0))
+        else:
+            out["loss_kl"] = 0.0
+            out["loss_kl_weighted"] = 0.0
+            out["w_kl_eff"] = 0.0
+            out["gaze_count"] = 0
+
+        return out
 
     raise ValueError(f"Unsupported model type: {args.model}")
 
@@ -584,14 +610,42 @@ def _make_train_step(
         # Forward pass (AMP-capable)
         # -----------------------------
         inputs, labels = _prepare_batch(data, device)
+        has_eye = labels["has_eye_mask"]  # [B] bool
+        gaze_sample_pct = has_eye.float().mean().item()          # fraction of samples with gaze
+        gaze_batch_any = float(bool(has_eye.any().item()))       # 1.0 if any sample has gaze
+        
+        # (optional) check if gaze tensors look non-dummy for gaze-enabled samples
+        gaze_l = labels["gaze_l"]  # [B,1,H,W] or [B,H,W] depending on transforms
+        gaze_r = labels["gaze_r"]
         
         # AMP is controlled by the scaler: if scaler is disabled, autocast does nothing.
         use_amp = scaler.is_enabled()
         
         with autocast(enabled=use_amp):
             forward_dict = net(*inputs)
-            
-        loss = compute_loss(args, forward_dict, labels)
+        # ---------------------------------------------------------
+        # Attention availability diagnostics (per iteration / batch)
+        # ---------------------------------------------------------
+        attn_uniform_batch = 0.0
+        attn_missing_batch = 0.0
+        
+        net_cfg_local = net.module if isinstance(net, torch.nn.DataParallel) else net
+        if hasattr(net_cfg_local, "transformer"):
+            tr = net_cfg_local.transformer
+            meta = getattr(tr, "last_attn_meta", None)
+            if isinstance(meta, dict):
+                # "uniform map batch": if either branch used uniform fallback
+                if meta.get("left", {}).get("used_uniform", False) or meta.get("right", {}).get("used_uniform", False):
+                    attn_uniform_batch = 1.0
+        
+                # "no attention map available": if either branch returned None (maps disabled/unavailable)
+                if meta.get("left", {}).get("attn_map_is_none", True) or meta.get("right", {}).get("attn_map_is_none", True):
+                    attn_missing_batch = 1.0
+                    
+        loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+        # Backprop objective without KL; KL stays in `parts` for logging
+        loss_no_kl = loss_total - parts.get("loss_kl_weighted", 0.0)
+        loss = loss_total
         
         # Keep the *unscaled* loss for logging/metrics.
         raw_loss = loss
@@ -616,14 +670,59 @@ def _make_train_step(
         # -----------------------------
         # IMPORTANT: divide by accum_steps BEFORE backward so the accumulated gradient matches
         # a single batch of size (batch_size * accum_steps).
-        loss = loss / accum_steps
+        # --- DEBUG: isolate gaze KL backprop (set True for 1–5 iterations only) ---
+        DEBUG_KL_ONLY = False  # <-- flip to False after testing
         
+        if DEBUG_KL_ONLY:
+            w = float(parts.get("w_kl_eff", 0.0))
+            gc = int(parts.get("gaze_count", 0))
+            loss = parts["loss_kl"] * w
+        
+            print("[DEBUG KL terms]",
+                  "w_kl_eff=", w,
+                  "loss_kl=", float(parts.get("loss_kl_val", parts["loss_kl"]).detach().item()),
+                  "gaze_count=", gc,
+                  "kl_requires_grad=", bool(parts["loss_kl"].requires_grad))
+
+        
+            # If KL is inactive this batch, fall back to total loss so backward is valid
+            if (w <= 0.0) or (gc == 0):
+                print("[DEBUG KL-only] KL inactive for this batch -> falling back to total loss backward")
+                loss = loss_total
+        else:
+            #loss = loss_total
+            loss = loss_no_kl #-> No backpropagation
+        
+        # IMPORTANT: divide by accum_steps AFTER choosing which loss you backprop
+        loss = loss / accum_steps
+
         if use_amp:
             # Scaled backward prevents fp16 gradient underflow
             scaler.scale(loss).backward()
         else:
             loss.backward()
         
+        if DEBUG_KL_ONLY and (engine.state.iteration % accum_steps == 0):
+            m = net.module if isinstance(net, torch.nn.DataParallel) else net
+        
+            # If m is your Transformer wrapper, it has .backbone.
+            # If not, it might expose the wrapper under some attribute; otherwise treat m itself as the backbone.
+            if hasattr(m, "backbone"):
+                bb = m.backbone
+            elif hasattr(m, "transformer") and hasattr(getattr(m, "transformer"), "backbone"):
+                bb = m.transformer.backbone
+            else:
+                # Fallback: m.transformer is often the timm VisionTransformer
+                bb = getattr(m, "transformer", m)
+        
+            for n, p in bb.named_parameters():
+                if "qkv" in n and p.requires_grad:
+                    print("[DEBUG qkv]", n,
+                          "grad_is_none=", (p.grad is None),
+                          "grad_abs_mean=", (None if p.grad is None else p.grad.abs().mean().item()))
+                    break
+
+
         # -----------------------------
         # Optimizer / scheduler step (only on accumulation boundary)
         # -----------------------------
@@ -657,34 +756,50 @@ def _make_train_step(
         # -----------------------------
         if logger:
             logger.info(f"TRAIN_STEP, {timer() - start:.4f}")
-
-        return _build_metrics_output(args, forward_dict, labels, raw_loss)
-
+        out = _build_metrics_output(
+            args=args,
+            forward_dict=forward_dict,
+            labels=labels,
+            loss=raw_loss,
+            parts=parts,   # only exists because you called compute_loss(..., return_parts=True)
+        )
+        return out
+        
     return train_step
 
 
 def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
     """
-    Factory that builds an Ignite-compatible inference step.
+    Ignite-compatible inference step for validation/test.
 
-    Used for validation and test engines. No gradients, no optimizer,
-    deterministic behavior.
+    - no gradients
+    - returns per-batch metrics dict
+    - includes KL parts when compute_loss(..., return_parts=True) is enabled
     """
     def inference_step(engine, data):
-        # AMP inference is safe and reduces memory; it should match training AMP setting.
+        # AMP inference when enabled and running on CUDA
         use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
-    
+
         with torch.no_grad():
             inputs, labels = _prepare_batch(data, device)
-    
+
             with autocast(enabled=use_amp):
                 forward_dict = net(*inputs)
-                
-            loss = compute_loss(args, forward_dict, labels)
-    
-            return _build_metrics_output(args, forward_dict, labels, loss)
+
+                # total loss + parts (KL terms included in parts)
+                loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+
+            # per-batch output dict includes KL keys in rsscnn mode
+            return _build_metrics_output(
+                args=args,
+                forward_dict=forward_dict,
+                labels=labels,
+                loss=loss_total,
+                parts=parts,
+            )
 
     return inference_step
+
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -759,7 +874,30 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
         # ---------------------------------------------------------------------
         elif args.model == "rsscnn":
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
-
+            
+            #is_trainer = hasattr(engine.state, "trial")
+            
+            if args.gaze != "off":
+                RunningAverage(
+                    output_transform=lambda x: x.get("loss_kl", 0.0),
+                    device=device
+                ).attach(engine, "loss_kl")
+    
+                RunningAverage(
+                    output_transform=lambda x: x.get("loss_kl_weighted", 0.0),
+                    device=device
+                ).attach(engine, "loss_kl_weighted")
+    
+                RunningAverage(
+                    output_transform=lambda x: x.get("w_kl_eff", 0.0),
+                    device=device
+                ).attach(engine, "w_kl_eff")
+    
+                RunningAverage(
+                    output_transform=lambda x: x.get("gaze_count", 0.0),
+                    device=device
+                ).attach(engine, "gaze_count")               
+        
             # Ranking metric uses label_r (pairwise ranking label: left/tie/right).
             if args.full_accuracy:
                 RankAccuracy_withMargin(
@@ -1054,6 +1192,21 @@ def _make_validation_handler(
         if args.model == "rsscnn":
             metrics.update(
                 {
+                    #"gaze_missing_pct_train": engine.state.metrics.get("gaze_missing_pct"),
+                    #"gaze_sample_pct_train": engine.state.metrics.get("gaze_sample_pct"),
+                    #"gaze_missing_pct_val": evaluator.state.metrics.get("gaze_missing_pct"),
+                    #"gaze_sample_pct_val": evaluator.state.metrics.get("gaze_sample_pct"),
+                    #"attn_uniform_pct_train": engine.state.metrics.get("attn_uniform_pct"),
+                                    #"attn_missing_pct_train": engine.state.metrics.get("attn_missing_pct"),  
+                    "loss_kl_train": engine.state.metrics.get("loss_kl"),
+                    "loss_kl_validation": evaluator.state.metrics.get("loss_kl"),
+                    "loss_kl_test": evaluator_test.state.metrics.get("loss_kl"),
+                    #"loss_kl_weighted_validation": evaluator.state.metrics.get("loss_kl_weighted"),
+                    #"loss_kl_weighted_test": evaluator_test.state.metrics.get("loss_kl_weighted"),
+
+                    #"loss_kl_weighted_train": engine.state.metrics.get("loss_kl_weighted"),
+                    #"w_kl_eff_train": engine.state.metrics.get("w_kl_eff"),
+                    #"gaze_count_train": engine.state.metrics.get("gaze_count"),
                     "c_accuracy_train": engine.state.metrics["c_acc"],
                     "c_accuracy_validation": evaluator.state.metrics["c_acc"],
                     "c_accuracy_test": evaluator_test.state.metrics["c_acc"],

@@ -18,11 +18,6 @@ Label conventions in this project:
          0: tie
         +1: right wins
 
-Important compatibility detail (legacy behavior):
-  - This file flips the sign for MarginRankingLoss:
-        label = -1 * labels["label_r"]
-    so that (output_left, output_right, label) is consistent with historical training runs.
-
 Expected network_output_dict structure:
   - network_output_dict["left"]["output"]   : Tensor [B] or [B,1]
   - network_output_dict["right"]["output"]  : Tensor [B] or [B,1]
@@ -39,7 +34,7 @@ Expected labels dict structure:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import sys
 import torch
@@ -350,36 +345,58 @@ def attention_kl_loss(
 # Orchestrator: compute full loss per model type
 # ====================================================================================== #
 
-def compute_loss(args, network_output_dict: dict, labels: dict) -> Tensor:
-    """
-    Compute the training loss.
 
-    Supported models:
-      - 'rcnn'   : ranking-only (non-ties + optional ties)
-      - 'sscnn'  : classification-only
-      - 'rsscnn' : classification + ranking + optional gaze KL
+# ---------------------------------------------------------------------
+# Assumes these helpers already exist in the same module:
+#   - MarginRankingLossWithTies
+#   - compute_ranking_loss
+#   - compute_loss_classification
+#   - attention_kl_loss
+# ---------------------------------------------------------------------
+
+
+def compute_loss(
+    args,
+    network_output_dict: dict,
+    labels: dict,
+    return_parts: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Dict[str, Any]]]:
+    """
+    Compute the training loss for the configured model type.
+
+    Supported args.model:
+      - "rcnn"   : ranking-only
+      - "sscnn"  : classification-only
+      - "rsscnn" : ranking + classification + optional gaze KL
 
     Returns:
-        scalar loss tensor suitable for backprop.
+      - return_parts=False: total_loss
+      - return_parts=True : (total_loss, parts_dict)
     """
-    # ------------------------------------------------------------------
-    # 1) Non-tie ranking criterion (hinge)
-    # ------------------------------------------------------------------
+    # =================================================================================
+    # 0) Return helper
+    # =================================================================================
+    def _ret(total: Tensor, parts: Optional[Dict[str, Any]] = None):
+        if not return_parts:
+            return total
+        return total, (parts or {})
+
+    model = getattr(args, "model", None)
+
+    # =================================================================================
+    # 1) Criteria
+    # =================================================================================
     criterion_ranking = nn.MarginRankingLoss(
         reduction="mean",
         margin=float(args.ranking_margin),
     )
 
-    # ------------------------------------------------------------------
-    # 2) Classification criterion
-    #    - optional class weights
-    #    - optional label smoothing
-    # ------------------------------------------------------------------
+    # ---- classification criterion (optional class weights + label smoothing) ----
     class_weight_tensor: Optional[Tensor] = None
     if getattr(args, "use_class_weights", False) and ("logits" in network_output_dict):
         logits = network_output_dict["logits"]["output"]
         class_weight_tensor = torch.tensor(
-            args.class_weights,
+            getattr(args, "class_weights"),
             dtype=torch.float,
             device=logits.device,
         )
@@ -390,82 +407,137 @@ def compute_loss(args, network_output_dict: dict, labels: dict) -> Tensor:
         label_smoothing=(smoothing if smoothing > 0 else 0.0),
     )
 
-    # ------------------------------------------------------------------
-    # 3) Tie criterion (optional)
-    # ------------------------------------------------------------------
-    if bool(getattr(args, "ties", False)):
-        criterion_ties: Optional[nn.Module] = MarginRankingLossWithTies(
+    # ---- ties criterion (optional) ----
+    ties_enabled = bool(getattr(args, "ties", False))
+    criterion_ties: Optional[nn.Module] = None
+    if ties_enabled:
+        criterion_ties = MarginRankingLossWithTies(
             margin=float(args.ranking_margin_ties),
             reduction="mean",
         )
-    else:
-        criterion_ties = None
 
-    model = getattr(args, "model", None)
-
-    # ------------------------------------------------------------------
-    # Model: ranking-only (RCNN)
-    # ------------------------------------------------------------------
+    # =================================================================================
+    # 2) RCNN: ranking-only
+    # =================================================================================
     if model == "rcnn":
         loss_nonties, loss_ties = compute_ranking_loss(
             network_output_dict=network_output_dict,
             labels=labels,
             criterion_ranking=criterion_ranking,
-            ties=bool(getattr(args, "ties", False)),
+            ties=ties_enabled,
             criterion_ties=criterion_ties,
         )
-        return float(args.rank_w) * loss_nonties + float(args.ties_w) * loss_ties
 
-    # ------------------------------------------------------------------
-    # Model: classification-only (SSCNN)
-    # ------------------------------------------------------------------
+        rank_w = float(getattr(args, "rank_w", 1.0))
+        ties_w = float(getattr(args, "ties_w", 1.0))
+
+        loss_rank_combo = (rank_w * loss_nonties) + (ties_w * loss_ties)
+        total = loss_rank_combo
+
+        parts = {
+            "loss_rank_nonties": loss_nonties.detach(),
+            "loss_rank_ties": loss_ties.detach(),
+            "loss_rank_combo": loss_rank_combo.detach(),
+        }
+        return _ret(total, parts)
+
+    # =================================================================================
+    # 3) SSCNN: classification-only
+    # =================================================================================
     if model == "sscnn":
-        return compute_loss_classification(
-            network_output_dict=network_output_dict,
-            labels=labels,
-            criterion_classification=criterion_classification,
-        )
-
-    # ------------------------------------------------------------------
-    # Model: classification + ranking (+ optional gaze KL) (RSSCNN)
-    # ------------------------------------------------------------------
-    if model == "rsscnn":
-        # Classification
         loss_class = compute_loss_classification(
             network_output_dict=network_output_dict,
             labels=labels,
             criterion_classification=criterion_classification,
         )
 
-        # Ranking
+        parts = {"loss_class": loss_class.detach()}
+        return _ret(loss_class, parts)
+
+    # =================================================================================
+    # 4) RSSCNN: ranking + classification + optional gaze KL
+    # =================================================================================
+    if model == "rsscnn":
+        # -----------------------------------------------------------------
+        # 4.1) Classification loss
+        # -----------------------------------------------------------------
+        loss_class = compute_loss_classification(
+            network_output_dict=network_output_dict,
+            labels=labels,
+            criterion_classification=criterion_classification,
+        )
+
+        # -----------------------------------------------------------------
+        # 4.2) Ranking loss (non-ties + optional ties)
+        # -----------------------------------------------------------------
         loss_nonties, loss_ties = compute_ranking_loss(
             network_output_dict=network_output_dict,
             labels=labels,
             criterion_ranking=criterion_ranking,
-            ties=bool(getattr(args, "ties", False)),
+            ties=ties_enabled,
             criterion_ties=criterion_ties,
         )
-        
-        # combine ranking terms like in the paper:
-        #   L_R = λ_R * L_R̂(non-ties) + λ_1 * L_1(ties)
-        loss_rank_combo = float(args.rank_w) * loss_nonties + float(args.ties_w) * loss_ties
 
-        # Optional gaze KL
+        rank_w = float(getattr(args, "rank_w", 1.0))
+        ties_w = float(getattr(args, "ties_w", 1.0))
+        loss_rank_combo = (rank_w * loss_nonties) + (ties_w * loss_ties)
+
+        # -----------------------------------------------------------------
+        # 4.3) Gaze KL (optional)
+        # -----------------------------------------------------------------
         w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
         gaze_mode = getattr(args, "gaze", "use")
-        if gaze_mode == "off" or w_kl == 0.0:
-            loss_kl = loss_rank_combo * 0.0  # zero on correct device/dtype
-            w_kl = 0.0
+
+        gaze_any = False
+        gaze_count = 0
+
+        if (gaze_mode == "off") or (w_kl <= 0.0):
+            loss_kl = loss_class.new_zeros(())
+            w_kl_eff = 0.0
         else:
-            loss_kl = attention_kl_loss(
-                network_output_dict["left"]["attn_map"],
-                network_output_dict["right"]["attn_map"],
-                labels["gaze_l"],
-                labels["gaze_r"],
-                has_mask=labels.get("has_eye_mask", None),
-            )
+            if "has_eye_mask" not in labels:
+                raise KeyError("labels['has_eye_mask'] missing.")
+            if ("gaze_l" not in labels) or ("gaze_r" not in labels):
+                raise KeyError("labels['gaze_l'] / labels['gaze_r'] missing.")
+            if ("attn_map" not in network_output_dict["left"]) or ("attn_map" not in network_output_dict["right"]):
+                raise KeyError("network_output_dict['left/right']['attn_map'] missing.")
 
-        # Final weighted sum (classification has implicit weight 1.0)
-        return loss_class + loss_rank_combo + w_kl * loss_kl
+            has_eye_mask = labels["has_eye_mask"]  # BoolTensor [B]
+            gaze_count = int(has_eye_mask.long().sum().item())
+            gaze_any = bool(has_eye_mask.any().item())
 
+            if not gaze_any:
+                loss_kl = loss_class.new_zeros(())
+                w_kl_eff = 0.0
+            else:
+                loss_kl = attention_kl_loss(
+                    network_output_dict["left"]["attn_map"],
+                    network_output_dict["right"]["attn_map"],
+                    labels["gaze_l"],
+                    labels["gaze_r"],
+                    has_mask=has_eye_mask,
+                )
+                w_kl_eff = w_kl
+
+        # -----------------------------------------------------------------
+        # 4.4) Total loss
+        # -----------------------------------------------------------------
+        total = loss_class + loss_rank_combo + (w_kl_eff * loss_kl)
+
+        parts = {
+            "loss_class": loss_class.detach(),
+            "loss_rank_nonties": loss_nonties.detach(),
+            "loss_rank_ties": loss_ties.detach(),
+            "loss_rank_combo": loss_rank_combo.detach(),
+            "loss_kl": loss_kl.detach(),
+            "loss_kl_weighted": (w_kl_eff * loss_kl).detach(),
+            "w_kl_eff": float(w_kl_eff),
+            "gaze_any": float(gaze_any),
+            "gaze_count": gaze_count,
+        }
+        return _ret(total, parts)
+
+    # =================================================================================
+    # 5) Unknown model
+    # =================================================================================
     raise ValueError(f"Unknown model type: {model!r}")

@@ -379,60 +379,120 @@ class Transformer(nn.Module):
     def _extract_features(self, feats: torch.Tensor) -> torch.Tensor:
         """
         Pool features from:
-          - tokens (B,N,D) -> pooled (B,feat_dim)
-          - already pooled (B,D) -> adapt to (B,feat_dim) if needed
+          - tokens (B, N, D) -> pooled (B, feat_dim)
+          - already pooled (B, D) -> adapt to (B, feat_dim) if needed
+    
+        Pooling modes :
+          - "cls"               : CLS only (prefix[0])
+          - "mean"              : mean over CLS only (same output shape as "cls")
+          - "patch_mean"        : mean over patch tokens
+          - "reg_mean"          : mean over register tokens (prefix[1:])
+          - "prefix_mean"       : mean over all prefix tokens (CLS + regs)
+          - "cls_reg_concat"    : concat(CLS, mean(registers)) -> (B, 2D)
+          - "cls_reg_add"       : CLS + mean(registers)        -> (B, D)
+          - "concat"            : concat(CLS, patch_mean)       -> (B, 2D)
+          - "topk"              : mean of top-k patch tokens by L2 norm -> (B, D)
+          - "max"               : for each dimension chose the highest value of the embeddings
         """
-        # Case A: Backbone returned a single feature vector per image
+        # -------------------------------------------------------------
+        # A) Backbone returned a single pooled vector [B, D]
+        # -------------------------------------------------------------
         if feats.ndim == 2:
             pooled = feats
-            if self.pooling == "concat":
-                pooled = torch.cat([pooled, pooled], dim=-1)
+            if self.pooling in ("concat", "cls_reg_concat"):
+                pooled = torch.cat([pooled, pooled], dim=-1)  # keep 2D shape for concat heads
             pooled = self.feat_norm(pooled)
             return pooled
-        
-        # Case B: Backbone returned tokens
+    
+        # -------------------------------------------------------------
+        # B) Backbone returned tokens [B, N, D]
+        # -------------------------------------------------------------
         if feats.ndim != 3:
             raise ValueError(f"Unexpected backbone output shape: {tuple(feats.shape)}")
-        
+    
         tokens = feats
-        
+    
         if self.apply_token_norm and (self.token_norm is not None):
             try:
                 tokens = self.token_norm(tokens)
             except Exception:
                 pass
-        
-        # Separate prefix and patch tokens
-        prefix = tokens[:, : self.num_prefix_tokens, :]      # (B,T,D)
-        patches = tokens[:, self.num_prefix_tokens :, :]     # (B,P,D)
-        
-        # FIX: Safety for empty patches (rare edge case)
-        if patches.shape[1] == 0:
-            pooled = prefix[:, 0, :]
-            # If concat mode, we must match feat_dim (which is 2D)
-            if self.pooling == "concat":
-                pooled = torch.cat([pooled, pooled], dim=-1)
-            pooled = self.feat_norm(pooled)
-            return pooled
-        
+    
+        # prefix: [CLS + optional registers], patches: spatial tokens
+        prefix = tokens[:, : self.num_prefix_tokens, :]      # (B, T, D)
+        patches = tokens[:, self.num_prefix_tokens :, :]     # (B, P, D)
+    
+        # -------------------------------------------------------------
+        # C) Safe fallbacks for rare edge cases
+        # -------------------------------------------------------------
+        # CLS exists if at least 1 prefix token is configured; otherwise fall back to first token
+        if prefix.shape[1] >= 1:
+            cls = prefix[:, 0, :]                            # (B, D)
+        else:
+            cls = tokens[:, 0, :]                            # (B, D)
+    
+        # registers exist only if prefix has more than 1 token
+        has_regs = (prefix.shape[1] > 1)
+        regs = prefix[:, 1:, :] if has_regs else None        # (B, R, D) or None
+    
+        # patches may be empty; handle safely
+        has_patches = (patches.shape[1] > 0)
+        patch_mean = patches.mean(dim=1) if has_patches else cls  # (B, D)
+    
+        # register mean with a stable fallback
+        if has_regs:
+            reg_mean = regs.mean(dim=1)                      # (B, D)
+        else:
+            reg_mean = cls                                   # (B, D), keeps shapes stable
+    
+        # -------------------------------------------------------------
+        # D) Pooling selection
+        # -------------------------------------------------------------
         if self.pooling == "cls":
-            pooled = tokens[:, 0, :]
+            pooled = cls                                     # (B, D)
+        
+        elif self.pooling == "max":
+            pooled = patches.max(dim=1).values if has_patches else cls  # (B, D)
+            
+        elif self.pooling == "cls_max_concat":
+            patch_max = patches.max(dim=1).values if has_patches else cls
+            pooled = torch.cat([cls, patch_max], dim=-1)  # (B, 2D)
+
         elif self.pooling == "mean":
-            pooled = patches.mean(dim=1)
+            pooled = cls                                     # (B, D), mean over CLS only
+    
+        elif self.pooling == "patch_mean":
+            pooled = patch_mean                              # (B, D)
+    
+        elif self.pooling == "reg_mean":
+            pooled = reg_mean                                # (B, D)
+    
+        elif self.pooling == "prefix_mean":
+            pooled = prefix.mean(dim=1) if prefix.shape[1] > 0 else cls  # (B, D)
+    
+        elif self.pooling == "cls_reg_concat":
+            pooled = torch.cat([cls, reg_mean], dim=-1)       # (B, 2D)
+    
+        elif self.pooling == "cls_reg_add":
+            pooled = cls + reg_mean                           # (B, D)
+    
         elif self.pooling == "concat":
-            cls_tok = prefix[:, 0, :]
-            mean_tok = patches.mean(dim=1)
-            pooled = torch.cat([cls_tok, mean_tok], dim=-1)
+            pooled = torch.cat([cls, patch_mean], dim=-1)     # (B, 2D)
+    
         elif self.pooling == "topk":
-            k = max(1, min(int(self.pool_k), patches.shape[1]))
-            norms = patches.norm(dim=-1)              # (B,P)
-            idx = norms.topk(k, dim=1).indices        # (B,k)
-            idx_exp = idx.unsqueeze(-1).expand(-1, -1, patches.shape[-1])  # (B,k,D)
-            selected = torch.gather(patches, dim=1, index=idx_exp)         # (B,k,D)
-            pooled = selected.mean(dim=1)
+            if not has_patches:
+                pooled = cls                                  # (B, D)
+            else:
+                k = max(1, min(int(self.pool_k), patches.shape[1]))
+                norms = patches.norm(dim=-1)                  # (B, P)
+                idx = norms.topk(k, dim=1).indices            # (B, k)
+                idx_exp = idx.unsqueeze(-1).expand(-1, -1, patches.shape[-1])  # (B, k, D)
+                selected = torch.gather(patches, dim=1, index=idx_exp)         # (B, k, D)
+                pooled = selected.mean(dim=1)                 # (B, D)
+    
         else:
             raise ValueError(f"Unknown pooling mode: {self.pooling}")
-        
+    
         pooled = self.feat_norm(pooled)
         return pooled
 
@@ -499,14 +559,15 @@ class Transformer(nn.Module):
         """
         Monkeypatch one timm-style ViT Attention module.
     
-        IMPORTANT BEHAVIOR:
-          - We only override/capture attention when the module is called with *no extra* args/kwargs.
-            If args/kwargs are present (mask/bias/rope/etc.), we fall back to the original forward,
-            and attention capture may NOT happen for that block.
-    
-          - We expose visibility into this via:
-              * self._attn_fallback_calls: count of times we had to fall back due to args/kwargs
-              * optional warnings (rate-limited) so you do not silently train on uniform maps
+        Behavior:
+          - When attention capture is not requested, behave exactly like original.
+          - When capture is requested:
+              * If called with no args/kwargs: compute attention + return the same output as timm attention.
+              * If called with args/kwargs (mask/bias/rope/etc.):
+                    - Return the original output (correctness first)
+                    - ALSO try to compute/store attn_pre from qkv(x) for gaze supervision/rollout.
+                    - This stored attention will NOT affect the backbone output, but can provide gradients
+                      through the gaze loss if used downstream.
         """
         # --- init counters once (safe if called multiple times) ---
         if not hasattr(self, "_attn_fallback_calls"):
@@ -520,6 +581,40 @@ class Transformer(nn.Module):
     
         orig_forward = mod.forward
         self._original_attn_forwards[mid] = orig_forward
+    
+        def _store_attn(attn_pre: torch.Tensor) -> None:
+            # Store PRE-dropout attention for supervision stability
+            attn_store = attn_pre if (self.gaze_requires_grad and self.training) else attn_pre.detach()
+            self._active_last_attn = attn_store
+            if self.attn_cfg.mode == "rollout" and self._active_attn_sink is not None:
+                self._active_attn_sink.append(attn_store)
+    
+        def _compute_attn_pre_from_x(x_in: torch.Tensor, _mod=mod) -> Optional[torch.Tensor]:
+            """
+            Compute (B, heads, N, N) softmax attention from qkv(x) only.
+            Does NOT attempt to perfectly reproduce mask/bias logic from every backbone variant.
+            Returns None if the module is incompatible.
+            """
+            if x_in.ndim != 3:
+                return None
+    
+            B, N, C = x_in.shape
+            num_heads = int(getattr(_mod, "num_heads", 0))
+            if num_heads <= 0 or (C % num_heads) != 0:
+                return None
+    
+            if not hasattr(_mod, "qkv"):
+                return None
+    
+            head_dim = C // num_heads
+            qkv = _mod.qkv(x_in)
+            qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            q, k = qkv[0], qkv[1]
+    
+            scale = getattr(_mod, "scale", head_dim ** -0.5)
+            attn_logits = (q @ k.transpose(-2, -1)) * scale
+            attn_pre = attn_logits.softmax(dim=-1)
+            return attn_pre
     
         def wrapped_forward(
             x: torch.Tensor,
@@ -541,22 +636,33 @@ class Transformer(nn.Module):
             if not want_attn:
                 return _orig(x, *args, **kwargs)
     
-            # CRITICAL FIX: do not silently "succeed" when args/kwargs exist.
-            # We must fall back (to remain correct), but we also make it visible.
+            # If args/kwargs exist, preserve exact backbone behavior by calling original forward.
+            # Then attempt to compute/store attention for gaze supervision (does not affect out).
             if args or kwargs:
+                out = _orig(x, *args, **kwargs)
+    
                 self._attn_fallback_calls += 1
-                # Rate-limit warnings to avoid spamming logs
                 if self._attn_fallback_warned < 5:
                     self._attn_fallback_warned += 1
                     warnings.warn(
                         "Attention hook fallback: attention module was called with args/kwargs "
-                        "(e.g., mask/bias/rope). Falling back to original forward; attention map "
-                        "may be missing for this forward (uniform map may be used). "
-                        "If this happens often, consider disabling hooks for this backbone or "
-                        "extending the hook to support those arguments."
+                        "(e.g., mask/bias/rope). Returning original forward output, but also "
+                        "attempting to compute/store attention from qkv(x) for gaze supervision. "
+                        "If this triggers often and gradients remain zero, you may need to extend "
+                        "mask/bias handling for your specific backbone."
                     )
-                return _orig(x, *args, **kwargs)
     
+                try:
+                    attn_pre = _compute_attn_pre_from_x(x, _mod=_mod)
+                    if attn_pre is not None:
+                        _store_attn(attn_pre)
+                except Exception:
+                    # Do not let debug/aux computation break the backbone
+                    pass
+    
+                return out
+    
+            # No args/kwargs: we can fully reproduce timm Attention and store attention
             try:
                 if x.ndim != 3:
                     return _orig(x, *args, **kwargs)
@@ -580,12 +686,7 @@ class Transformer(nn.Module):
                 # forward attention (with dropout)
                 attn_fwd = _mod.attn_drop(attn_pre) if hasattr(_mod, "attn_drop") else attn_pre
     
-                # store PRE-dropout for supervision stability
-                attn_store = attn_pre if (self.gaze_requires_grad and self.training) else attn_pre.detach()
-    
-                self._active_last_attn = attn_store
-                if self.attn_cfg.mode == "rollout" and self._active_attn_sink is not None:
-                    self._active_attn_sink.append(attn_store)
+                _store_attn(attn_pre)
     
                 out = (attn_fwd @ v).transpose(1, 2).reshape(B, N, C)
                 out = _mod.proj(out) if hasattr(_mod, "proj") else out
@@ -755,6 +856,32 @@ class Transformer(nn.Module):
             m = self._uniform_map(B=B, device=feats_for_dtype.device, dtype=feats_for_dtype.dtype)
 
         return m
+
+    def _get_attention_map_and_meta(self, feats_for_dtype: torch.Tensor):
+        """
+        Returns:
+            attn_map: Optional[Tensor]
+            used_uniform: bool  (True only when we had to fall back because attention capture produced nothing)
+        """
+        # Default meta
+        used_uniform = False
+    
+        if not (self.attn_cfg.enabled and self.attn_cfg.return_attn):
+            return None, used_uniform
+    
+        mode = self.attn_cfg.mode
+        if mode == "rollout":
+            m = self._attention_rollout_map(feats_for_dtype)
+        else:
+            m = self._attention_last_map(feats_for_dtype)
+    
+        if m is None:
+            B = int(feats_for_dtype.shape[0])
+            m = self._uniform_map(B=B, device=feats_for_dtype.device, dtype=feats_for_dtype.dtype)
+            used_uniform = True
+    
+        return m, used_uniform
+
     """
     def train(self, mode: bool = True):
         super().train(mode)
@@ -762,29 +889,25 @@ class Transformer(nn.Module):
         if not backbone_has_grad:
             self.backbone.eval()
         return self
+
     """
     def _forward_one(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward one Siamese branch.
-    
-        Notes:
-          - Attention maps are captured when enabled *and* the hooked attention modules
-            are invoked without extra args/kwargs. If capture fails, a uniform map is used.
-          - Attention gradients are only kept when:
-              (a) model is in training mode, AND
-              (b) some backbone params require grad (i.e., finetuning is active).
-            Otherwise, stored attention tensors are detached to save memory.
-        """
         self._reset_attention_cache()
     
         backbone_has_grad = any(p.requires_grad for p in self.backbone.parameters())
     
+        # Compute gaze_requires_grad FIRST
         self.gaze_requires_grad = bool(
             self.attn_cfg.enabled
             and self.attn_cfg.return_attn
             and self.training
             and backbone_has_grad
         )
+    
+        # Print AFTER computing it (and only once)
+        if self.training and (not hasattr(self, "_printed_gradflag")):
+            self._printed_gradflag = True
+            print(f"[debug] backbone_has_grad={backbone_has_grad}, gaze_requires_grad={self.gaze_requires_grad}")
     
         local_mats: List[torch.Tensor] = []
         self._active_attn_sink = local_mats
@@ -793,11 +916,9 @@ class Transformer(nn.Module):
         try:
             feats = self._forward_backbone(x)
     
-            # Persist what the hooked attention modules collected during this forward
             self._attn_mats = local_mats
             self._last_attn = self._active_last_attn
     
-            # If we expected attention but captured none, make that visible.
             if self.attn_cfg.enabled and self.attn_cfg.return_attn:
                 missing = (
                     (self.attn_cfg.mode in ("last", "topk") and self._last_attn is None)
@@ -812,18 +933,46 @@ class Transformer(nn.Module):
         finally:
             self._active_attn_sink = None
             self._active_last_attn = None
-            self.gaze_requires_grad = False
+            # DO NOT force gaze_requires_grad=False here
     
         pooled = self._extract_features(feats)
         score = self._rank_score(pooled)
-        attn_map = self._get_attention_map(feats)
+        attn_map, used_uniform = self._get_attention_map_and_meta(feats)
+
+        """
+        print(
+            "[DEBUG attn_map]",
+            "is_none=", (attn_map is None),
+            "req_grad=", (attn_map.requires_grad if attn_map is not None else None),
+            "mean=", (attn_map.mean().item() if attn_map is not None else None),
+            "std=", (attn_map.std().item() if attn_map is not None else None),
+            "fallback_calls=", int(getattr(self, "_attn_fallback_calls", 0)),
+        )
+        """
+        self._last_branch_used_uniform = bool(used_uniform)
     
         return pooled, score, attn_map
 
     
     def forward(self, x_left: torch.Tensor, x_right: torch.Tensor) -> Dict[str, Any]:
+        
         pooled_l, score_l, attn_l = self._forward_one(x_left)
+        used_uniform_l = bool(getattr(self, "_last_branch_used_uniform", False))
+    
         pooled_r, score_r, attn_r = self._forward_one(x_right)
+        used_uniform_r = bool(getattr(self, "_last_branch_used_uniform", False))
+    
+        # Make per-forward metadata available to the training loop
+        self.last_attn_meta = {
+            "left": {
+                "attn_map_is_none": (attn_l is None),
+                "used_uniform": used_uniform_l,
+            },
+            "right": {
+                "attn_map_is_none": (attn_r is None),
+                "used_uniform": used_uniform_r,
+            },
+        }
 
         if self.model in ("sscnn", "rsscnn"):
             logits = self._fusion_logits(pooled_l, pooled_r)

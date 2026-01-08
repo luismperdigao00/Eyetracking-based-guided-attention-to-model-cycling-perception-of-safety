@@ -215,12 +215,38 @@ def arg_parse():
     )
 
     # === POOLING ARGUMENTS ===
-    parser.add_argument("--pooling", type=str, default="cls",
-                        choices=["cls", "mean", "max", "concat", "topk"],
-                        help="Feature pooling strategy (transformers only): cls | mean | max | concat | topk")
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default="cls",
+        choices=[
+            "cls",              # CLS token only
+            "mean",             # mean over CLS only (same as cls, explicit semantic)
+            "patch_mean",       # mean over patch tokens
+            "reg_mean",         # mean over register tokens
+            "prefix_mean",      # mean over CLS + registers
+            "cls_reg_concat",   # concat(CLS, mean(registers))
+            "cls_reg_add",      # CLS + mean(registers)
+            "concat",           # concat(CLS, patch_mean)
+            "topk",             # mean of top-k patch tokens by norm
+            "max",
+            "cls_max_concat",
+        ],
+        help=(
+            "Feature pooling strategy for transformer backbones. "
+            "Options: "
+            "cls | mean | patch_mean | reg_mean | prefix_mean | "
+            "cls_reg_concat | cls_reg_add | concat | topk"
+        ),
+    )
     
-    parser.add_argument("--pool_k", type=int, default=10,
-                        help="Number of patches to keep when using --pooling topk")
+    parser.add_argument(
+        "--pool_k",
+        type=int,
+        default=10,
+        help="Number of patch tokens used when --pooling topk is selected",
+    )
+    
 
     # -------------------- LOSSES ------------------------------
     parser.add_argument("--rank_w", type=float, default=1.0)
@@ -713,27 +739,23 @@ def run_training_with_args(args, trial=None):
     else:
         device = torch.device("cpu")
     print("Device:", device)
-
-    #use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
-
+    
+    # ---------------------------------------------------------------------------
+    # Gaze-loss switch (THIS MUST NOT BE COMMENTED OUT)
+    # ---------------------------------------------------------------------------
+    use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and float(getattr(args, "attn_w", 0.0) or 0.0) > 0.0)
     
     # ------BACKBONE FAMILIES--------
-
     TRANSFORMER_BACKBONES = [
-        # --- The "Power 5" ---
         "dinov3_vitb16",
         "beitv2_base_patch16_224",
         "deit3_base_patch16_224",
         "siglip_base_patch16_224",
         "vit_base_patch16_clip_224",
-    
-        # --- Modern High-Performance Transformers ---
-        "dinov2_base",        # NEW: DINOv2 (no registers)
-        "dinov2_reg_base",    # DINOv2 + registers
+        "dinov2_base",
+        "dinov2_reg_base",
         "eva02_base",
-    
-        # --- Legacy / Canonical Transformers ---
-        "vit_base_patch16_224",  # NEW: Original ViT-B/16 (21k -> 1k)
+        "vit_base_patch16_224",
         "vit_base_dino",
         "vit_small",
         "deit_base",
@@ -741,7 +763,6 @@ def run_training_with_args(args, trial=None):
         "deit_tiny",
         "deit_base_distilled",
     ]
-
     
     CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
     
@@ -749,7 +770,7 @@ def run_training_with_args(args, trial=None):
     if args.backbone in TRANSFORMER_BACKBONES:
         print(f"Using TRANSFORMER architecture: {args.backbone}")
         from nets.transformer import Transformer as Net
-
+    
         # Instantiate the Siamese Transformer Wrapper
         net = Net(
             backbone=backbone_model,
@@ -769,59 +790,75 @@ def run_training_with_args(args, trial=None):
             attention_mode=args.attention_mode,
             attn_topk=args.attn_topk,
         )
-        # Dynamically enable attention gradients if gaze loss is active
+    
+        # If your Transformer wrapper uses this flag, keep it consistent
         net.attn_grad = use_gaze_loss
-
+    
+        # -----------------------------------------------------------------------
+        # ensure attention map resolution == gaze map resolution
+        # -----------------------------------------------------------------------
+        if use_gaze_loss:
+            if not hasattr(args, "gaze_grid_size") or args.gaze_grid_size is None:
+                raise ValueError(
+                    "args.gaze_grid_size is missing. "
+                    "You must compute gaze_grid_size (e.g., (14,14) or (16,16)) before model creation."
+                )
+    
+            # Update attn_cfg.out_hw if your Transformer has an AttnConfig dataclass
+            try:
+                from dataclasses import replace
+                if hasattr(net, "attn_cfg"):
+                    net.attn_cfg = replace(net.attn_cfg, out_hw=tuple(args.gaze_grid_size))
+            except Exception as e:
+                raise RuntimeError(f"Failed to set net.attn_cfg.out_hw to gaze_grid_size={args.gaze_grid_size}: {e}")
+    
     # CNN PATH
     elif args.backbone in CNN_BACKBONES:
         print(f"Using CNN architecture: {args.backbone}")
         from nets.cnn import CNN as Net
-
-        # Map CLI names to torchvision constructors
+        from torchvision import models
+    
         cnn_factory = {
             "alex": models.alexnet,
             "vgg": models.vgg19,
             "dense": models.densenet121,
             "resnet": models.resnet50,
         }
-
-        # Instantiate the Siamese CNN Wrapper
+    
         net = Net(
             backbone=cnn_factory[args.backbone],
             model=args.model,
             finetune=args.finetune,
             num_classes=3 if args.ties else 2,
         )
-
+    
     else:
         known_models = TRANSFORMER_BACKBONES + CNN_BACKBONES
         raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known_models}")
-
+    
     # Move to device
     net.to(device)
-
+    
+    # DataParallel (after moving to device)
     if args.cuda and args.multi_gpu:
         net = torch.nn.DataParallel(net, device_ids=gpu_ids)
         print(f"[DataParallel] Using GPUs: {gpu_ids} (primary cuda:{gpu_ids[0]})")
-
+    
+    # Resume 
     if args.resume:
         print("\nResuming training.")
         checkpoint_name = os.path.join(args.model_dir, f"{args.resume_checkpoint}")
         print("Loading model:", checkpoint_name)
-
+    
         state = torch.load(checkpoint_name, map_location=device)
-
-        # If current model is DataParallel, it expects "module." keys.
         is_dp = isinstance(net, torch.nn.DataParallel)
-
-        # If checkpoint keys have "module." but model is not DP, strip them.
+    
         if not is_dp and any(k.startswith("module.") for k in state.keys()):
             state = {k.replace("module.", "", 1): v for k, v in state.items()}
-
-        # If model is DP but checkpoint keys do not have "module.", add them.
+    
         if is_dp and not any(k.startswith("module.") for k in state.keys()):
             state = {f"module.{k}": v for k, v in state.items()}
-
+    
         net.load_state_dict(state, strict=True)
         print()
 
