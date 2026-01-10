@@ -76,6 +76,40 @@ class EarlyStopper:
         should_stop = self.bad_epochs >= self.patience
         return should_stop, improved
 
+class BackboneFreezeController:
+    """
+    Freeze backbone parameters for the first `freeze_epochs` epochs (0-based),
+    then unfreeze them. Optimizer param groups are never modified.
+    """
+
+    def __init__(self, freeze_epochs: int, finetune: bool, backbone_params):
+        self.freeze_epochs = int(max(0, freeze_epochs))
+        self.finetune = bool(finetune)
+        self.backbone_params = backbone_params
+        self._unfrozen = False
+
+    def start_frozen(self) -> bool:
+        return self.finetune and self.freeze_epochs > 0
+
+    def apply_initial_freeze(self) -> None:
+        if not self.start_frozen():
+            return
+        for _, p in self.backbone_params:
+            p.requires_grad = False
+
+    def maybe_unfreeze(self, epoch0: int) -> bool:
+        if not self.finetune or self._unfrozen:
+            return False
+        if int(epoch0) < self.freeze_epochs:
+            return False
+
+        for _, p in self.backbone_params:
+            p.requires_grad = True
+
+        self._unfrozen = True
+        return True
+
+
 
 # --------------------------------------------------------------------------------------------------------------------
 # Data preparation helpers
@@ -218,14 +252,9 @@ def _split_parameters(
     """
     Split parameters into two logical groups: "heads" vs "backbone".
 
-    Correct rule for the codebase:
-      - Any parameter that belongs to `net.backbone` is "backbone".
-      - Everything else is "head" (ranking/classification layers, fusion norms, etc.).
-
-    This is robust to:
-      - Transformer wrappers that include trainable modules outside the backbone
-        (e.g., pair_norm, feat_norm).
-      - DataParallel/DistributedDataParallel, where parameter names are prefixed with "module.".
+    Rule:
+      - Any parameter under net.backbone is "backbone"
+      - Everything else is "head"
     """
     head_params: List[Tuple[str, torch.nn.Parameter]] = []
     backbone_params: List[Tuple[str, torch.nn.Parameter]] = []
@@ -234,167 +263,126 @@ def _split_parameters(
         if not param.requires_grad:
             continue
 
-        # Handle DataParallel prefixing
         is_backbone = name.startswith("backbone.") or name.startswith("module.backbone.")
-
-        if is_backbone:
-            backbone_params.append((name, param))
-        else:
-            head_params.append((name, param))
+        (backbone_params if is_backbone else head_params).append((name, param))
 
     return head_params, backbone_params
 
 
-def _separate_decay(params):
+def _separate_decay(params: List[Tuple[str, torch.nn.Parameter]]):
     """
-    Helper to split parameters into 'decay' (weights) and 'no_decay' (biases, layernorm).
-    Used for AdamW to correctly apply weight decay only where appropriate.
+    Split named parameters into:
+      - decay: weights
+      - no_decay: biases and normalization-like parameters
     """
     decay = []
     no_decay = []
+
     for name, param in params:
         if not param.requires_grad:
             continue
-        # Biases and LayerNorms/BatchNorms should NOT have weight decay
-        if "bias" in name or "norm" in name or "len_sig" in name:
+
+        name_l = name.lower()
+        if ("bias" in name_l) or ("norm" in name_l) or ("len_sig" in name_l):
             no_decay.append(param)
         else:
             decay.append(param)
+
     return decay, no_decay
 
 
-def _build_optimizer(
+def _set_requires_grad(named_params: List[Tuple[str, torch.nn.Parameter]], flag: bool) -> None:
+    for _, p in named_params:
+        p.requires_grad = bool(flag)
+
+def build_optimizer(
     args,
     net: torch.nn.Module,
     is_transformer: bool,
-    head_params: list,
-    backbone_params: list,
-) -> Tuple[torch.optim.Optimizer, Dict]:
+    head_params: List[Tuple[str, torch.nn.Parameter]],
+    backbone_params: List[Tuple[str, torch.nn.Parameter]],
+) -> Tuple[torch.optim.Optimizer, Dict, Optional[BackboneFreezeController]]:
     """
-    Optimizer builder with family-specific policies, using explicit backbone scaling.
+    Optimizer builder with optional backbone freeze.
 
-    Logic:
-      - Head Parameters:     Run at 'base_lr'
-      - Backbone Parameters: Run at 'base_lr * backbone_lr_scale' (slower)
-      
-    Common Rules:
-      - finetune=True  -> optimize backbone + head
-      - finetune=False -> optimize head only
-      - Weight decay   -> applied to weights, disabled for bias/norm
+    Behavior:
+      - finetune=False  -> head only
+      - finetune=True   -> head + backbone groups from the start (split LR)
+      - backbone_freeze_epochs>0 -> backbone params have requires_grad=False for first N epochs
+                                  (optimizer groups unchanged, scheduler-safe)
     """
     base_lr = float(getattr(args, "base_lr"))
     weight_decay = float(getattr(args, "weight_decay", 0.0))
     finetune = bool(getattr(args, "finetune", False))
-    
-    # Scale backbone relative to the head (e.g., 0.1x)
+
     bb_scale = float(getattr(args, "backbone_lr_scale", 0.1))
-    
     head_lr = base_lr
     backbone_lr = base_lr * bb_scale
 
-    # =========================================================================
-    # TRANSFORMERS (AdamW, Split LR)
-    # =========================================================================
+    freeze_epochs = int(getattr(args, "backbone_freeze_epochs", 4))
+
+    controller = BackboneFreezeController(
+        freeze_epochs=freeze_epochs,
+        finetune=finetune,
+        backbone_params=backbone_params,
+    )
+
+    # -------------------------
+    # Head groups (always)
+    # -------------------------
+    head_decay, head_no_decay = _separate_decay(head_params)
+
+    groups = []
+    if head_decay:
+        groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay})
+    if head_no_decay:
+        groups.append({"params": head_no_decay, "lr": head_lr, "weight_decay": 0.0})
+
+    # -------------------------
+    # Backbone groups (only if finetune)
+    # -------------------------
+    if finetune:
+        bb_decay, bb_no_decay = _separate_decay(backbone_params)
+        if bb_decay:
+            groups.append({"params": bb_decay, "lr": backbone_lr, "weight_decay": weight_decay})
+        if bb_no_decay:
+            groups.append({"params": bb_no_decay, "lr": backbone_lr, "weight_decay": 0.0})
+
+    # -------------------------
+    # Optimizer family
+    # -------------------------
     if is_transformer:
-        # -------------------------
-        # 1. Prepare Head Groups (Always optimized)
-        # -------------------------
-        target_head = [(n, p) for (n, p) in head_params if p.requires_grad]
-        head_decay, head_no_decay = _separate_decay(target_head)
-
-        groups = []
-        if head_decay:
-            groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay})
-        if head_no_decay:
-            groups.append({"params": head_no_decay, "lr": head_lr, "weight_decay": 0.0})
-
-        # -------------------------
-        # 2. Prepare Backbone Groups (Only if finetune)
-        # -------------------------
-        if finetune:
-            target_bb = [(n, p) for (n, p) in backbone_params if p.requires_grad]
-            bb_decay, bb_no_decay = _separate_decay(target_bb)
-
-            if bb_decay:
-                groups.append({"params": bb_decay, "lr": backbone_lr, "weight_decay": weight_decay})
-            if bb_no_decay:
-                groups.append({"params": bb_no_decay, "lr": backbone_lr, "weight_decay": 0.0})
-            
-            mode = "transformer_split_lr"
-        else:
-            mode = "transformer_head_only"
-
-        # -------------------------
-        # Optimizer (AdamW)
-        # -------------------------
-        optimizer = optim.AdamW(
-            groups,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
-
-        optimizer_info = {
-            "family": "transformer",
-            "optimizer": "AdamW",
-            "mode": mode,
-            "backbone_lr": backbone_lr,
-            "head_lr": head_lr,
-            "scale_factor": bb_scale,
-            "weight_decay": weight_decay,
-        }
-        return optimizer, optimizer_info
-
-    # =========================================================================
-    # CNNs (Adam, Split LR)
-    # =========================================================================
+        optimizer = optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+        family, opt_name = "transformer", "AdamW"
     else:
-        # -------------------------
-        # 1. Prepare Head Groups (Always optimized)
-        # -------------------------
-        target_head = [(n, p) for (n, p) in head_params if p.requires_grad]
-        head_decay, head_no_decay = _separate_decay(target_head)
+        optimizer = optim.Adam(groups, betas=(0.9, 0.999), eps=1e-8)
+        family, opt_name = "cnn", "Adam"
 
-        groups = []
-        if head_decay:
-            groups.append({"params": head_decay, "lr": head_lr, "weight_decay": weight_decay})
-        if head_no_decay:
-            groups.append({"params": head_no_decay, "lr": head_lr, "weight_decay": 0.0})
+    # Freeze backbone after optimizer is created so param groups remain stable (scheduler-safe)
+    controller.apply_initial_freeze()
 
-        # -------------------------
-        # 2. Prepare Backbone Groups (Only if finetune)
-        # -------------------------
-        if finetune:
-            target_bb = [(n, p) for (n, p) in backbone_params if p.requires_grad]
-            bb_decay, bb_no_decay = _separate_decay(target_bb)
+    mode = (
+        f"{family}_head_only"
+        if not finetune
+        else (f"{family}_freeze_backbone_{freeze_epochs}ep" if controller.start_frozen() else f"{family}_split_lr")
+    )
 
-            if bb_decay:
-                groups.append({"params": bb_decay, "lr": backbone_lr, "weight_decay": weight_decay})
-            if bb_no_decay:
-                groups.append({"params": bb_no_decay, "lr": backbone_lr, "weight_decay": 0.0})
-            
-            mode = "cnn_split_lr"
-        else:
-            mode = "cnn_head_only"
+    optimizer_info = {
+        "family": family,
+        "optimizer": opt_name,
+        "mode": mode,
+        "finetune": finetune,
+        "backbone_lr": backbone_lr,
+        "head_lr": head_lr,
+        "scale_factor": bb_scale,
+        "weight_decay": weight_decay,
+        "backbone_freeze_epochs": freeze_epochs,
+    }
 
-        # -------------------------
-        # Optimizer (Adam)
-        # -------------------------
-        optimizer = optim.Adam(
-            groups,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
+    if not finetune:
+        return optimizer, optimizer_info, None
+    return optimizer, optimizer_info, controller
 
-        optimizer_info = {
-            "family": "cnn",
-            "optimizer": "Adam",
-            "mode": mode,
-            "backbone_lr": backbone_lr,
-            "head_lr": head_lr,
-            "scale_factor": bb_scale,
-            "weight_decay": weight_decay,
-        }
-        return optimizer, optimizer_info
         
 def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, base_lr: float):
     """
@@ -1377,7 +1365,14 @@ def train(
     head_params, backbone_params = _split_parameters(net_cfg)
     
     # Construct optimizer (Logic is now encapsulated in the function)
-    optimizer, optimizer_info = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
+    #optimizer, optimizer_info = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
+    optimizer, optimizer_info, freeze_ctl = build_optimizer(
+        args=args,
+        net=net,
+        is_transformer=is_transformer,
+        head_params=head_params,
+        backbone_params=backbone_params,
+    )
 
 
     scheduler, scheduler_type = _build_scheduler(
@@ -1544,6 +1539,18 @@ def train(
     # Reinitialize timing if a logger is enabled (supports step-level timing logs downstream).
     if logger:
         start_training = timer()
+        
+    @trainer.on(Events.EPOCH_STARTED)
+    def _maybe_unfreeze_backbone(engine):
+        if freeze_ctl is None:
+            return
+    
+        # Ignite epochs are 1-based; convert to 0-based for "freeze first N epochs"
+        epoch0 = int(engine.state.epoch) - 1
+    
+        did_unfreeze = freeze_ctl.maybe_unfreeze(epoch0)
+        if did_unfreeze:
+            print(f"[optimizer] Backbone unfrozen at Ignite epoch {engine.state.epoch} (epoch0={epoch0})")
 
     # ------------------------------------------------------------------------------------------------
     # Run training loop (with guaranteed W&B finalization)

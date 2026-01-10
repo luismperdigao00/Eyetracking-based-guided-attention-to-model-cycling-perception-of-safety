@@ -449,7 +449,7 @@ AUG_PRESETS = {
         paired_erase=True,
 
         # Params
-        hflip_p=0.50,
+        hflip_p=0.20,
         swap_p=0.50,
 
         crop_p=0.00,
@@ -475,45 +475,43 @@ AUG_PRESETS = {
     ),
 
     "heavy": dict(
-        # Pairing toggles
-        paired_scale=False,
-        paired_hflip=False,
-        paired_crop=False,
-        paired_rotation=False,
-        paired_color_jitter=False,
-        paired_gray=False,
-        paired_erase=False,
-
-        # Params (label-stable, ViT-safe)
-        hflip_p=0.5,
+        # Pairing toggles (ranking-safe defaults)
+        paired_scale=True,
+        paired_hflip=True,
+        paired_crop=True,
+        paired_rotation=True,
+        paired_color_jitter=False,   # keep unpaired but mild
+        paired_gray=True,            # irrelevant if gray_p=0
+        paired_erase=True,
+    
+        # Pair operations
         swap_p=0.5,
-
-        # Paired translation jitter
-        crop_p=1,
-
-        scale_p=0.1,
-        #scale_p=0.5,
-        scale_range=(1, 1.3),
-
-        # Small, infrequent rotation
-        rotation_p=0.25,
-        max_rotation_deg=4,
-
-        # Unpaired photometric jitter (moderate)
-        color_jitter_p=0.2,
-        jitter_brightness=0.40,
-        jitter_contrast=0.40,
-        jitter_saturation=0.45,
-        jitter_hue=0.10,
-
-        gray_p=0.05,
-
-        # Keep erasing off by default (enable only after baseline is stable)
-        erase_p=0.05,
-        erase_scale=(0.03, 0.1),
+    
+        # Geometry (paired)
+        hflip_p=0.5,                 # common for ViTs; paired keeps it label-stable
+        crop_p=0.8,                  # strong, but not always-on to avoid over-randomizing evidence
+        scale_p=0.25,
+        scale_range=(1.0, 1.15),     # mild zoom-in only
+        rotation_p=0.10,
+        max_rotation_deg=3.0,
+    
+        # Photometric (mild, unpaired)
+        color_jitter_p=0.20,
+        jitter_brightness=0.20,
+        jitter_contrast=0.20,
+        jitter_saturation=0.20,
+        jitter_hue=0.03,             # hue is the easiest to overdo
+    
+        # Usually keep off unless color invariance is desired
+        gray_p=0.0,
+    
+        # Regularization (start low; increase after baseline is stable)
+        erase_p=0.10,
+        erase_scale=(0.02, 0.08),
         erase_ratio=(0.3, 3.3),
         erase_value=0.0,
     ),
+
 }
 
 # ==============================================================================
