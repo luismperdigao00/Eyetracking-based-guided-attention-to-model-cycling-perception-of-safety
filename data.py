@@ -480,8 +480,8 @@ AUG_PRESETS = {
         paired_hflip=True,
         paired_crop=True,
         paired_rotation=True,
-        paired_color_jitter=False,   # keep unpaired but mild
-        paired_gray=True,            # irrelevant if gray_p=0
+        paired_color_jitter=False,   
+        paired_gray=True,        
         paired_erase=True,
     
         # Pair operations
@@ -500,7 +500,7 @@ AUG_PRESETS = {
         jitter_brightness=0.20,
         jitter_contrast=0.20,
         jitter_saturation=0.20,
-        jitter_hue=0.03,             # hue is the easiest to overdo
+        jitter_hue=0.03,             
     
         # Usually keep off unless color invariance is desired
         gray_p=0.0,
@@ -530,9 +530,6 @@ class Augmentation:
     Geometry:
       - Scale is zoom-in only (scale_min clamped to >= 1.0).
       - Crop always outputs out_size; when crop is not applied to a side, center-crop is used for that side.
-
-    Photometric:
-      - Unpaired photometric transforms sample independent parameters per image.
 
     Swap:
       - Always a pair operation, updates labels deterministically.

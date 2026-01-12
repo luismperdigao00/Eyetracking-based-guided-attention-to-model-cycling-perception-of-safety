@@ -135,7 +135,19 @@ def arg_parse():
                           help="Do not early-stop before this epoch.")
 
     # -------------------- GAZE & CITY FILTERS ----------------
-    parser.add_argument("--gaze", default="use", choices=["off", "use", "only"])
+    parser.add_argument(
+    "--gaze",
+        default="off",
+        choices=["off", "use", "use_nobp", "only"],
+        help=(
+            "Gaze supervision mode:\n"
+            "  off       : do not use gaze loss\n"
+            "  use       : use gaze KL in total loss (backprop)\n"
+            "  use_nobp  : compute/log gaze KL but DO NOT backprop KL\n"
+            "  only      : train using gaze KL only (debug/ablation)\n"
+        ),
+    )
+
     parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
     help=(
         "How to extract transformer attention maps:\n"
@@ -525,7 +537,7 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 3) TRAIN/VAL/TEST SPLIT
     # =============================================================================================== #
-  
+    """      
     # 1. Define the Grouping Variable
     # Ideally 'trial_id' represents a unique user session or trip. 
     # If 'trial_id' is not spatial, use the image filename itself to be 100% strict.
@@ -547,13 +559,13 @@ def run_training_with_args(args, trial=None):
     train_groups = X_train['survey_id']
     splitter_val = GroupShuffleSplit(test_size=0.13, n_splits=1, random_state=args.seed)
     sub_train_idx, sub_val_idx = next(splitter_val.split(X_train, groups=train_groups))
-    
+     
     X_val = X_train.iloc[sub_val_idx]
     X_train = X_train.iloc[sub_train_idx]
-    """
+    """    
     X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
     X_train, X_val  = train_test_split(X_train       , test_size=0.13, random_state=args.seed)
-
+    """
     splits_dir = "splits"
     os.makedirs(splits_dir, exist_ok=True)
     
@@ -819,6 +831,7 @@ def run_training_with_args(args, trial=None):
             return_attn=use_gaze_loss,
             attention_mode=args.attention_mode,
             attn_topk=args.attn_topk,
+            attn_out_hw=tuple(args.gaze_grid_size),
         )
     
         # If your Transformer wrapper uses this flag, keep it consistent

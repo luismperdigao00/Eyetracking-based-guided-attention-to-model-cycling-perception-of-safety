@@ -1,0 +1,198 @@
+# ==============================================================================
+# W&B Sweep: 5 Backbones + Unfreeze Depth + Pooling + Augmentation
+# ==============================================================================
+program: /home/csantiago/train.py
+project: PCS_ET_v2
+command:
+  - python
+  - ${program}
+  - ${args}
+
+method: grid
+metric:
+  name: max_accuracy_validation
+  goal: maximize
+
+parameters:
+  # ---------------------------------------------------------------------------
+  # A) System / I/O
+  # ---------------------------------------------------------------------------
+  cuda:
+    value: true
+  cuda_id:
+    value: 1
+  amp:
+    value: false
+  
+  multi_gpu:
+    value: false
+  gpu_ids:
+    value: "0,1"
+
+  seed:
+    values: [30]
+  log_wandb:
+    value: true
+  log_console:
+    value: true
+
+  dataset:
+    value: images/
+  model_dir:
+    value: models
+  comparisons:
+    value: comparisons_df.pickle 
+  resume:
+    value: false
+  epoch:
+    value: 0
+  resume_checkpoint:
+    value: ""
+
+  # ---------------------------------------------------------------------------
+  # B) Dataset / Filtering
+  # ---------------------------------------------------------------------------
+  cities:
+    value: berlin
+  # ---------------------------------------------------------------------------
+  # C) Model family / Objective
+  # ---------------------------------------------------------------------------
+  model:
+    value: rsscnn
+  ties:
+    value: false
+  gaze:
+    values: ["off"]
+
+  # ---------------------------------------------------------------------------
+  # D) Backbone & Architecture
+  # ---------------------------------------------------------------------------
+  backbone:
+    values:
+      #- "vit_small"
+      - "dinov3_vitb16"
+      #- "deit3_base_patch16_224"
+      #- "vit_base_patch16_224"
+      #- "vit_base_patch16_clip_224"
+
+  pooling:
+    values:
+      #- max
+      #- cls_max_concat
+      #- mean
+      - cls
+      #- reg_mean
+      #- prefix_mean
+      #- cls_reg_concat
+      #- cls_reg_add
+      - concat
+      #- topk
+
+    
+  pool_k:
+    value: 100
+
+  # ---------------------------------------------------------------------------
+  # E) Fine-tuning policy
+  # ---------------------------------------------------------------------------
+  finetune:
+    value: true
+    
+  num_ft_blocks:
+    values: [4]
+
+  # ---------------------------------------------------------------------------
+  # F) Batch / Training length
+  # ---------------------------------------------------------------------------
+  batch_size:
+    value: 16
+  k:
+    value: 8
+    
+  max_epochs:
+    value: 15
+  grad_clip:
+    value: 0.0
+
+  # ---------------------------------------------------------------------------
+  # G) Optimizer
+  # ---------------------------------------------------------------------------
+  base_lr:
+    values: [3e-5]
+  backbone_lr_scale:
+    value: 0.5
+  weight_decay:
+    value: 0.05
+
+  rank_dropout:
+    value: 0.3
+  cross_dropout:
+    value: 0.3
+
+  # ---------------------------------------------------------------------------
+  # H) Ranking / Loss weights
+  # ---------------------------------------------------------------------------
+  ranking_margin:
+    values: [1.4]
+#  ranking_margin_ties:
+#    value: 0.7
+  rank_w:
+    value: 1
+
+  ties_w:
+    value: 1.0
+  attn_w:
+    value: 0
+  label_smoothing:
+    value: 0.0
+  use_class_weights:
+    value: true
+
+  # ---------------------------------------------------------------------------
+  # I) Scheduler
+  # ---------------------------------------------------------------------------
+  scheduler:
+    value: warmup_cosine
+  warmup_frac:
+    value: 0.2
+  eta_min:
+    value: 5.0e-6
+
+  # ---------------------------------------------------------------------------
+  # J) Augmentation
+  # ---------------------------------------------------------------------------
+  augment:
+    values: ["none", "heavy"]
+  use_seg:
+    value: false
+
+  # ---------------------------------------------------------------------------
+  # K) Accuracy reporting
+  # ---------------------------------------------------------------------------
+  full_accuracy:
+    value: false
+
+  # ---------------------------------------------------------------------------
+  # L) Early stopping
+  # ---------------------------------------------------------------------------
+  early_stop:
+    value: true
+  early_stop_metric:
+    value: loss_validation
+  early_stop_mode:
+    value: min
+  early_stop_patience:
+    value: 4
+  early_stop_min_delta:
+    value: 0.0
+  early_stop_start_epoch:
+    value: 1
+
+  # ---------------------------------------------------------------------------
+  # Gaze Configuration
+  # ---------------------------------------------------------------------------
+  gaze_map_size:
+    value: "auto"    # Options: "auto" or an integer (e.g., 14, 16)
+  
+  gaze_subdir_fmt:
+    value: "{s}x{s}" # Format for subfolders (e.g., "14x14")

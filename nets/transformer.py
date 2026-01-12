@@ -95,7 +95,8 @@ class Transformer(nn.Module):
         attention_mode: str = "last",
         attn_topk: Optional[int] = None,
         force_num_prefix_tokens: Optional[int] = None,
-        apply_token_norm: bool = False, 
+        apply_token_norm: bool = False,
+        attn_out_hw: Optional[Tuple[int, int]] = None,
     ) -> None:
         super().__init__()
 
@@ -135,6 +136,8 @@ class Transformer(nn.Module):
         self.gaze_requires_grad = False
 
         self._hooked_modules: List[nn.Module] = []
+
+        self.gaze_backprop_enabled = True
 
         # ------------------------------------------------------------------
         # 1) Backbone freeze / finetune setup
@@ -217,7 +220,9 @@ class Transformer(nn.Module):
             return_attn=bool(return_attn),
             mode=str(attention_mode).lower().strip(),
             topk=None if attn_topk is None else int(attn_topk),
+            out_hw=tuple(attn_out_hw) if attn_out_hw is not None else (14, 14),
         )
+
         if self.attn_cfg.mode not in ("last", "rollout", "topk"):
             raise ValueError(f"Unknown attention_mode='{attention_mode}'. Expected one of: last/rollout/topk.")
 
@@ -242,23 +247,65 @@ class Transformer(nn.Module):
 
     def _unfreeze_last_blocks(self, num_ft_blocks: int) -> None:
         """
-        Unfreeze last N blocks/stages and final norm (if present).
-        Designed for timm-style ViTs/CNNs exposing `.blocks` or `.stages`.
+        Unfreeze a small, explicit subset of the backbone for fine-tuning.
+    
+        Policy:
+          - If num_ft_blocks <= 0: keep the backbone fully frozen.
+          - Otherwise:
+              - unfreeze the last N blocks/stages (timm-style `.blocks` or `.stages`)
+              - unfreeze the final norm (common in ViTs)
+              - unfreeze patch embedding + positional/special tokens when present (ViTs)
         """
+        n_req = int(num_ft_blocks)
+        if n_req <= 0:
+            return
+    
+        # ------------------------------------------------------------------
+        # Helper: unfreeze a parameter if it exists and is a proper Parameter
+        # ------------------------------------------------------------------
+        def _unfreeze_param_attr(module, attr_name: str) -> None:
+            if not hasattr(module, attr_name):
+                return
+            obj = getattr(module, attr_name)
+            if isinstance(obj, torch.nn.Parameter):
+                obj.requires_grad = True
+    
+        # ------------------------------------------------------------------
+        # 1) Unfreeze the last N blocks / stages
+        # ------------------------------------------------------------------
         blocks = getattr(self.backbone, "blocks", None)
         if blocks is None:
             blocks = getattr(self.backbone, "stages", None)
-
-        if blocks is not None and len(blocks) > 0:
-            n = max(0, min(int(num_ft_blocks), len(blocks)))
-            for blk in blocks[-n:]:
+    
+        if blocks is not None:
+            # Works for ModuleList / Sequential / list-like containers
+            n_total = len(blocks)
+            n = max(0, min(n_req, n_total))
+            for blk in list(blocks)[-n:]:
                 for p in blk.parameters():
                     p.requires_grad = True
-
-        # Unfreeze final norm if present (common for ViTs)
-        if hasattr(self.backbone, "norm"):
-            for p in self.backbone.norm.parameters():
+    
+        # ------------------------------------------------------------------
+        # 2) Unfreeze final norm (common for ViTs and some CNN backbones)
+        # ------------------------------------------------------------------
+        norm = getattr(self.backbone, "norm", None)
+        if isinstance(norm, torch.nn.Module):
+            for p in norm.parameters():
                 p.requires_grad = True
+    
+        # ------------------------------------------------------------------
+        # 3) Unfreeze embedding + tokens when present (ViT-family)
+        # ------------------------------------------------------------------
+        patch_embed = getattr(self.backbone, "patch_embed", None)
+        if isinstance(patch_embed, torch.nn.Module):
+            for p in patch_embed.parameters():
+                p.requires_grad = True
+    
+        _unfreeze_param_attr(self.backbone, "pos_embed")
+        _unfreeze_param_attr(self.backbone, "cls_token")
+        _unfreeze_param_attr(self.backbone, "dist_token")
+        _unfreeze_param_attr(self.backbone, "reg_token")
+
 
     def _get_backbone_input_hw(self) -> Tuple[int, int]:
         """
@@ -559,6 +606,8 @@ class Transformer(nn.Module):
     # ==================================================================================
     # Attention extraction (hooks + map conversion)
     # ==================================================================================
+    def set_gaze_backprop(self, enabled: bool) -> None:
+        self.gaze_backprop_enabled = bool(enabled)
 
     def _reset_attention_cache(self) -> None:
         self._attn_mats = []
@@ -618,7 +667,7 @@ class Transformer(nn.Module):
     
         def _store_attn(attn_pre: torch.Tensor) -> None:
             # Store PRE-dropout attention for supervision stability
-            attn_store = attn_pre if (self.gaze_requires_grad and self.training) else attn_pre.detach()
+            attn_store = attn_pre if (self.gaze_requires_grad and self.training and self.gaze_backprop_enabled) else attn_pre.detach()
             self._active_last_attn = attn_store
             if self.attn_cfg.mode == "rollout" and self._active_attn_sink is not None:
                 self._active_attn_sink.append(attn_store)
@@ -751,6 +800,7 @@ class Transformer(nn.Module):
 
         # CLS -> patches only (token 0 attending to patch tokens)
         patch_scores = attn[:, 0, self.num_prefix_tokens:]  # (B, P)
+        patch_scores = patch_scores / patch_scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
         return self._patch_vector_to_map(
             patch_scores,

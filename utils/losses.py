@@ -522,15 +522,22 @@ def compute_loss(
         # -----------------------------------------------------------------
         # 4.4) Total loss
         # -----------------------------------------------------------------
-        total = loss_class + loss_rank_combo + (w_kl_eff * loss_kl)
-
+        loss_kl_weighted = w_kl_eff * loss_kl
+        total = loss_class + loss_rank_combo + loss_kl_weighted
+        
         parts = {
+            # raw (keep graph)
+            "loss_class_raw": loss_class,
+            "loss_rank_combo_raw": loss_rank_combo,
+            "loss_kl_raw": loss_kl,
+            "loss_kl_weighted_raw": loss_kl_weighted,
+        
+            # detached (safe for logging)
             "loss_class": loss_class.detach(),
-            "loss_rank_nonties": loss_nonties.detach(),
-            "loss_rank_ties": loss_ties.detach(),
             "loss_rank_combo": loss_rank_combo.detach(),
             "loss_kl": loss_kl.detach(),
-            "loss_kl_weighted": (w_kl_eff * loss_kl).detach(),
+            "loss_kl_weighted": loss_kl_weighted.detach(),
+        
             "w_kl_eff": float(w_kl_eff),
             "gaze_any": float(gaze_any),
             "gaze_count": gaze_count,

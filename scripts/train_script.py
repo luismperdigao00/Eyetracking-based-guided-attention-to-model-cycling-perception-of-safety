@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional, Any
 from timeit import default_timer as timer
 
 import optuna
@@ -29,14 +29,17 @@ from torch import nn
 
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
-from ignite.metrics import Accuracy, RunningAverage
+from ignite.metrics import RunningAverage, Average, Accuracy
+
 
 from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
 from utils.losses import compute_loss
 from utils.log import log
 
+from ignite.exceptions import NotComputableError
 from train_utils import print_run_plan
 
+        
 class EarlyStopper:
     """Simple epoch-level early stopping helper."""
 
@@ -184,43 +187,50 @@ def _build_metrics_output(
           rank_left, rank_right, logits, label_r, label_c,
           loss_kl, loss_kl_weighted, w_kl_eff, gaze_count
     """
-    # loss: scalar float per batch
     out: Dict[str, Any] = {"loss": float(loss.item())}
 
     if args.model == "rcnn":
-        # rank_left/rank_right: tensors per batch
-        # label: ranking labels per batch (label_r)
-        out.update({
-            "rank_left": forward_dict["left"]["output"],
-            "rank_right": forward_dict["right"]["output"],
-            "label": labels["label_r"],
-        })
+        out.update(
+            {
+                "rank_left": forward_dict["left"]["output"],
+                "rank_right": forward_dict["right"]["output"],
+                "label": labels["label_r"],
+            }
+        )
         return out
 
     if args.model == "sscnn":
-        # logits: classification logits per batch
-        # label: class labels per batch (label_c)
-        out.update({
-            "logits": forward_dict["logits"]["output"],
-            "label": labels["label_c"].long(),
-        })
+        out.update(
+            {
+                "logits": forward_dict["logits"]["output"],
+                "label": labels["label_c"].long(),
+            }
+        )
         return out
 
     if args.model == "rsscnn":
-        # rank_left/rank_right: ranking scores per batch
-        # logits: classification logits per batch
-        # label_r/label_c: targets per batch
-        out.update({
-            "rank_left": forward_dict["left"]["output"],
-            "rank_right": forward_dict["right"]["output"],
-            "logits": forward_dict["logits"]["output"],
-            "label_r": labels["label_r"],
-            "label_c": labels["label_c"],
-        })
+        out.update(
+            {
+                "rank_left": forward_dict["left"]["output"],
+                "rank_right": forward_dict["right"]["output"],
+                "logits": forward_dict["logits"]["output"],
+                "label_r": labels["label_r"],
+                "label_c": labels["label_c"],
+            }
+        )
 
-        # loss_kl/loss_kl_weighted: scalar floats per batch
-        # w_kl_eff: effective KL weight per batch
-        # gaze_count: number of gaze-supervised samples per batch
+        gaze_mode = getattr(args, "gaze", "off")
+
+        # When gaze supervision is disabled, metrics are forced to zero
+        # to prevent stale logging from previous runs or partially-populated parts.
+        if gaze_mode == "off":
+            out["loss_kl"] = 0.0
+            out["loss_kl_weighted"] = 0.0
+            out["w_kl_eff"] = 0.0
+            out["gaze_count"] = 0
+            return out
+
+        # Gaze modes that compute KL for logging (use / use_nobp / only)
         if parts is not None:
             loss_kl = parts.get("loss_kl", 0.0)
             loss_kl_weighted = parts.get("loss_kl_weighted", 0.0)
@@ -240,6 +250,7 @@ def _build_metrics_output(
         return out
 
     raise ValueError(f"Unsupported model type: {args.model}")
+
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -319,7 +330,7 @@ def build_optimizer(
     head_lr = base_lr
     backbone_lr = base_lr * bb_scale
 
-    freeze_epochs = int(getattr(args, "backbone_freeze_epochs", 4))
+    freeze_epochs = int(getattr(args, "backbone_freeze_epochs", 0))
 
     controller = BackboneFreezeController(
         freeze_epochs=freeze_epochs,
@@ -543,38 +554,23 @@ def _make_train_step(
     trial,
     scaler: GradScaler,
 ):
+
     """
-    Factory that builds a single training step callable for Ignite.
+    Ignite training-step factory.
 
-    This function returns a closure (`train_step`) that:
-      - Matches Ignite's required signature: (engine, batch)
-      - Has access to all training configuration via lexical scoping
-      - Supports gradient accumulation, gradient clipping, schedulers,
-        Optuna pruning, and user-triggered early termination
-
-    Returns
-    -------
-    Callable
-        Ignite-compatible training step function.
+    Builds and returns a closure `train_step(engine, batch)` that:
+      - Runs the forward pass under AMP when enabled
+      - Computes composite loss and individual loss parts (including gaze KL parts)
+      - Selects a backward objective based on `args.gaze`:
+          * "off"      : class + rank (+ any non-gaze terms) only
+          * "use"      : class + rank + gaze KL (full objective)
+          * "use_nobp" : computes/logs gaze KL but backpropagates class + rank only
+          * "only"     : backpropagates gaze KL only (ablation/debug)
+      - Supports gradient accumulation, optional gradient clipping, optimizer stepping,
+        and scheduler stepping (non-plateau schedulers only)
+      - Returns a per-batch metrics dict compatible with Ignite metrics attachment
     """
-
     def train_step(engine, data):
-        """
-        Single training iteration executed by Ignite.
-
-        Parameters
-        ----------
-        engine : ignite.engine.Engine
-            Ignite engine instance.
-        data : tuple
-            Batch produced by the DataLoader.
-
-        Returns
-        -------
-        dict
-            Dictionary of metrics for logging.
-        """
-
         # -----------------------------
         # User-requested hard stop
         # -----------------------------
@@ -588,9 +584,6 @@ def _make_train_step(
             engine.terminate()
             return {"skipped": True}
 
-        # -----------------------------
-        # Optional timing
-        # -----------------------------
         if logger:
             start = timer()
 
@@ -598,50 +591,36 @@ def _make_train_step(
         # Forward pass (AMP-capable)
         # -----------------------------
         inputs, labels = _prepare_batch(data, device)
-        has_eye = labels["has_eye_mask"]  # [B] bool
-        gaze_sample_pct = has_eye.float().mean().item()          # fraction of samples with gaze
-        gaze_batch_any = float(bool(has_eye.any().item()))       # 1.0 if any sample has gaze
-        
-        # (optional) check if gaze tensors look non-dummy for gaze-enabled samples
-        gaze_l = labels["gaze_l"]  # [B,1,H,W] or [B,H,W] depending on transforms
-        gaze_r = labels["gaze_r"]
-        
-        # AMP is controlled by the scaler: if scaler is disabled, autocast does nothing.
         use_amp = scaler.is_enabled()
-        
+
         with autocast(enabled=use_amp):
             forward_dict = net(*inputs)
-        # ---------------------------------------------------------
-        # Attention availability diagnostics (per iteration / batch)
-        # ---------------------------------------------------------
-        attn_uniform_batch = 0.0
-        attn_missing_batch = 0.0
-        
-        net_cfg_local = net.module if isinstance(net, torch.nn.DataParallel) else net
-        if hasattr(net_cfg_local, "transformer"):
-            tr = net_cfg_local.transformer
-            meta = getattr(tr, "last_attn_meta", None)
-            if isinstance(meta, dict):
-                # "uniform map batch": if either branch used uniform fallback
-                if meta.get("left", {}).get("used_uniform", False) or meta.get("right", {}).get("used_uniform", False):
-                    attn_uniform_batch = 1.0
-        
-                # "no attention map available": if either branch returned None (maps disabled/unavailable)
-                if meta.get("left", {}).get("attn_map_is_none", True) or meta.get("right", {}).get("attn_map_is_none", True):
-                    attn_missing_batch = 1.0
-                    
-        loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
-        # Backprop objective without KL; KL stays in `parts` for logging
-        loss_no_kl = loss_total - parts.get("loss_kl_weighted", 0.0)
-        loss = loss_total
-        
-        # Keep the *unscaled* loss for logging/metrics.
-        raw_loss = loss
-        
+
+            # Full loss + parts; parts contains raw tensors for selective backprop
+            loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+
+            # Class + rank objective (keeps graph)
+            loss_no_kl = parts["loss_class_raw"] + parts["loss_rank_combo_raw"]
+
         # -----------------------------
-        # NaN guard (debug safety)
+        # Backprop objective selection
         # -----------------------------
-        if torch.isnan(loss):
+        gaze_mode = getattr(args, "gaze", "off")
+
+        DEBUG_KL_ONLY = False  # temporary debug hook
+        if DEBUG_KL_ONLY:
+            loss_bp = parts["loss_kl_weighted_raw"]
+        elif gaze_mode == "only":
+            loss_bp = parts["loss_kl_weighted_raw"]
+        elif gaze_mode == "use_nobp":
+            loss_bp = loss_no_kl
+        else:
+            loss_bp = loss_total
+
+        # -----------------------------
+        # NaN guard (check backward objective)
+        # -----------------------------
+        if torch.isnan(loss_bp):
             label_r = labels["label_r"]
             n_ties = (label_r == 0).sum().item()
             n_nonties = (label_r != 0).sum().item()
@@ -652,120 +631,78 @@ def _make_train_step(
                 f"n_nonties={n_nonties}, n_ties={n_ties}"
             )
             raise ValueError("NaN loss detected; stopping for debugging.")
-        
+
         # -----------------------------
         # Backward pass (accumulated, AMP-safe)
         # -----------------------------
-        # IMPORTANT: divide by accum_steps BEFORE backward so the accumulated gradient matches
-        # a single batch of size (batch_size * accum_steps).
-        # --- DEBUG: isolate gaze KL backprop (set True for 1–5 iterations only) ---
-        DEBUG_KL_ONLY = False  # <-- flip to False after testing
-        
-        if DEBUG_KL_ONLY:
-            w = float(parts.get("w_kl_eff", 0.0))
-            gc = int(parts.get("gaze_count", 0))
-            loss = parts["loss_kl"] * w
-        
-            print("[DEBUG KL terms]",
-                  "w_kl_eff=", w,
-                  "loss_kl=", float(parts.get("loss_kl_val", parts["loss_kl"]).detach().item()),
-                  "gaze_count=", gc,
-                  "kl_requires_grad=", bool(parts["loss_kl"].requires_grad))
-
-        
-            # If KL is inactive this batch, fall back to total loss so backward is valid
-            if (w <= 0.0) or (gc == 0):
-                print("[DEBUG KL-only] KL inactive for this batch -> falling back to total loss backward")
-                loss = loss_total
-        else:
-            loss = loss_total
-            #loss = loss_no_kl #-> No backpropagation
-        
-        # IMPORTANT: divide by accum_steps AFTER choosing which loss you backprop
-        loss = loss / accum_steps
+        raw_loss = loss_bp
+        loss_scaled = loss_bp / accum_steps
 
         if use_amp:
-            # Scaled backward prevents fp16 gradient underflow
-            scaler.scale(loss).backward()
+            scaler.scale(loss_scaled).backward()
         else:
-            loss.backward()
-        
-        if DEBUG_KL_ONLY and (engine.state.iteration % accum_steps == 0):
-            m = net.module if isinstance(net, torch.nn.DataParallel) else net
-        
-            # If m is your Transformer wrapper, it has .backbone.
-            # If not, it might expose the wrapper under some attribute; otherwise treat m itself as the backbone.
-            if hasattr(m, "backbone"):
-                bb = m.backbone
-            elif hasattr(m, "transformer") and hasattr(getattr(m, "transformer"), "backbone"):
-                bb = m.transformer.backbone
-            else:
-                # Fallback: m.transformer is often the timm VisionTransformer
-                bb = getattr(m, "transformer", m)
-        
-            for n, p in bb.named_parameters():
-                if "qkv" in n and p.requires_grad:
-                    print("[DEBUG qkv]", n,
-                          "grad_is_none=", (p.grad is None),
-                          "grad_abs_mean=", (None if p.grad is None else p.grad.abs().mean().item()))
-                    break
-
+            loss_scaled.backward()
 
         # -----------------------------
         # Optimizer / scheduler step (only on accumulation boundary)
         # -----------------------------
         if engine.state.iteration % accum_steps == 0:
-        
-            # If using AMP, unscale gradients before clipping so clipping sees true magnitudes.
             if use_amp:
                 scaler.unscale_(optimizer)
-        
-            # Optional gradient clipping (global norm)
+
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
-        
-            # Step optimizer (AMP-aware)
+
             if use_amp:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
-        
-            # Clear gradients for next accumulation window
+
             optimizer.zero_grad(set_to_none=True)
-        
-            # Step per-optimizer-step schedulers (not plateau)
+
             if scheduler and scheduler_type != "plateau":
                 scheduler.step()
-        
 
         # -----------------------------
-        # Logging
+        # Logging output
         # -----------------------------
         if logger:
             logger.info(f"TRAIN_STEP, {timer() - start:.4f}")
+
         out = _build_metrics_output(
             args=args,
             forward_dict=forward_dict,
             labels=labels,
             loss=raw_loss,
-            parts=parts,   # only exists because you called compute_loss(..., return_parts=True)
+            parts=parts,
         )
+
+        # Optional: expose both objectives for later metric work
+        #out["loss_total"] = float(loss_total.detach().item())
+        #out["loss_no_kl"] = float(loss_no_kl.detach().item())
+
         return out
-        
+
     return train_step
 
 
 def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
+    
     """
-    Ignite-compatible inference step for validation/test.
+    Ignite inference-step factory for validation/test.
 
-    - no gradients
-    - returns per-batch metrics dict
-    - includes KL parts when compute_loss(..., return_parts=True) is enabled
+    Builds and returns a closure `inference_step(engine, batch)` that:
+      - Runs under `torch.no_grad()` (no gradients)
+      - Uses AMP autocast on CUDA when enabled
+      - Computes composite loss and individual loss parts (including gaze KL parts)
+      - Reports a loss value consistent with the current `args.gaze` mode:
+          * "use_nobp" : reports class + rank (no-KL objective)
+          * "only"     : reports gaze KL objective
+          * otherwise  : reports full composite loss
+      - Returns a per-batch metrics dict compatible with Ignite metrics attachment
     """
     def inference_step(engine, data):
-        # AMP inference when enabled and running on CUDA
         use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
 
         with torch.no_grad():
@@ -773,22 +710,33 @@ def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
 
             with autocast(enabled=use_amp):
                 forward_dict = net(*inputs)
-
-                # total loss + parts (KL terms included in parts)
                 loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
 
-            # per-batch output dict includes KL keys in rsscnn mode
-            return _build_metrics_output(
+                # Detached eval objective consistent with training objective choice
+                loss_no_kl = parts["loss_class"] + parts["loss_rank_combo"]
+
+            gaze_mode = getattr(args, "gaze", "off")
+            if gaze_mode == "use_nobp":
+                loss_report = loss_no_kl
+            elif gaze_mode == "only":
+                loss_report = parts["loss_kl_weighted"]
+            else:
+                loss_report = loss_total
+
+            out = _build_metrics_output(
                 args=args,
                 forward_dict=forward_dict,
                 labels=labels,
-                loss=loss_total,
+                loss=loss_report,
                 parts=parts,
             )
 
+            #out["loss_total"] = float(loss_total.detach().item())
+            #out["loss_no_kl"] = float(loss_no_kl.detach().item())
+
+            return out
+
     return inference_step
-
-
 
 # --------------------------------------------------------------------------------------------------------------------
 # Metric + handler helpers
@@ -858,7 +806,7 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             Accuracy(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "acc")
 
         # ---------------------------------------------------------------------
-        # RSSCNN: ranking + classification
+        # RSSCNN: ranking + classification + gaze
         # ---------------------------------------------------------------------
         elif args.model == "rsscnn":
             # 1. Loss (Rolling Average)
@@ -869,10 +817,9 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                 RunningAverage(output_transform=lambda x: x.get("loss_kl", 0.0), device=device).attach(engine, "loss_kl")
                 RunningAverage(output_transform=lambda x: x.get("loss_kl_weighted", 0.0), device=device).attach(engine, "loss_kl_weighted")
                 RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
-                RunningAverage(output_transform=lambda x: x.get("gaze_count", 0.0), device=device).attach(engine, "gaze_count")                
-        
+                #SumMetric(output_transform=lambda x: float(x.get("gaze_count", 0.0)), device=device).attach(engine, "gaze_count_sum")
+               
             # 3. Ranking Accuracy (Cumulative)
-            # (Kept as cumulative because ranking metrics are often noisy per-batch)
             if args.full_accuracy:
                 RankAccuracy_withMargin(
                     output_transform=lambda x: (x["rank_left"], x["rank_right"], x["label_r"], args.ranking_margin),
@@ -892,7 +839,7 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
         else:
             raise ValueError(f"Unsupported model type: {args.model}")
 
-
+            
 def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_idx: int, print_output: bool = True):
     """
     Computes a confusion matrix adapted to:
@@ -1071,19 +1018,20 @@ def _make_validation_handler(
         # ---------------------------------------------------------------------
         training_state["val_acc_history"].append(current_val_acc)
         
-        # IMPORTANT: selection is based on validation only.
-        # When validation improves, snapshot the corresponding train/test accuracies
-        # from THIS SAME epoch (same weights).
         if current_val_acc > float(training_state["best_val_acc"]):
-            training_state["best_val_acc"] = current_val_acc
-            training_state["epoch_best_val"] = int(engine.state.epoch)
+            training_state["best_val_acc"] = float(current_val_acc)
+            training_state["epoch_best_val"] = int(trainer.state.epoch)
         
-            # Snapshot train/test acc at the best-val epoch (may be None if metric missing)
             if current_train_acc is not None:
                 training_state["train_acc_at_best_val"] = float(current_train_acc)
             if current_test_acc is not None:
                 training_state["test_acc_at_best_val"] = float(current_test_acc)
-
+        
+            # Snapshot best weights for final evaluation (best epoch, not last epoch)
+            model_to_save = net.module if hasattr(net, "module") else net
+            training_state["best_state_dict"] = {
+                k: v.detach().cpu().clone() for k, v in model_to_save.state_dict().items()
+            }
 
         # ---------------------------------------------------------------------
         # 4) Optuna integration (report + pruning)
@@ -1120,67 +1068,37 @@ def _make_validation_handler(
         # 7) Assemble a consolidated metrics dictionary for logging
         # ---------------------------------------------------------------------
         metrics = {
-            # Train metrics are taken from the trainer engine metrics accumulated during the epoch.
             "accuracy_train": engine.state.metrics.get("acc"),
-
+            "accuracy_validation": evaluator.state.metrics.get("acc"),
+            "accuracy_test": evaluator_test.state.metrics.get("acc"),
         
-            # Validation/test metrics come from the evaluator engines (current epoch weights).
-            "accuracy_validation": evaluator.state.metrics["acc"],
-            "accuracy_test": evaluator_test.state.metrics["acc"],
-            "loss_validation": evaluator.state.metrics["loss"],
-            "loss_test": evaluator_test.state.metrics["loss"],
-
-            "loss_train": engine.state.metrics["loss"],
+            "loss_train": engine.state.metrics.get("loss"),
+            "loss_validation": evaluator.state.metrics.get("loss"),
+            "loss_test": evaluator_test.state.metrics.get("loss"),
         
-            # Wall-clock time since training started (string for log consistency).
             "time": f"{timer() - start_training:.3f}",
-        
-            # Bookkeeping for reproducibility and alignment with logs.
             "epoch": engine.state.epoch,
             "iteration": engine.state.iteration,
         
-            # -----------------------------
-            # Selection-coupled "best" stats
-            # -----------------------------
-            # Best validation accuracy observed so far (selection criterion).
             "max_accuracy_validation": training_state["best_val_acc"],
-        
-            # Legacy keys (keep for backward compatibility):
-            # These are NOT "max over epochs". They are train/test accuracy
-            # at the epoch where validation was best.
             "max_accuracy_train": training_state["train_acc_at_best_val"],
             "max_accuracy_test": training_state["test_acc_at_best_val"],
-        
-            # Explicit names (recommended for thesis clarity).
-            #"accuracy_train_at_best_val": training_state["train_acc_at_best_val"],
-            #"accuracy_test_at_best_val": training_state["test_acc_at_best_val"],
             "epoch_best_val": training_state["epoch_best_val"],
         }
-        # RSSCNN exposes an additional classification metric ("c_acc") alongside ranking accuracy.
+        
         if args.model == "rsscnn":
             metrics.update(
                 {
-                    #"gaze_missing_pct_train": engine.state.metrics.get("gaze_missing_pct"),
-                    #"gaze_sample_pct_train": engine.state.metrics.get("gaze_sample_pct"),
-                    #"gaze_missing_pct_val": evaluator.state.metrics.get("gaze_missing_pct"),
-                    #"gaze_sample_pct_val": evaluator.state.metrics.get("gaze_sample_pct"),
-                    #"attn_uniform_pct_train": engine.state.metrics.get("attn_uniform_pct"),
-                                    #"attn_missing_pct_train": engine.state.metrics.get("attn_missing_pct"),  
-                    "loss_kl_train": engine.state.metrics.get("loss_kl"),
-                    "loss_kl_validation": evaluator.state.metrics.get("loss_kl"),
-                    "loss_kl_test": evaluator_test.state.metrics.get("loss_kl"),
-                    #"loss_kl_weighted_validation": evaluator.state.metrics.get("loss_kl_weighted"),
-                    #"loss_kl_weighted_test": evaluator_test.state.metrics.get("loss_kl_weighted"),
-
-                    #"loss_kl_weighted_train": engine.state.metrics.get("loss_kl_weighted"),
-                    #"w_kl_eff_train": engine.state.metrics.get("w_kl_eff"),
-                    #"gaze_count_train": engine.state.metrics.get("gaze_count"),
-                    "c_accuracy_train": engine.state.metrics["c_acc"],
-                    "c_accuracy_validation": evaluator.state.metrics["c_acc"],
-                    "c_accuracy_test": evaluator_test.state.metrics["c_acc"],
+                    "loss_kl_train": engine.state.metrics.get("loss_kl") or 0.0,
+                    "loss_kl_validation": evaluator.state.metrics.get("loss_kl") or 0.0,
+                    "loss_kl_test": evaluator_test.state.metrics.get("loss_kl") or 0.0,
+        
+                    "c_accuracy_train": engine.state.metrics.get("c_acc"),
+                    "c_accuracy_validation": evaluator.state.metrics.get("c_acc"),
+                    "c_accuracy_test": evaluator_test.state.metrics.get("c_acc"),
                 }
             )
-
+        
         # ---------------------------------------------------------------------
         # 8) Early stopping (optional) based on a chosen validation metric
         # ---------------------------------------------------------------------
@@ -1264,57 +1182,25 @@ def train(
     train_tfms=None,
     eval_tfms=None,
 ):
-
     """
-    Main training entrypoint (Ignite-based).
+    Main Ignite-based training entrypoint.
 
-    This function orchestrates the full experiment lifecycle:
-      - Model/device setup
-      - Optimizer and scheduler creation (with transformer-aware parameter groups)
-      - Ignite engine construction for training/validation/testing
-      - Metric attachment and per-epoch validation hook
-      - Checkpointing (top-k, best, and last)
-      - Optional resume behavior (epoch and max_epochs overrides)
-      - W&B finalization
-      - Return a scalar objective suitable for Optuna/W&B sweeps
-
-    Parameters
-    ----------
-    device : torch.device
-        Target device to run the model on.
-    net : torch.nn.Module
-        Model to train.
-    dataloader : torch.utils.data.DataLoader
-        Training dataloader.
-    val_loader : torch.utils.data.DataLoader
-        Validation dataloader.
-    test_loader : torch.utils.data.DataLoader
-        Test dataloader (evaluated at epoch end).
-    args : argparse.Namespace
-        Experiment configuration (hyperparameters, logging, checkpointing, etc.).
-    logger : logging.Logger or None
-        Optional structured logger.
-    trial : optuna.Trial or None, optional
-        Optuna trial handle (enables pruning and user attribute logging).
-
-    Returns
-    -------
-    float
-        Final validation accuracy proxy used as the objective (smoothed when possible).
+    What it does:
+      - Configure training utilities and shared state
+      - Move model to device and configure model-level switches (e.g., gaze backprop)
+      - Build optimizer/scheduler (transformer-aware, optional backbone freezing)
+      - Build Ignite engines (trainer / evaluator / evaluator_test) and attach metrics/handlers
+      - Run training
+      - Reload best-validation weights and run final validation/test evaluation
+      - Return a scalar objective for sweeps (smoothed validation accuracy when available)
     """
 
-    # ------------------------------------------------------------------------------------------------
+    # -----------------------------
     # Training utilities
-    # ------------------------------------------------------------------------------------------------
+    # -----------------------------
+    accum_steps = max(1, getattr(args, "k", 1))              # gradient accumulation factor
+    grad_clip = float(getattr(args, "grad_clip", 0.0))      # global norm clipping threshold
 
-    # Gradient accumulation: perform one optimizer update every `accum_steps` iterations.
-    # The argument name `k` is treated as the accumulation factor.
-    accum_steps = max(1, getattr(args, "k", 1))
-
-    # Gradient clipping: stabilizes training by limiting global norm of parameter gradients.
-    grad_clip = getattr(args, "grad_clip", 0.0)
-
-    # Optional early stopping controller (patience-based with configurable directionality).
     early_stopper = None
     if getattr(args, "early_stop", False):
         early_stopper = EarlyStopper(
@@ -1324,65 +1210,55 @@ def train(
             start_epoch=getattr(args, "early_stop_start_epoch", 1),
         )
 
-    # Centralized state for cross-handler communication and summary statistics.
-    # `val_acc_history` supports smoothing and robust final reporting.
-    training_state: Dict[str, float | List[float] | int | None] = {
+    # Shared state used by handlers (best tracking, history, best weights)
+    training_state: Dict[str, Any] = {
         "best_val_acc": 0.0,
         "train_acc_at_best_val": float("-inf"),
         "test_acc_at_best_val": float("-inf"),
         "epoch_best_val": None,
         "val_acc_history": [],
+        "best_state_dict": None,  # populated when a new best val epoch is reached
     }
 
+    # -----------------------------
+    # Model setup
+    # -----------------------------
+    net = net.to(device)  # critical: move parameters/buffers to target device
 
-    # ------------------------------------------------------------------------------------------------
-    # Model and optimization setup
-    # ------------------------------------------------------------------------------------------------
-    """
-    # Ensure the model is on the correct device.
-    net = net.to(device)
-
-    # Transformer-aware configuration: used to apply parameter-group policies (e.g., LR scaling).
-    is_transformer = hasattr(net, "transformer")
-
-    # Split parameters into head vs backbone to enable differential learning rates / weight decay.
-    head_params, backbone_params = _split_parameters(net)
-
-    # Construct optimizer using the project’s policy (e.g., AdamW, parameter groups, LR scaling).
-    optimizer = _build_optimizer(args, net, is_transformer, head_params, backbone_params)
-    """
-    # Ensure the model is on the correct device.
-    net = net.to(device)
-    
-    # IMPORTANT (DataParallel):
-    # If net is torch.nn.DataParallel, attributes such as `.transformer` live under net.module.
+    # DataParallel-safe config accessor (attributes like `.transformer` live under `.module`)
     net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
-    
-    # Transformer-aware configuration: used to apply parameter-group policies (e.g., LR scaling).
     is_transformer = hasattr(net_cfg, "transformer")
-    
-    # Split parameters into head vs backbone to enable differential learning rates / weight decay.
+
+    # Model-level gaze backprop safety switch (requires transformer.py support)
+    gaze_mode = getattr(args, "gaze", "off")
+
+    def _set_gaze_bp(m, enabled: bool) -> None:
+        # Handles both plain modules and DataParallel/DistributedDataParallel wrappers
+        if hasattr(m, "set_gaze_backprop"):
+            m.set_gaze_backprop(enabled)
+        elif hasattr(m, "module") and hasattr(m.module, "set_gaze_backprop"):
+            m.module.set_gaze_backprop(enabled)
+
+    _set_gaze_bp(net, enabled=(gaze_mode != "use_nobp"))  # use_nobp detaches attention maps at the model level
+
+    # Split params for differential LR/WD policies (head vs backbone)
     head_params, backbone_params = _split_parameters(net_cfg)
-    
-    # Construct optimizer (Logic is now encapsulated in the function)
-    #optimizer, optimizer_info = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
+
+    # Build optimizer and optional freeze controller (single source of truth for param groups)
     optimizer, optimizer_info, freeze_ctl = build_optimizer(
         args=args,
-        net=net,
+        net=net,                        # pass the wrapped model (build_optimizer must handle wrappers)
         is_transformer=is_transformer,
         head_params=head_params,
         backbone_params=backbone_params,
     )
 
-
+    # Build scheduler (accounts for accumulation and train loader length)
     scheduler, scheduler_type = _build_scheduler(
         args, optimizer, accum_steps, len(train_loader), args.base_lr
     )
 
-    
-    # ------------------------------------------------------------
-    # RUN PLAN (single source of truth)
-    # ------------------------------------------------------------
+    # Print run configuration summary (debug/repro)
     print_run_plan(
         args,
         train_df=train_df,
@@ -1398,22 +1274,15 @@ def train(
         scheduler=scheduler,
     )
 
-    # ------------------------------------------------------------------------------------------------
+    # -----------------------------
     # AMP (Automatic Mixed Precision)
-    # ------------------------------------------------------------------------------------------------
-    # AMP should be explicitly controlled by args.amp.
-    # It's required CUDA and an actual CUDA device.
+    # -----------------------------
     use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
-    
-    # GradScaler dynamically scales the loss to prevent fp16 underflow.
-    # If use_amp=False, this becomes a no-op wrapper.
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp)  # enabled=False turns scaler into a no-op
 
-    # ------------------------------------------------------------------------------------------------
-    # Ignite engines: training + inference
-    # ------------------------------------------------------------------------------------------------
-
-    # Training engine: runs forward/backward, applies accumulation and optimizer/scheduler stepping.
+    # -----------------------------
+    # Ignite engines
+    # -----------------------------
     trainer = Engine(
         _make_train_step(
             args=args,
@@ -1426,162 +1295,161 @@ def train(
             grad_clip=grad_clip,
             logger=logger,
             trial=trial,
-            scaler=scaler,  # AMP scaler (no-op if disabled)
+            scaler=scaler,
         )
     )
 
-    # Inference engines: identical step function, distinct engines to keep metrics/state separated.
     evaluator = Engine(_make_inference_step(args, device, net))
     evaluator_test = Engine(_make_inference_step(args, device, net))
 
-    # Persist Optuna trial handle into trainer state for handlers that need access.
-    trainer.state.trial = trial
+    trainer.state.trial = trial  # makes trial available to handlers
 
-    # Attach metrics to all engines (train/val/test) so that `engine.state.metrics` is populated.
-    _attach_metrics([trainer, evaluator, evaluator_test], args, device)
+    _attach_metrics([trainer, evaluator, evaluator_test], args, device)          # fills engine.state.metrics
+    _attach_epoch_end_step(trainer, optimizer, accum_steps, scaler=scaler)       # handles accumulation bookkeeping
 
-    # Attach per-epoch hooks that depend on the training engine lifecycle (e.g., accumulation bookkeeping).
-    _attach_epoch_end_step(trainer, optimizer, accum_steps, scaler=scaler)
-
-    # ------------------------------------------------------------------------------------------------
-    # Epoch-end validation/test evaluation handler
-    # ------------------------------------------------------------------------------------------------
-
-    # Timestamp used for end-to-end wall-clock time reporting.
+    # -----------------------------
+    # Epoch-end evaluation handler
+    # -----------------------------
     start_training = timer()
 
-    # Validation handler runs at each epoch end:
-    #   - evaluates validation and test sets
-    #   - updates training_state (best tracking, history)
-    #   - applies early stopping logic
-    #   - manages scheduler stepping for plateau schedulers (if applicable)
     validation_handler = _make_validation_handler(
-        args,
-        net,
-        trainer,
-        evaluator,
-        evaluator_test,
-        optimizer,
-        scheduler,
-        scheduler_type,
-        val_loader,
-        test_loader,
-        early_stopper,
-        start_training,
-        training_state,
-        device,
+        args=args,
+        net=net,
+        trainer=trainer,
+        evaluator=evaluator,
+        evaluator_test=evaluator_test,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scheduler_type=scheduler_type,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        early_stopper=early_stopper,
+        start_training=start_training,
+        training_state=training_state,   # contains best_state_dict storage
+        device=device,
     )
     trainer.add_event_handler(Events.EPOCH_COMPLETED, validation_handler)
 
-    # ------------------------------------------------------------------------------------------------
-    # Checkpointing policy
-    # ------------------------------------------------------------------------------------------------
-    # Safe W&B run name: avoids AttributeError when wandb is disabled or not initialized
+    # -----------------------------
+    # Checkpointing
+    # -----------------------------
     run_name = getattr(getattr(wandb, "run", None), "name", "no_wandb")
 
-    # Top-k checkpoints scored by validation accuracy.
-    # Filename prefix uses model/backbone identifiers to keep runs organized in the same directory.
-    handler = ModelCheckpoint(
-        args.model_dir,
-        "{}_{}".format(args.model, args.backbone),
-        n_saved=10,
-        create_dir=True,
-        require_empty=False,
-        score_function=lambda engine: engine.state.metrics["val_acc"],
-        global_step_transform=lambda *_: trainer.state.epoch,
+    trainer.add_event_handler(
+        Events.EPOCH_COMPLETED,
+        ModelCheckpoint(
+            args.model_dir,
+            f"{args.model}_{args.backbone}",
+            n_saved=10,
+            create_dir=True,
+            require_empty=False,
+            score_function=lambda e: e.state.metrics["val_acc"],
+            global_step_transform=lambda *_: trainer.state.epoch,
+        ),
+        {"model": net},
     )
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, handler, {"model": net})
 
-    # Best checkpoint: retains only the single best checkpoint for the current W&B run name.
-    handler_best = ModelCheckpoint(
-        args.model_dir,
-        "{}".format(run_name),
-        n_saved=1,
-        create_dir=True,
-        require_empty=False,
-        score_function=lambda engine: engine.state.metrics["val_acc"],
-        global_step_transform=lambda *_: trainer.state.epoch,
+    trainer.add_event_handler(
+        Events.EPOCH_COMPLETED,
+        ModelCheckpoint(
+            args.model_dir,
+            f"{run_name}",
+            n_saved=1,
+            create_dir=True,
+            require_empty=False,
+            score_function=lambda e: e.state.metrics["val_acc"],
+            global_step_transform=lambda *_: trainer.state.epoch,
+        ),
+        {"model": net},
     )
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, handler_best, {"model": net})
 
-    # Last checkpoint: always overwrites to keep the most recent state (useful for resuming/debugging).
-    handler_last = ModelCheckpoint(
-        args.model_dir,
-        "{}".format(run_name),
-        n_saved=1,
-        create_dir=True,
-        require_empty=False,
-        global_step_transform=lambda *_: trainer.state.epoch,
+    trainer.add_event_handler(
+        Events.EPOCH_COMPLETED,
+        ModelCheckpoint(
+            args.model_dir,
+            f"{run_name}",
+            n_saved=1,
+            create_dir=True,
+            require_empty=False,
+            global_step_transform=lambda *_: trainer.state.epoch,
+        ),
+        {"model": net},
     )
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, handler_last, {"model": net})
 
-    # ------------------------------------------------------------------------------------------------
-    # Resume support (epoch and max_epochs overrides)
-    # ------------------------------------------------------------------------------------------------
+    # -----------------------------
+    # Resume support
+    # -----------------------------
+    if getattr(args, "resume", False):
 
-    # When resuming, force Ignite engines to start from a user-provided epoch and to respect
-    # a user-provided maximum number of epochs.
-    if args.resume:
-
-        def start_epoch(engine):
+        def _set_start_epoch(engine):
             engine.state.epoch = args.epoch
 
-        def max_epoch(engine):
+        def _set_max_epoch(engine):
             engine.state.max_epochs = args.max_epochs
 
-        for engine in [trainer, evaluator, evaluator_test]:
-            engine.add_event_handler(Events.STARTED, start_epoch)
-            engine.add_event_handler(Events.STARTED, max_epoch)
+        for eng in [trainer, evaluator, evaluator_test]:
+            eng.add_event_handler(Events.STARTED, _set_start_epoch)
+            eng.add_event_handler(Events.STARTED, _set_max_epoch)
 
-    # Ensure a clean gradient state before training begins.
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)  # clean gradient state at start
 
-    # Reinitialize timing if a logger is enabled (supports step-level timing logs downstream).
-    if logger:
-        start_training = timer()
-        
+    # Optional backbone unfreeze controller (epoch-gated)
     @trainer.on(Events.EPOCH_STARTED)
     def _maybe_unfreeze_backbone(engine):
         if freeze_ctl is None:
             return
-    
-        # Ignite epochs are 1-based; convert to 0-based for "freeze first N epochs"
-        epoch0 = int(engine.state.epoch) - 1
-    
+        epoch0 = int(engine.state.epoch) - 1  # Ignite epochs are 1-based
         did_unfreeze = freeze_ctl.maybe_unfreeze(epoch0)
         if did_unfreeze:
             print(f"[optimizer] Backbone unfrozen at Ignite epoch {engine.state.epoch} (epoch0={epoch0})")
 
     # ------------------------------------------------------------------------------------------------
-    # Run training loop (with guaranteed W&B finalization)
+    # Run training loop
     # ------------------------------------------------------------------------------------------------
-    try:
-        trainer.run(train_loader, max_epochs=args.max_epochs)
-    finally:
-        # Ensure W&B run is properly closed even if training terminates early or raises.
-        if args.log_wandb and wandb.run is not None:
-            wandb.finish()
-
+    trainer.run(train_loader, max_epochs=args.max_epochs)
+    
     # ------------------------------------------------------------------------------------------------
-    # Objective computation (final reporting)
+    # Final evaluation using best-validation weights (not last epoch)
     # ------------------------------------------------------------------------------------------------
-
-    # Extract validation accuracy history and best value from the shared state.
-    val_acc_history: List[float] = training_state["val_acc_history"]  # type: ignore[assignment]
+    best_sd = training_state.get("best_state_dict")
+    
+    if isinstance(best_sd, dict) and len(best_sd) > 0:
+        model_to_load = net.module if hasattr(net, "module") else net
+        model_to_load.load_state_dict(best_sd, strict=True)
+    
+        net.eval()
+        evaluator.run(val_loader)
+        evaluator_test.run(test_loader)
+        net.train()
+    
+        training_state["final_best_val_acc"] = float(evaluator.state.metrics.get("acc", 0.0))
+        training_state["final_best_test_acc"] = float(evaluator_test.state.metrics.get("acc", 0.0))
+    else:
+        training_state["final_best_val_acc"] = float(training_state.get("best_val_acc", 0.0))
+        training_state["final_best_test_acc"] = float(training_state.get("test_acc_at_best_val", 0.0))
+    
+    # ------------------------------------------------------------------------------------------------
+    # W&B finalization (after final eval so final metrics can be logged)
+    # ------------------------------------------------------------------------------------------------
+    if getattr(args, "log_wandb", False) and wandb.run is not None:
+        wandb.finish()
+    
+    # ------------------------------------------------------------------------------------------------
+    # Objective computation
+    # ------------------------------------------------------------------------------------------------
+    val_acc_history: List[float] = training_state["val_acc_history"]
     best_val_acc = float(training_state["best_val_acc"])
-
-    # Provide a smoothed objective when sufficient epochs exist; otherwise fall back gracefully.
+    
     if len(val_acc_history) >= 3:
         final_val_acc = sum(val_acc_history[-3:]) / 3.0
     elif len(val_acc_history) > 0:
         final_val_acc = sum(val_acc_history) / len(val_acc_history)
     else:
         final_val_acc = best_val_acc
-
-    # Persist key results into Optuna for downstream analysis and reproducibility.
+    
     if trial is not None:
         trial.set_user_attr("best_val_acc", float(best_val_acc))
         trial.set_user_attr("final_val_acc", float(final_val_acc))
-
-    # Return objective value (used by sweeps and external callers).
+    
     return final_val_acc
+
