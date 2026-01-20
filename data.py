@@ -501,17 +501,37 @@ AUG_PRESETS = {
 
 class Augmentation:
     """
-    Applies preprocessing + stochastic augmentation to a paired sample:
-      - image_l/image_r: PIL.Image -> torch.Tensor [3, out_size, out_size] (normalized)
-      - Optional gaze alignment when enable_gaze=True:
-          gaze_l/gaze_r follow the same geometric transforms as the corresponding image,
-          then are downsampled to gaze_grid_size.
-
-    Pairing controls:
-      - paired_* flags decide whether random choices/parameters are shared across left/right.
-      - crop_scale/crop_ratio implement a RandomResizedCrop-style crop, resized to (out_size, out_size),
-        sampled in a way that avoids any extra pre-crop.
+    Paired image augmentation for pairwise ranking.
+    
+    Input:
+      - sample["image_l"], sample["image_r"]: PIL.Image
+      - sample["score_r"]: int (pairwise label; sign indicates preference, 0 allowed when ties=True)
+      - Optional gaze fields when enable_gaze=True and sample["has_eyetracker"]=True:
+          • sample["gaze_l"], sample["gaze_r"]: array/tensor gaze maps
+    
+    Output:
+      - sample["image_l"], sample["image_r"]: torch.FloatTensor [3, out_size, out_size], normalized
+      - sample["score_r"]: possibly sign-flipped if the pair is swapped
+      - sample["score_c"]: derived classification label
+      - When enable_gaze=True:
+          • sample["gaze_l"], sample["gaze_r"]: torch.FloatTensor [1, grid_h, grid_w]
+    
+    Policy:
+      - Geometry: resize(short side -> resize_short) -> ensure min side >= out_size
+                -> optional paired/unpaired hflip and rotation
+                -> one RandomResizedCrop-style crop per side, resized to (out_size, out_size)
+      - Pairing flags control whether random decisions are shared across left/right:
+          • paired_hflip / paired_rotation: share flip decision / rotation angle
+          • paired_scale: share crop scale fraction and aspect ratio (size/shape)
+          • paired_crop: share crop position in normalized coordinates (location)
+          • paired_color_jitter / paired_gray / paired_erase: share photometric / erasing decisions
+      - Swap: with probability swap_p, left/right are swapped and score_r sign is inverted
+      - Photometric: optional color jitter, grayscale, gaussian blur (PIL domain)
+      - Tensor: to_tensor -> optional random erasing (tensor domain) -> normalize
+      - Gaze (if enabled and available): geometric ops and crop mirror the corresponding image,
+              then downsample to gaze_grid_size; erased regions are zeroed on the gaze grid
     """
+
 
     def __init__(
         self,
@@ -723,6 +743,9 @@ class Augmentation:
 
         return None
 
+
+
+    
     @staticmethod
     def _sample_crop_hw(H: int, W: int, scale_range, ratio_range):
         area = H * W
@@ -807,34 +830,53 @@ class Augmentation:
     # -------------------------
     # Crop policy (single crop per side)
     # -------------------------
+    @staticmethod
+    def _sample_scale_aspect(scale_range, ratio_range):
+        scale_frac = random.uniform(scale_range[0], scale_range[1])
+        log_r0 = math.log(ratio_range[0])
+        log_r1 = math.log(ratio_range[1])
+        aspect = math.exp(random.uniform(log_r0, log_r1))
+        return scale_frac, aspect
+    
+    @staticmethod
+    def _crop_hw_from_scale_aspect(H: int, W: int, scale_frac: float, aspect: float):
+        area = H * W
+        target_area = scale_frac * area
+    
+        w = int(round(math.sqrt(target_area * aspect)))
+        h = int(round(math.sqrt(target_area / aspect)))
+    
+        if 0 < h <= H and 0 < w <= W:
+            return h, w
+        return None
+        
     def _sample_crop_pair(self, img_l, img_r):
         Hl, Wl = img_l.size[1], img_l.size[0]
         Hr, Wr = img_r.size[1], img_r.size[0]
-
+    
         scale_rng = self.crop_scale
         ratio_rng = self.crop_ratio
-
+    
         if not (self.augment and (scale_rng is not None) and (ratio_rng is not None)):
             hl = wl = self.out_size
             hr = wr = self.out_size
             il, jl = self._center_ij(Hl, Wl, hl, wl)
             ir, jr = self._center_ij(Hr, Wr, hr, wr)
             return (il, jl, hl, wl), (ir, jr, hr, wr)
-
-        if self.paired_crop:
-            u = random.random()
-            v = random.random()
-        else:
-            u = v = None
-
-        def sample_hw_for_dims(H, W):
-            return self._sample_crop_hw(H, W, scale_rng, ratio_rng)
-
+    
+        u = random.random() if self.paired_crop else None
+        v = random.random() if self.paired_crop else None
+    
         if self.paired_scale:
             for _ in range(10):
-                hl, wl = sample_hw_for_dims(Hl, Wl)
-                hr, wr = sample_hw_for_dims(Hr, Wr)
-                if (hl <= Hl and wl <= Wl) and (hr <= Hr and wr <= Wr):
+                scale_frac, aspect = self._sample_scale_aspect(scale_rng, ratio_rng)
+    
+                hw_l = self._crop_hw_from_scale_aspect(Hl, Wl, scale_frac, aspect)
+                hw_r = self._crop_hw_from_scale_aspect(Hr, Wr, scale_frac, aspect)
+    
+                if (hw_l is not None) and (hw_r is not None):
+                    hl, wl = hw_l
+                    hr, wr = hw_r
                     break
             else:
                 sl = min(Hl, Wl)
@@ -842,23 +884,18 @@ class Augmentation:
                 hl = wl = sl
                 hr = wr = sr
         else:
-            hl, wl = sample_hw_for_dims(Hl, Wl)
-            hr, wr = sample_hw_for_dims(Hr, Wr)
-
+            hl, wl = self._sample_crop_hw(Hl, Wl, scale_rng, ratio_rng)
+            hr, wr = self._sample_crop_hw(Hr, Wr, scale_rng, ratio_rng)
+    
         if self.paired_crop:
             il, jl = self._uv_ij(Hl, Wl, hl, wl, u, v)
             ir, jr = self._uv_ij(Hr, Wr, hr, wr, u, v)
         else:
-            if self.paired_scale:
-                ul, vl = random.random(), random.random()
-                ur, vr = random.random(), random.random()
-            else:
-                ul, vl = random.random(), random.random()
-                ur, vr = random.random(), random.random()
-
+            ul, vl = random.random(), random.random()
+            ur, vr = random.random(), random.random()
             il, jl = self._uv_ij(Hl, Wl, hl, wl, ul, vl)
             ir, jr = self._uv_ij(Hr, Wr, hr, wr, ur, vr)
-
+    
         return (il, jl, hl, wl), (ir, jr, hr, wr)
 
     # -------------------------
