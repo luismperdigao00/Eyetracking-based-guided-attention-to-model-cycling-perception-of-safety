@@ -1018,7 +1018,7 @@ def _make_validation_handler(
         # ---------------------------------------------------------------------
         training_state["val_acc_history"].append(current_val_acc)
         
-        if training_state.get("best_state_dict") is None or current_val_acc > float(training_state["best_val_acc"]):
+        if current_val_acc > float(training_state["best_val_acc"]):
             training_state["best_val_acc"] = float(current_val_acc)
             training_state["epoch_best_val"] = int(trainer.state.epoch)
         

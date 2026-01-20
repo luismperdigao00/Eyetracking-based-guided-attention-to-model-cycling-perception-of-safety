@@ -10,9 +10,11 @@ VENV_PATH=".venv"
 # ----------------------------------
 # Test configuration
 # ----------------------------------
-RUN_NAME="c5qp4c1v"
-CHECKPOINT="lilac-sweep-1_model_6.pt"   #"vgg_syn+ber.pt" #fluent-sweep-18_model_2_0.7382.pt"
-#TEST_SET="splits/comparisons_df_with_synthetic_berlin_test.pkl"
+RUN_NAME="2ainhlx4"
+CHECKPOINT="treasured-sweep-1_best_model_8_0.7292.pt"
+#CHECKPOINT="quiet-sweep-2_best_model_3_0.7382.pt"   #"vgg_syn+ber.pt" #fluent-sweep-18_model_2_0.7382.pt"
+#CHECKPOINT="resilient-sweep-3_best_model_5_0.7333.pt" #GAZE
+#TEST_SET="splits/comparisons_df_test.pkl"
 TEST_SET="build_datasets/comparisons_tests.pkl"
 
 PYTHON_SCRIPT="test.py"
@@ -33,12 +35,12 @@ source "$VENV_PATH/bin/activate"
 # ----------------------------------
 python "$PYTHON_SCRIPT" \
     --comparisons "$TEST_SET" \
-    --dataset images \
-    --cities berlin \
+    --dataset images/printart/subjectivesafety_images \
+    --cities "berlin" \
     --wandb_run_id "$RUN_NAME" \
     --checkpoint "$CHECKPOINT" \
     --cuda \
-    --cuda_id 1
+    --cuda_id 0
 
 echo "Test finished: $RUN_NAME ($TEST_SET)"
 

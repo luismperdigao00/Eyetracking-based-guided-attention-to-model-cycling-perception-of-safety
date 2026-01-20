@@ -966,7 +966,7 @@ class Transformer(nn.Module):
     
         return m, used_uniform
 
-    """
+    
     def train(self, mode: bool = True):
         super().train(mode)
         backbone_has_grad = any(p.requires_grad for p in self.backbone.parameters())
@@ -974,7 +974,6 @@ class Transformer(nn.Module):
             self.backbone.eval()
         return self
 
-    """
     def _forward_one(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         self._reset_attention_cache()
     

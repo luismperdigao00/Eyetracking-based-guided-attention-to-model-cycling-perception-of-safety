@@ -34,9 +34,10 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import torchvision.models as tv_models
 
-from data import ComparisonsDataset, DictTransform
 from scripts.test_script import test
-from train_utils import resolve_backbone
+from data import ComparisonsDataset, build_eval_transforms
+from train_utils import resolve_backbone, infer_vit_grid_size
+
 
 warnings.filterwarnings("ignore")
 pd.options.mode.chained_assignment = None
@@ -173,15 +174,15 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     p.add_argument("--model", type=str)
     p.add_argument("--backbone", type=str)
-    
+
     p.add_argument("--finetune", nargs="?", const=True, type=str2bool)
-    
+
     p.add_argument("--num_ft_blocks", type=int)
     p.add_argument("--rank_dropout", type=float)
     p.add_argument("--cross_dropout", type=float)
-    
+
     p.add_argument("--ties", nargs="?", const=True, type=str2bool)
-    
+
     p.add_argument("--gaze", type=str)
     p.add_argument("--attn_w", type=float)
 
@@ -189,11 +190,23 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
     p.add_argument("--ties_w", type=float)
     p.add_argument("--ranking_margin", type=float)
     p.add_argument("--ranking_margin_ties", type=float)
-    
+
     p.add_argument("--pooling", type=str)
     p.add_argument("--pool_k", type=int)
     p.add_argument("--use_seg", nargs="?", const=True, type=str2bool)
     p.add_argument("--full_accuracy", nargs="?", const=True, type=str2bool)
+
+    p.add_argument("--gaze_root", type=str)
+    p.add_argument("--gaze_subdir_fmt", type=str)
+    p.add_argument("--gaze_map_size", type=str)
+
+    p.add_argument("--attention_mode", type=str)
+    p.add_argument("--attn_topk", type=int)
+
+    p.add_argument("--use_class_weights", nargs="?", const=True, type=str2bool)
+    p.add_argument("--label_smoothing", type=float)
+
+    p.add_argument("--cnn_pool", type=str)  # only relevant for CNN backbones
 
     known, _unknown = p.parse_known_args(train_cli_args)
 
@@ -331,25 +344,39 @@ def build_model(args):
         from nets.transformer import Transformer as Net
 
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
-        use_gaze_loss = (args.gaze != "off" and float(getattr(args, "attn_w", 0.0)) > 0.0)
-
+        use_gaze_loss = (
+            args.model == "rsscnn"
+            and args.gaze != "off"
+            and float(getattr(args, "attn_w", 0.0)) > 0.0
+        )
+        
+        attn_kwargs = {}
+        if use_gaze_loss:
+            ms = int(getattr(args, "gaze_map_size_int", 14))
+            attn_kwargs = dict(
+                use_attn_hook=True,
+                return_attn=True,
+                attn_out_hw=(ms, ms),
+                attention_mode=getattr(args, "attention_mode", "last"),
+                attn_topk=getattr(args, "attn_topk", None),
+            )
+        else:
+            attn_kwargs = dict(
+                use_attn_hook=False,
+                return_attn=False,
+            )
+        
         net = Net(
             backbone=backbone_model,
             model=args.model,
-            # Pooling & Architecture
             pooling=getattr(args, "pooling", "cls"),
             pool_k=getattr(args, "pool_k", 10),
             num_classes=3 if args.ties else 2,
-            # Training Dynamics
             finetune=args.finetune,
             num_ft_blocks=args.num_ft_blocks,
             rank_dropout=args.rank_dropout,
             cross_dropout=args.cross_dropout,
-            # Gaze & Attention
-            use_attn_hook=use_gaze_loss,
-            return_attn=use_gaze_loss,
-            #attention_mode=args.attention_mode,
-            #attn_topk=args.attn_topk,
+            **attn_kwargs,
         )
         net.attn_grad = use_gaze_loss
         return net
@@ -378,26 +405,41 @@ def _load_checkpoint(net: torch.nn.Module, ckpt_path: str, device: torch.device)
     Load checkpoint into the model and report key compatibility information.
     """
     t0 = time.time()
-    state_dict = torch.load(ckpt_path, map_location=device)
+    obj = torch.load(ckpt_path, map_location=device)
+
+    state_dict = obj["model"] if isinstance(obj, dict) and "model" in obj else obj
+
+    def _strip_prefix(sd, prefix: str):
+        if isinstance(sd, dict) and len(sd) > 0 and all(k.startswith(prefix) for k in sd.keys()):
+            return {k[len(prefix):]: v for k, v in sd.items()}
+        return sd
+
+    state_dict = _strip_prefix(state_dict, "module.")
+    state_dict = _strip_prefix(state_dict, "_orig_mod.")
 
     missing, unexpected = net.load_state_dict(state_dict, strict=False)
-    load_sec = time.time() - t0
+    if missing or unexpected:
+        sample_m = missing[:12] if missing else []
+        sample_u = unexpected[:12] if unexpected else []
+        raise RuntimeError(
+            "Checkpoint/model mismatch during evaluation.\n"
+            f"  ckpt: {ckpt_path}\n"
+            f"  missing_keys (sample): {sample_m}\n"
+            f"  unexpected_keys (sample): {sample_u}\n"
+            "This usually means you changed one of: model head (rcnn/sscnn/rsscnn), "
+            "ties on/off (2 vs 3 classes), backbone, pooling mode, or finetune block config.\n"
+            "Fix by instantiating the exact same architecture/config as training, "
+            "or evaluate the correct checkpoint."
+        )
 
-    report = {
+    load_sec = time.time() - t0
+    return {
         "checkpoint_path": ckpt_path,
         "checkpoint_tensors": len(state_dict) if isinstance(state_dict, dict) else None,
         "load_seconds": round(load_sec, 3),
-        "missing_keys_count": _safe_len(missing),
-        "unexpected_keys_count": _safe_len(unexpected),
+        "missing_keys_count": 0,
+        "unexpected_keys_count": 0,
     }
-
-    if missing:
-        report["missing_keys_sample"] = missing[:12]
-    if unexpected:
-        report["unexpected_keys_sample"] = unexpected[:12]
-
-    return report
-
     
 def str2bool(v):
     if isinstance(v, bool):
@@ -458,10 +500,45 @@ def parse_args():
     p.add_argument("--notes", type=str, default="", help="Prefix for outputs/saved/* filename.")
     p.add_argument("--seed", type=int, default=7, help="Random seed.")
     
-    # --- ADDED Missing Pooling Arguments ---
-    p.add_argument("--pooling", type=str, default="cls", choices=["cls", "mean", "max", "concat", "topk"], help="Feature pooling strategy.")
-    p.add_argument("--pool_k", type=int, default=10, help="Number of patches to keep when using --pooling topk")
+    p.add_argument("--gaze_map_size", default="auto", help="Gaze folder size: 'auto' or integer (e.g., 14, 16).")
+    p.add_argument("--gaze_subdir_fmt", type=str, default="{s}x{s}", help="Gaze subdir format under gaze_root.")
 
+    # --- ADDED Missing Pooling Arguments ---
+    p.add_argument(
+    "--pooling",
+    type=str,
+    default="cls",
+    choices=[
+        "cls",
+        "mean",
+        "patch_mean",
+        "reg_mean",
+        "prefix_mean",
+        "cls_reg_concat",
+        "cls_reg_add",
+        "concat",
+        "topk",
+        "max",
+        "cls_max_concat",
+    ],
+    help="Feature pooling strategy (must match training).",
+)
+
+    p.add_argument("--pool_k", type=int, default=10, help="Number of patches to keep when using --pooling topk")
+    p.add_argument(
+        "--attention_mode",
+        type=str,
+        default="last",
+        choices=["last", "rollout", "topk"],
+        help="Attention map extraction mode (must match training when using gaze loss).",
+    )
+    p.add_argument(
+        "--attn_topk",
+        type=int,
+        default=None,
+        help="Top-k patches for attention_mode=topk (must match training).",
+    )
+    
     return p
 
 
@@ -636,30 +713,65 @@ def main():
 
 
     # =============================================================================================== #
-    # (STEP 7) DATASET & DATALOADER CONSTRUCTION
+    # (STEP 7) DATASET & DATALOADER CONSTRUCTION  (mirrors train.py)
     # =============================================================================================== #
-    eval_tfms = transforms.Compose([
-        DictTransform(transforms.Resize(256)),
-        DictTransform(transforms.CenterCrop(224)),
-        DictTransform(transforms.ToTensor()),
-        DictTransform(
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            )
-        ),
-    ])
-
+    
+    CNN_BACKBONES = {"alex", "vgg", "dense", "resnet"}
+    is_cnn_backbone = str(args.backbone).lower().strip() in CNN_BACKBONES
+    
+    # Fixed preprocessing for CNNs (same as train.py)
+    SPECS = {
+        "input_size": (3, 224, 224),
+        "crop_pct": 0.875,
+        "mean": (0.485, 0.456, 0.406),
+        "std": (0.229, 0.224, 0.225),
+        "interpolation": "bilinear",
+    }
+    
+    # 1) Resolve model specs + infer token grid (for gaze alignment)
+    if is_cnn_backbone:
+        model_specs = {
+            "alias": args.backbone,
+            "timm_id": None,
+            **SPECS,
+            "img_size": int(SPECS["input_size"][-1]),
+        }
+        grid_h, grid_w = 14, 14
+    else:
+        # No need to download weights just to get patch grid; pretrained=False is enough for grid inference
+        backbone_tmp, model_specs = resolve_backbone(args.backbone, pretrained=False, strict=True)
+        grid_h, grid_w = infer_vit_grid_size(backbone_tmp, model_specs)
+        del backbone_tmp
+    
+    # Optional override to match existing gaze folder layout
+    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
+        forced = int(args.gaze_map_size)
+        grid_h, grid_w = forced, forced
+    
+    args.gaze_grid_size = (int(grid_h), int(grid_w))
+    args.gaze_map_size_int = int(grid_h)
+    
+    # 2) Build eval transforms (timm-style resize->center-crop->normalize; aligns gaze if enabled)
+    use_gaze = (str(args.gaze).lower().strip() != "off")
+    
+    eval_tfms, eval_meta = build_eval_transforms(
+        model_specs,
+        gaze_grid_size=args.gaze_grid_size,
+        enable_gaze=use_gaze,
+    )
+    
+    # 3) Dataset (note: map_size selects gaze_root/<map_size>x<map_size>/...)
     dataset = ComparisonsDataset(
         dataframe=df,
         root_dir=args.dataset,
         transform=eval_tfms,
         gaze_root=args.gaze_root,
-        use_gaze=(args.gaze != "off"),
+        use_gaze=use_gaze,
         use_seg=args.use_seg,
+        map_size=args.gaze_map_size_int,
+        gaze_subdir_fmt=getattr(args, "gaze_subdir_fmt", "{s}x{s}"),
         logger=None,
     )
-
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,

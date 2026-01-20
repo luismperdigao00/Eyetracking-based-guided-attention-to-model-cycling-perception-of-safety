@@ -36,7 +36,11 @@ import timm
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 import os
 from torchvision import models
-
+from typing import Tuple, Dict, Any, Iterable, Set, Optional
+#from __future__ import annotations
+#from typing import Tuple, Dict, Any, Set, Optional
+#import numpy as np
+#import pandas as pd
 
 warnings.filterwarnings("ignore")
 
@@ -483,6 +487,646 @@ def initialize_wandb(args):
     wandb.define_metric("max_accuracy_validation", step_metric="epoch")
     wandb.define_metric("max_accuracy_test", step_metric="epoch")
 
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from typing import Tuple, Dict, Any, Set
+
+
+def img_set(df: pd.DataFrame, a: str, b: str) -> Set[str]:
+    return set(pd.concat([df[a].astype(str), df[b].astype(str)], ignore_index=True).values)
+
+
+def build_graph(df: pd.DataFrame, a: str, b: str):
+    df = df.copy()
+    df[a] = df[a].astype(str)
+    df[b] = df[b].astype(str)
+
+    images = pd.Index(pd.unique(pd.concat([df[a], df[b]], ignore_index=True)))
+    img2id = {im: i for i, im in enumerate(images)}
+    A = df[a].map(img2id).to_numpy()
+    B = df[b].map(img2id).to_numpy()
+
+    n = len(images)
+    adj = [set() for _ in range(n)]
+    for u, v in zip(A, B):
+        if u == v:
+            continue
+        adj[u].add(v)
+        adj[v].add(u)
+    return images, A, B, adj
+
+
+def split_keep_all_min_overlap_optimized(
+    df: pd.DataFrame,
+    img_cols: Tuple[str, str] = ("image_l", "image_r"),
+    train_frac: float = 0.90,
+    val_frac: float = 0.05,
+    test_frac: float = 0.05,
+    seed: int = 0,
+    w_train_overlap: float = 10.0,
+    w_val_test_overlap: float = 1.0,
+    restarts: int = 30,
+    steps: int = 200_000,
+    temperature: float = 0.0,   # 0.0 = pure hill climb; >0 enables simulated annealing
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """
+    KEEP ALL rows. Exact split sizes by row count. Minimizes image overlap heuristically via random restarts + swap refinement.
+
+    Notes:
+      - Cannot guarantee 0 overlap when keeping all rows.
+      - Strongly minimizes train↔(val/test) overlap via weights.
+    """
+    a, b = img_cols
+    df = df.copy().reset_index(drop=True)
+    df[a] = df[a].astype(str)
+    df[b] = df[b].astype(str)
+
+    s = train_frac + val_frac + test_frac
+    if not np.isclose(s, 1.0):
+        raise ValueError(f"Fractions must sum to 1.0; got {s}")
+
+    n = len(df)
+    n_train = int(round(train_frac * n))
+    n_val = int(round(val_frac * n))
+    n_test = n - n_train - n_val  # exact
+
+    # Map image ids -> int
+    images = pd.Index(pd.unique(pd.concat([df[a], df[b]], ignore_index=True)))
+    img2id = {im: i for i, im in enumerate(images)}
+    U = df[a].map(img2id).to_numpy()
+    V = df[b].map(img2id).to_numpy()
+    n_imgs = len(images)
+
+    rng0 = np.random.default_rng(seed)
+
+    def objective_from_overlap(tv: int, tt: int, vt: int) -> float:
+        return w_train_overlap * (tv + tt) + w_val_test_overlap * vt
+
+    def compute_overlaps_from_counts(cnt: np.ndarray):
+        # cnt shape [n_imgs, 3] counts of incident edges assigned to each split
+        in_tr = cnt[:, 0] > 0
+        in_va = cnt[:, 1] > 0
+        in_te = cnt[:, 2] > 0
+        tv = int(np.sum(in_tr & in_va))
+        tt = int(np.sum(in_tr & in_te))
+        vt = int(np.sum(in_va & in_te))
+        return tv, tt, vt
+
+    best = None  # (obj, assign, counts, overlaps)
+
+    for r in range(max(1, restarts)):
+        rng = np.random.default_rng(int(rng0.integers(0, 2**31 - 1)))
+
+        # Initial exact assignment by rows
+        perm = rng.permutation(n)
+        assign = np.empty(n, dtype=np.int8)
+        assign[perm[:n_train]] = 0
+        assign[perm[n_train:n_train + n_val]] = 1
+        assign[perm[n_train + n_val:]] = 2
+
+        # counts[image, split] = number of incident edges assigned to split
+        counts = np.zeros((n_imgs, 3), dtype=np.int32)
+        for i in range(n):
+            s_id = int(assign[i])
+            counts[U[i], s_id] += 1
+            counts[V[i], s_id] += 1
+
+        tv, tt, vt = compute_overlaps_from_counts(counts)
+        obj = objective_from_overlap(tv, tt, vt)
+
+        # For faster delta updates: store current membership booleans
+        in_tr = counts[:, 0] > 0
+        in_va = counts[:, 1] > 0
+        in_te = counts[:, 2] > 0
+
+        # Pools of indices per split for O(1) sampling swaps
+        idx_by_split = [np.where(assign == k)[0].tolist() for k in range(3)]
+
+        def update_image_membership(img_ids):
+            nonlocal tv, tt, vt, obj
+            for im in img_ids:
+                # before
+                b_tr, b_va, b_te = in_tr[im], in_va[im], in_te[im]
+                b_tv = b_tr and b_va
+                b_tt = b_tr and b_te
+                b_vt = b_va and b_te
+
+                # after (recompute from counts)
+                a_tr = counts[im, 0] > 0
+                a_va = counts[im, 1] > 0
+                a_te = counts[im, 2] > 0
+                in_tr[im], in_va[im], in_te[im] = a_tr, a_va, a_te
+
+                a_tv = a_tr and a_va
+                a_tt = a_tr and a_te
+                a_vt = a_va and a_te
+
+                # adjust global overlap counts
+                tv += int(a_tv) - int(b_tv)
+                tt += int(a_tt) - int(b_tt)
+                vt += int(a_vt) - int(b_vt)
+
+            obj = objective_from_overlap(tv, tt, vt)
+
+        # Swap-based refinement: swap an edge from split p with one from split q to keep exact sizes
+        for t in range(max(1, steps)):
+            # pick two different splits to swap between (bias toward involving train)
+            if rng.random() < 0.7:
+                p, q = 0, 1 if rng.random() < 0.5 else 2
+            else:
+                p, q = (1, 2) if rng.random() < 0.5 else (2, 1)
+
+            if not idx_by_split[p] or not idx_by_split[q]:
+                continue
+
+            i = idx_by_split[p][rng.integers(0, len(idx_by_split[p]))]
+            j = idx_by_split[q][rng.integers(0, len(idx_by_split[q]))]
+
+            if i == j:
+                continue
+
+            # affected images (up to 4)
+            affected = {U[i], V[i], U[j], V[j]}
+
+            # --- Apply tentative swap p<->q ---
+            # remove i from p, add to q
+            counts[U[i], p] -= 1; counts[V[i], p] -= 1
+            counts[U[i], q] += 1; counts[V[i], q] += 1
+
+            # remove j from q, add to p
+            counts[U[j], q] -= 1; counts[V[j], q] -= 1
+            counts[U[j], p] += 1; counts[V[j], p] += 1
+
+            old_obj = obj
+            update_image_membership(affected)
+            new_obj = obj
+
+            accept = False
+            if new_obj <= old_obj:
+                accept = True
+            elif temperature > 0.0:
+                # simulated annealing acceptance
+                delta = new_obj - old_obj
+                prob = np.exp(-delta / temperature)
+                if rng.random() < prob:
+                    accept = True
+
+            if accept:
+                # commit: swap assignments and fix pools
+                assign[i], assign[j] = q, p
+
+                # update pools (swap indices in lists)
+                # remove i from p list and add to q list, similarly for j
+                idx_by_split[p].remove(i)
+                idx_by_split[q].remove(j)
+                idx_by_split[q].append(i)
+                idx_by_split[p].append(j)
+            else:
+                # revert swap
+                counts[U[i], p] += 1; counts[V[i], p] += 1
+                counts[U[i], q] -= 1; counts[V[i], q] -= 1
+                counts[U[j], q] += 1; counts[V[j], q] += 1
+                counts[U[j], p] -= 1; counts[V[j], p] -= 1
+                update_image_membership(affected)  # restores membership + obj
+
+        # Save best restart
+        if best is None or obj < best[0]:
+            best = (obj, assign.copy(), (tv, tt, vt))
+
+    best_obj, best_assign, (tv, tt, vt) = best
+
+    X_train = df.loc[best_assign == 0].reset_index(drop=True)
+    X_val   = df.loc[best_assign == 1].reset_index(drop=True)
+    X_test  = df.loc[best_assign == 2].reset_index(drop=True)
+
+    tr = set(pd.concat([X_train[a], X_train[b]], ignore_index=True).values)
+    va = set(pd.concat([X_val[a],   X_val[b]], ignore_index=True).values)
+    te = set(pd.concat([X_test[a],  X_test[b]], ignore_index=True).values)
+
+    info = {
+        "mode": "keep_all_min_overlap_optimized",
+        "original_pairs": n,
+        "result_pairs": {"train": len(X_train), "val": len(X_val), "test": len(X_test), "dropped": 0},
+        "unique_images": {"train": len(tr), "val": len(va), "test": len(te)},
+        "overlap_counts": {"train∩val": len(tr & va), "train∩test": len(tr & te), "val∩test": len(va & te)},
+        "overlap_rates": {
+            "train∩val/val": len(tr & va) / max(1, len(va)),
+            "train∩test/test": len(tr & te) / max(1, len(te)),
+            "val∩test/val": len(va & te) / max(1, len(va)),
+        },
+        "weights": {"w_train_overlap": w_train_overlap, "w_val_test_overlap": w_val_test_overlap},
+        "restarts": restarts,
+        "steps": steps,
+        "best_objective": float(best_obj),
+    }
+    return X_train, X_val, X_test, info
+
+
+# ---------- MODE 1: image-disjoint, drop cross rows, minimize drops (cut edges) ----------
+
+def _init_partition_dense_clusters(images, A, B, adj, n_pairs: int,
+                                  train_frac: float, val_frac: float, test_frac: float,
+                                  seed: int, tries: int):
+    """
+    Initial heuristic: grow dense clusters for val/test; remaining nodes -> train.
+    """
+    n_imgs = len(images)
+    target_val_pairs = int(round(val_frac * n_pairs))
+    target_test_pairs = int(round(test_frac * n_pairs))
+    rng = np.random.default_rng(seed)
+
+    def count_internal(in_set: np.ndarray) -> int:
+        return int(np.sum(in_set[A] & in_set[B]))
+
+    def grow_cluster(start: int, target_pairs: int, forbidden: np.ndarray) -> set[int]:
+        cluster = {start}
+        boundary = set([x for x in adj[start] if not forbidden[x]])
+        internal_edges = 0
+
+        while boundary and internal_edges < target_pairs:
+            best = None
+            best_gain = -1
+            for c in boundary:
+                gain = sum((nb in cluster) for nb in adj[c])
+                if gain > best_gain:
+                    best_gain = gain
+                    best = c
+            if best is None:
+                best = next(iter(boundary))
+                best_gain = 0
+
+            boundary.remove(best)
+            cluster.add(best)
+            internal_edges += best_gain
+
+            for nb in adj[best]:
+                if nb not in cluster and not forbidden[nb]:
+                    boundary.add(nb)
+
+        return cluster
+
+    best = None  # (score_tuple, part)
+    for _ in range(max(1, tries)):
+        forbidden = np.zeros(n_imgs, dtype=bool)
+
+        start_val = int(rng.integers(0, n_imgs))
+        val_set = grow_cluster(start_val, target_val_pairs, forbidden)
+        forbidden[list(val_set)] = True
+
+        candidates = np.where(~forbidden)[0]
+        if len(candidates) == 0:
+            continue
+        start_test = int(rng.choice(candidates))
+        test_set = grow_cluster(start_test, target_test_pairs, forbidden)
+        forbidden[list(test_set)] = True
+
+        part = np.full(n_imgs, 0, dtype=np.int8)  # 0=train, 1=val, 2=test
+        part[list(val_set)] = 1
+        part[list(test_set)] = 2
+
+        in_val = (part == 1)
+        in_test = (part == 2)
+        in_train = (part == 0)
+
+        val_pairs = count_internal(in_val)
+        test_pairs = count_internal(in_test)
+        train_pairs = count_internal(in_train)
+        kept = train_pairs + val_pairs + test_pairs
+        dropped = n_pairs - kept
+
+        score = (
+            abs(val_pairs - target_val_pairs) + abs(test_pairs - target_test_pairs),
+            dropped,   # primary: fewer drops
+            -kept      # secondary: more kept
+        )
+
+        if best is None or score < best[0]:
+            best = (score, part)
+
+    if best is None:
+        raise RuntimeError("Could not find an initial split. Increase tries or inspect the data graph.")
+    return best[1]
+
+
+def _compute_deg_to_parts(adj, part, n_parts=3):
+    n = len(adj)
+    deg = np.zeros((n, n_parts), dtype=np.int32)
+    for u in range(n):
+        pu = part[u]
+        for v in adj[u]:
+            deg[u, part[v]] += 1
+    return deg
+
+
+def _refine_partition_min_cut(adj, part, A, B,
+                              train_frac, val_frac, test_frac,
+                              n_pairs: int,
+                              refine_sweeps: int,
+                              lambda_size: float,
+                              seed: int):
+    """
+    Local search refinement:
+      - Objective = cut_edges + lambda_size * (|train_internal-target| + |val_internal-target| + |test_internal-target|)
+      - cut_edges are exactly dropped rows in disjoint/drop-cross mode.
+    """
+    rng = np.random.default_rng(seed)
+    n_imgs = len(adj)
+
+    targets = np.array([
+        int(round(train_frac * n_pairs)),
+        int(round(val_frac * n_pairs)),
+        int(round(test_frac * n_pairs))
+    ], dtype=np.int32)
+
+    def internal_counts(part_arr):
+        in0 = (part_arr == 0); in1 = (part_arr == 1); in2 = (part_arr == 2)
+        c0 = int(np.sum(in0[A] & in0[B]))
+        c1 = int(np.sum(in1[A] & in1[B]))
+        c2 = int(np.sum(in2[A] & in2[B]))
+        return np.array([c0, c1, c2], dtype=np.int32)
+
+    def cut_edges(part_arr):
+        return int(np.sum(part_arr[A] != part_arr[B]))
+
+    deg = _compute_deg_to_parts(adj, part, n_parts=3)
+    internal = internal_counts(part)
+    cut = cut_edges(part)
+
+    def obj(cut_v, internal_v):
+        return cut_v + lambda_size * int(np.sum(np.abs(internal_v - targets)))
+
+    current_obj = obj(cut, internal)
+
+    nodes = np.arange(n_imgs)
+    for _ in range(max(1, refine_sweeps)):
+        rng.shuffle(nodes)
+        improved = False
+
+        for u in nodes:
+            p = int(part[u])
+
+            # Skip isolated nodes
+            if len(adj[u]) == 0:
+                continue
+
+            best_move = None
+            best_obj = current_obj
+
+            for q in (0, 1, 2):
+                if q == p:
+                    continue
+
+                # Delta cut = edges_to_p - edges_to_q
+                delta_cut = int(deg[u, p] - deg[u, q])
+
+                # Internal edges change:
+                # part p loses edges from u to nodes in p
+                # part q gains edges from u to nodes in q
+                new_internal = internal.copy()
+                new_internal[p] -= int(deg[u, p])
+                new_internal[q] += int(deg[u, q])
+
+                new_cut = cut + delta_cut
+                new_obj = obj(new_cut, new_internal)
+
+                if new_obj < best_obj:
+                    best_obj = new_obj
+                    best_move = (q, delta_cut, new_internal)
+
+            if best_move is not None:
+                q, delta_cut, new_internal = best_move
+
+                # Apply move u: p -> q, update deg for neighbors
+                for v in adj[u]:
+                    deg[v, p] -= 1
+                    deg[v, q] += 1
+
+                part[u] = q
+                cut += delta_cut
+                internal = new_internal
+                current_obj = best_obj
+                improved = True
+
+        if not improved:
+            break
+
+    return part
+
+
+def split_optimized_drop_cross(
+    df: pd.DataFrame,
+    img_cols=("image_l", "image_r"),
+    train_frac=0.80,
+    val_frac=0.10,
+    test_frac=0.10,
+    seed=0,
+    tries=300,
+    refine_sweeps=5,
+    lambda_size=1.0,
+):
+    a, b = img_cols
+    df = df.copy()
+    df[a] = df[a].astype(str)
+    df[b] = df[b].astype(str)
+
+    s = train_frac + val_frac + test_frac
+    if not np.isclose(s, 1.0):
+        raise ValueError(f"Fractions must sum to 1.0; got {s}")
+
+    n_pairs = len(df)
+    images, A, B, adj = build_graph(df, a, b)
+
+    part = _init_partition_dense_clusters(images, A, B, adj, n_pairs, train_frac, val_frac, test_frac, seed, tries)
+    part = _refine_partition_min_cut(adj, part, A, B, train_frac, val_frac, test_frac, n_pairs, refine_sweeps, lambda_size, seed)
+
+    is_train = (part[A] == 0) & (part[B] == 0)
+    is_val = (part[A] == 1) & (part[B] == 1)
+    is_test = (part[A] == 2) & (part[B] == 2)
+    is_drop = ~(is_train | is_val | is_test)
+
+    X_train = df.loc[is_train].reset_index(drop=True)
+    X_val = df.loc[is_val].reset_index(drop=True)
+    X_test = df.loc[is_test].reset_index(drop=True)
+    X_drop = df.loc[is_drop]
+
+    tr = img_set(X_train, a, b)
+    va = img_set(X_val, a, b)
+    te = img_set(X_test, a, b)
+
+    # Hard constraints in this mode
+    assert tr.isdisjoint(va)
+    assert tr.isdisjoint(te)
+    assert va.isdisjoint(te)
+
+    info = {
+        "mode": "drop_cross",
+        "original_pairs": n_pairs,
+        "result_pairs": {"train": len(X_train), "val": len(X_val), "test": len(X_test), "dropped": int(is_drop.sum())},
+        "drop_rate": float(is_drop.mean()),
+        "unique_images": {"train": len(tr), "val": len(va), "test": len(te)},
+    }
+    return X_train, X_val, X_test, info
+
+
+# ---------- MODE 2: keep all rows, minimize overlaps (cannot guarantee 0) ----------
+
+def split_optimized_keep_all_min_overlap(
+    df: pd.DataFrame,
+    img_cols=("image_l", "image_r"),
+    train_frac=0.80,
+    val_frac=0.10,
+    test_frac=0.10,
+    seed=0,
+    w_train_overlap=10.0,
+    w_val_test_overlap=1.0,
+    restarts=50,              # NEW: try many random orders, keep best
+):
+    a, b = img_cols
+    df = df.copy().reset_index(drop=True)   # IMPORTANT
+    df[a] = df[a].astype(str)
+    df[b] = df[b].astype(str)
+
+    s = train_frac + val_frac + test_frac
+    if not np.isclose(s, 1.0):
+        raise ValueError(f"Fractions must sum to 1.0; got {s}")
+
+    n = len(df)
+    n_train = int(round(train_frac * n))
+    n_val = int(round(val_frac * n))
+    n_test = n - n_train - n_val
+
+    rng0 = np.random.default_rng(seed)
+
+    def img_set_local(d):
+        return set(pd.concat([d[a], d[b]], ignore_index=True).values)
+
+    best = None  # (objective, assign, info)
+
+    for r in range(max(1, restarts)):
+        rng = np.random.default_rng(int(rng0.integers(0, 2**31-1)))
+
+        remaining = np.array([n_train, n_val, n_test], dtype=np.int32)
+        assign = np.full(n, -1, dtype=np.int8)
+
+        # per-image split membership bitmask: bit0=train, bit1=val, bit2=test
+        img_mask = {}
+
+        order = np.arange(n)
+        rng.shuffle(order)
+
+        def delta_cost_for_split(img: str, split_id: int) -> float:
+            old = img_mask.get(img, 0)
+            new = old | (1 << split_id)
+            if new == old:
+                return 0.0
+
+            cost = 0.0
+            # train + (val or test)
+            if (new & 0b001) and (new & 0b110) and not ((old & 0b001) and (old & 0b110)):
+                cost += w_train_overlap
+            # val + test
+            if (new & 0b010) and (new & 0b100) and not ((old & 0b010) and (old & 0b100)):
+                cost += w_val_test_overlap
+            return cost
+
+        for idx in order:
+            row = df.iloc[idx]
+            im1, im2 = row[a], row[b]
+
+            best_s = None
+            best_cost = float("inf")
+
+            for s_id in (0, 1, 2):
+                if remaining[s_id] <= 0:
+                    continue
+                cost = delta_cost_for_split(im1, s_id) + delta_cost_for_split(im2, s_id)
+                cost -= 1e-6 * remaining[s_id]  # tie-breaker
+                if cost < best_cost:
+                    best_cost = cost
+                    best_s = s_id
+
+            if best_s is None:
+                best_s = int(np.argmax(remaining))
+
+            assign[idx] = best_s
+            remaining[best_s] -= 1
+            img_mask[im1] = img_mask.get(im1, 0) | (1 << best_s)
+            img_mask[im2] = img_mask.get(im2, 0) | (1 << best_s)
+
+        X_train = df.loc[assign == 0]
+        X_val   = df.loc[assign == 1]
+        X_test  = df.loc[assign == 2]
+
+        tr = img_set_local(X_train)
+        va = img_set_local(X_val)
+        te = img_set_local(X_test)
+
+        ov_tr_va = len(tr & va)
+        ov_tr_te = len(tr & te)
+        ov_va_te = len(va & te)
+
+        # Objective: heavily penalize train overlap, lightly penalize val-test overlap
+        objective = w_train_overlap * (ov_tr_va + ov_tr_te) + w_val_test_overlap * ov_va_te
+
+        if best is None or objective < best[0]:
+            info = {
+                "mode": "keep_all_min_overlap",
+                "original_pairs": n,
+                "result_pairs": {"train": int((assign == 0).sum()), "val": int((assign == 1).sum()), "test": int((assign == 2).sum()), "dropped": 0},
+                "unique_images": {"train": len(tr), "val": len(va), "test": len(te)},
+                "overlap_counts": {"train∩val": ov_tr_va, "train∩test": ov_tr_te, "val∩test": ov_va_te},
+                "overlap_rates": {
+                    "train∩val/val": ov_tr_va / max(1, len(va)),
+                    "train∩test/test": ov_tr_te / max(1, len(te)),
+                    "val∩test/val": ov_va_te / max(1, len(va)),
+                },
+                "weights": {"w_train_overlap": w_train_overlap, "w_val_test_overlap": w_val_test_overlap},
+                "restarts": restarts,
+                "best_objective": float(objective),
+            }
+            best = (objective, assign.copy(), info)
+
+    objective, assign, info = best
+    X_train = df.loc[assign == 0].reset_index(drop=True)
+    X_val   = df.loc[assign == 1].reset_index(drop=True)
+    X_test  = df.loc[assign == 2].reset_index(drop=True)
+    return X_train, X_val, X_test, info
+
+
+
+# ---------- Unified entry point ----------
+
+def make_splits(
+    df: pd.DataFrame,
+    img_cols=("image_l", "image_r"),
+    train_frac=0.80,
+    val_frac=0.10,
+    test_frac=0.10,
+    seed=0,
+    mode: str = "drop_cross",  # "drop_cross" or "keep_all"
+    tries: int = 300,
+    refine_sweeps: int = 5,
+    lambda_size: float = 1.0,
+    w_train_overlap: float = 5.0,
+    w_val_test_overlap: float = 1.0,
+):
+    """
+    mode="drop_cross": 0 image overlaps guaranteed; drops cross rows; optimized to drop fewer via refinement.
+    mode="keep_all"  : keep all rows; minimize overlaps heuristically; cannot guarantee 0 overlaps.
+    """
+    if mode == "drop_cross":
+        return split_optimized_drop_cross(
+            df, img_cols, train_frac, val_frac, test_frac,
+            seed=seed, tries=tries, refine_sweeps=refine_sweeps, lambda_size=lambda_size
+        )
+    elif mode == "keep_all":
+        return split_optimized_keep_all_min_overlap(
+            df, img_cols, train_frac, val_frac, test_frac,
+            seed=seed, w_train_overlap=w_train_overlap, w_val_test_overlap=w_val_test_overlap
+        )
+    else:
+        raise ValueError(f"Unknown mode={mode!r}. Use 'drop_cross' or 'keep_all'.")
 
 def run_training_with_args(args, trial=None):
     """
@@ -574,9 +1218,66 @@ def run_training_with_args(args, trial=None):
     X_val = X_train.iloc[sub_val_idx]
     X_train = X_train.iloc[sub_train_idx]
     """    
+    # 90% train, 5% val, 5% test
+
+    """
+    X_train, X_val, X_test, info = split_pairwise_no_train_image_overlap_target_eval(
+        comparisons_df,
+        img_cols=("image_l", "image_r"),
+        train_frac=0.90, val_frac=0.05, test_frac=0.05,
+        seed=args.seed,
+        tries=200,
+    )
+
+    X_train, X_val, X_test, info = split_keep_all_min_overlap_optimized(
+        comparisons_df,
+        img_cols=("image_l","image_r"),
+        train_frac=0.70, val_frac=0.1, test_frac=0.2,
+        seed=args.seed,
+        w_train_overlap=100.0,
+        w_val_test_overlap=1.0,
+        restarts=30,        # was 80
+        steps=220_000,      # was 600k
+        temperature=0.0,    # turn off annealing (faster + fewer random accepts)
+    )
+
+
+    print(info)
+    """
     X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
     X_train, X_val  = train_test_split(X_train       , test_size=0.13, random_state=args.seed)
+    a, b = "image_l", "image_r"
     
+    tr = set(pd.concat([X_train[a].astype(str), X_train[b].astype(str)], ignore_index=True))
+    va = set(pd.concat([X_val[a].astype(str),   X_val[b].astype(str)], ignore_index=True))
+    te = set(pd.concat([X_test[a].astype(str),  X_test[b].astype(str)], ignore_index=True))
+    
+    print("train∩val :", len(tr & va))
+    print("train∩test:", len(tr & te))
+    print("val∩test  :", len(va & te))
+
+    # --- has_eyetracker counts per split ---
+    if "has_eyetracker" in comparisons_df.columns:
+        def _eyetrack_counts(df_):
+            s = df_["has_eyetracker"]
+            # robust to bool / int / float / strings
+            s = s.astype(str).str.lower().str.strip().isin(["1", "true", "t", "yes", "y"])
+            n_true = int(s.sum())
+            n_total = len(df_)
+            return n_true, n_total, (n_true / max(1, n_total))
+    
+        tr_n, tr_tot, tr_rate = _eyetrack_counts(X_train)
+        va_n, va_tot, va_rate = _eyetrack_counts(X_val)
+        te_n, te_tot, te_rate = _eyetrack_counts(X_test)
+    
+        print("\nhas_eyetracker per split:")
+        print(f"  Train: {tr_n}/{tr_tot} = {tr_rate:.2%}")
+        print(f"  Val  : {va_n}/{va_tot} = {va_rate:.2%}")
+        print(f"  Test : {te_n}/{te_tot} = {te_rate:.2%}")
+    else:
+        print("\nColumn 'has_eyetracker' not found in comparisons_df.")
+
+
     splits_dir = "splits"
     os.makedirs(splits_dir, exist_ok=True)
     
@@ -601,7 +1302,7 @@ def run_training_with_args(args, trial=None):
     print(f"- Val  : {len(X_val):,}  [{len(X_val)/total:.2%}]")
     print(f"- Test : {len(X_test):,}  [{len(X_test)/total:.2%}]")
     print("========================================================\n")
-
+    
     # =============================================================================================== #
     # 3b) LABEL DISTRIBUTION PER SPLIT + CLASS WEIGHTS (TRAIN ONLY)
     # =============================================================================================== #
@@ -727,39 +1428,36 @@ def run_training_with_args(args, trial=None):
     if augment_level not in ("none", "light", "heavy"):
         augment_level = "none"
     
-    # Augmentation is not allowed when gaze is enabled
-    if use_gaze_requested:
+    if augment_level == "none":
         train_tfms = eval_tfms
         train_meta = {
             "train_policy": "deterministic (same as eval)",
             "augment": "none",
-            "forced_deterministic_reason": "gaze_enabled",
         }
     else:
-        if augment_level == "none":
-            train_tfms = eval_tfms
-            train_meta = {
-                "train_policy": "deterministic (same as eval)",
-                "augment": "none",
-            }
-        else:
-            preset = AUG_PRESETS[augment_level]
-            train_tfms = Augmentation(
-                augment=True,
-                ties=bool(getattr(args, "ties", True)),
-                resize_short=int(eval_meta["resize_dim"]),
-                out_size=int(eval_meta["target_crop"]),
-                interpolation=_get_interp_mode(eval_meta["interpolation"]),
-                mean=tuple(eval_meta["mean"]),
-                std=tuple(eval_meta["std"]),
-                **preset,
-            )
-            train_meta = {
-                "train_policy": f"pairwise augmentation ({augment_level})",
-                "augment": augment_level,
-                "params": dict(preset),
-            }
+        preset = AUG_PRESETS[augment_level]
+        train_tfms = Augmentation(
+            augment=True,
+            ties=bool(getattr(args, "ties", True)),
+            resize_short=int(eval_meta["resize_dim"]),
+            out_size=int(eval_meta["target_crop"]),
+            interpolation=_get_interp_mode(eval_meta["interpolation"]),
+            mean=tuple(eval_meta["mean"]),
+            std=tuple(eval_meta["std"]),
     
+            # NEW: enable gaze-aware augmentation when gaze is not off
+            enable_gaze=use_gaze_requested,
+            gaze_grid_size=tuple(args.gaze_grid_size),
+    
+            **preset,
+        )
+        train_meta = {
+            "train_policy": f"pairwise augmentation ({augment_level})",
+            "augment": augment_level,
+            "gaze_aware": bool(use_gaze_requested),
+            "params": dict(preset),
+        }
+
     # Expected model image size (for logging / checks)
     args.expected_img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
     
@@ -822,9 +1520,9 @@ def run_training_with_args(args, trial=None):
     )
 
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=False)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
 
     # =============================================================================================== #
     # 6) DEVICE & MODEL

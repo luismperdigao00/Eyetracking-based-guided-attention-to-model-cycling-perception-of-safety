@@ -64,7 +64,7 @@ def test(device, net, dataloader, args, logger=None):
             gaze_r = data.get("gaze_r", None)
             has_eye = data.get("has_eyetracker", None)
 
-            if gaze_l is None:
+            if gaze_l is None or gaze_r is None or has_eye is None:
                 # Legacy datasets: create dummy tensors
                 gaze_l = torch.zeros((label_r.size(0), 14, 14), device=device)
                 gaze_r = torch.zeros((label_r.size(0), 14, 14), device=device)
@@ -73,6 +73,12 @@ def test(device, net, dataloader, args, logger=None):
                 gaze_l = gaze_l.to(device)
                 gaze_r = gaze_r.to(device)
                 has_eye_mask = has_eye.to(device)
+
+                # New dataset can return [B,1,H,W] (or dummy [B,1,1,1]); losses expect [B,H,W]
+                if gaze_l.ndim == 4 and gaze_l.size(1) == 1:
+                    gaze_l = gaze_l.squeeze(1)
+                if gaze_r.ndim == 4 and gaze_r.size(1) == 1:
+                    gaze_r = gaze_r.squeeze(1)
 
             labels = {
                 "label_r": label_r,
@@ -86,7 +92,27 @@ def test(device, net, dataloader, args, logger=None):
             # 2) Forward + loss
             # ----------------------------
             forward_dict = net(input_left, input_right)
-            loss = compute_loss(args, forward_dict, labels)
+
+            # compute_loss returns total loss + optional parts (class / rank / KL) when return_parts=True
+            loss_t, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+
+            # Safe float extraction (parts keys may not exist depending on model / flags)
+            def _pf(key: str) -> float:
+                v = parts.get(key, None) if isinstance(parts, dict) else None
+                if v is None:
+                    return 0.0
+                if torch.is_tensor(v):
+                    return float(v.item())
+                try:
+                    return float(v)
+                except Exception:
+                    return 0.0
+
+            loss_total = float(loss_t.item())
+            loss_class = _pf("loss_class")
+            loss_rank_combo = _pf("loss_rank_combo")
+            loss_kl = _pf("loss_kl")
+            loss_kl_weighted = _pf("loss_kl_weighted")
 
             # ----------------------------
             # 3) Prepare outputs for metrics
@@ -95,6 +121,24 @@ def test(device, net, dataloader, args, logger=None):
             input_left_name = data["image_l_name"]
             input_right_name = data["image_r_name"]
 
+            # ----------------------------
+            # 4) Save per-batch outputs
+            # ----------------------------
+            output_dict = {
+                "image_left": input_left_name,
+                "image_right": input_right_name,
+                "label_r": data["score_r"],
+                "label_c": data["score_c"],
+                "loss_total": loss_total,
+                "loss_class": loss_class,
+                "loss_rank": loss_rank_combo,
+                "loss_kl": loss_kl,
+                "loss_kl_weighted": loss_kl_weighted,
+            }
+
+            # ----------------------------
+            # 5) Return values for metrics (ignite)
+            # ----------------------------
             if args.model == "rcnn":
                 rank_left_t = forward_dict["left"]["output"].view(-1)
                 rank_right_t = forward_dict["right"]["output"].view(-1)
@@ -102,16 +146,21 @@ def test(device, net, dataloader, args, logger=None):
                 rank_left = rank_left_t.detach().cpu().numpy()
                 rank_right = rank_right_t.detach().cpu().numpy()
 
-                forward_pass = {
-                    "rank_left": rank_left,
-                    "rank_right": rank_right,
-                }
+                output_dict.update(
+                    {
+                        "rank_left": rank_left,
+                        "rank_right": rank_right,
+                    }
+                )
 
                 returnable_dict = {
-                    "loss": loss.item(),
+                    "loss": loss_total,
                     "rank_left": rank_left_t,
                     "rank_right": rank_right_t,
                     "label": label_r,
+                    "loss_rank_combo": loss_rank_combo,
+                    "loss_kl": loss_kl,
+                    "loss_kl_weighted": loss_kl_weighted,
                 }
 
             elif args.model == "sscnn":
@@ -119,21 +168,26 @@ def test(device, net, dataloader, args, logger=None):
                 logits_np = logits_t.detach().cpu().numpy()
 
                 if args.ties:
-                    forward_pass = {
-                        "logits_l": logits_np[:, 0],
-                        "logits_0": logits_np[:, 1],
-                        "logits_r": logits_np[:, 2],
-                    }
+                    output_dict.update(
+                        {
+                            "logits_l": logits_np[:, 0],
+                            "logits_0": logits_np[:, 1],
+                            "logits_r": logits_np[:, 2],
+                        }
+                    )
                 else:
-                    forward_pass = {
-                        "logits_l": logits_np[:, 0],
-                        "logits_r": logits_np[:, 1],
-                    }
+                    output_dict.update(
+                        {
+                            "logits_l": logits_np[:, 0],
+                            "logits_r": logits_np[:, 1],
+                        }
+                    )
 
                 returnable_dict = {
-                    "loss": loss.item(),
+                    "loss": loss_total,
                     "logits": logits_t,
                     "label": label_c,
+                    "loss_class": loss_class,
                 }
 
             elif args.model == "rsscnn":
@@ -145,44 +199,44 @@ def test(device, net, dataloader, args, logger=None):
                 rank_right = rank_right_t.detach().cpu().numpy()
                 logits_np = logits_t.detach().cpu().numpy()
 
+                output_dict.update(
+                    {
+                        "rank_left": rank_left,
+                        "rank_right": rank_right,
+                    }
+                )
+
                 if args.ties:
-                    forward_pass = {
-                        "rank_left": rank_left,
-                        "rank_right": rank_right,
-                        "logits_l": logits_np[:, 0],
-                        "logits_0": logits_np[:, 1],
-                        "logits_r": logits_np[:, 2],
-                    }
+                    output_dict.update(
+                        {
+                            "logits_l": logits_np[:, 0],
+                            "logits_0": logits_np[:, 1],
+                            "logits_r": logits_np[:, 2],
+                        }
+                    )
                 else:
-                    forward_pass = {
-                        "rank_left": rank_left,
-                        "rank_right": rank_right,
-                        "logits_l": logits_np[:, 0],
-                        "logits_r": logits_np[:, 1],
-                    }
+                    output_dict.update(
+                        {
+                            "logits_l": logits_np[:, 0],
+                            "logits_r": logits_np[:, 1],
+                        }
+                    )
 
                 returnable_dict = {
-                    "loss": loss.item(),
+                    "loss": loss_total,
                     "rank_left": rank_left_t,
                     "rank_right": rank_right_t,
                     "logits": logits_t,
                     "label_r": label_r,
                     "label_c": label_c,
+                    "loss_class": loss_class,
+                    "loss_rank_combo": loss_rank_combo,
+                    "loss_kl": loss_kl,
+                    "loss_kl_weighted": loss_kl_weighted,
                 }
 
             else:
                 raise ValueError(f"Unknown model type: {args.model}")
-
-            # ----------------------------
-            # 4) Save per-batch outputs
-            # ----------------------------
-            output_dict = {
-                "image_left": input_left_name,
-                "image_right": input_right_name,
-                "label_r": data["score_r"],
-                "label_c": data["score_c"],
-            }
-            output_dict.update(forward_pass)
 
             df_batch = pd.DataFrame(output_dict)
             batch_fname = f"{ckpt_base}_{engine.state.iteration}.pkl"
@@ -210,6 +264,17 @@ def test(device, net, dataloader, args, logger=None):
             "iteration": evaluator.state.iteration,
         }
 
+        # When gaze != off, show loss breakdown + KL (if compute_loss provides it)
+        if getattr(args, "gaze", "off") != "off":
+            if "loss_class" in evaluator.state.metrics:
+                metrics["loss_class_validation"] = evaluator.state.metrics["loss_class"]
+            if "loss_rank_combo" in evaluator.state.metrics:
+                metrics["loss_rank_validation"] = evaluator.state.metrics["loss_rank_combo"]
+            if "loss_kl" in evaluator.state.metrics:
+                metrics["loss_kl_validation"] = evaluator.state.metrics["loss_kl"]
+            if "loss_kl_weighted" in evaluator.state.metrics:
+                metrics["loss_kl_weighted_validation"] = evaluator.state.metrics["loss_kl_weighted"]
+
         if args.full_accuracy and args.ties and args.model != "sscnn":
             metrics["accuracy_validation_ties"] = evaluator.state.metrics["acc_ties"]
 
@@ -227,6 +292,24 @@ def test(device, net, dataloader, args, logger=None):
             output_transform=lambda x: x["loss"],
             device=device,
         ).attach(engine, "loss")
+
+        # Optional: component losses (logged only if present in returnable_dict)
+        RunningAverage(
+            output_transform=lambda x: x.get("loss_class", 0.0),
+            device=device,
+        ).attach(engine, "loss_class")
+        RunningAverage(
+            output_transform=lambda x: x.get("loss_rank_combo", 0.0),
+            device=device,
+        ).attach(engine, "loss_rank_combo")
+        RunningAverage(
+            output_transform=lambda x: x.get("loss_kl", 0.0),
+            device=device,
+        ).attach(engine, "loss_kl")
+        RunningAverage(
+            output_transform=lambda x: x.get("loss_kl_weighted", 0.0),
+            device=device,
+        ).attach(engine, "loss_kl_weighted")
 
         # Ranking only
         if args.model == "rcnn":
@@ -262,9 +345,7 @@ def test(device, net, dataloader, args, logger=None):
 
         # SSCNN (classification only)
         elif args.model == "sscnn":
-            Accuracy(
-                output_transform=lambda x: (x["logits"], x["label"])
-            ).attach(engine, "acc")
+            Accuracy(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "acc")
 
         # RSSCNN (ranking + classification)
         elif args.model == "rsscnn":
@@ -298,13 +379,10 @@ def test(device, net, dataloader, args, logger=None):
                     device=device,
                 ).attach(engine, "acc")
 
-            Accuracy(
-                output_transform=lambda x: (x["logits"], x["label_c"])
-            ).attach(engine, "c_acc")
+            Accuracy(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_acc")
 
         else:
             raise Exception(f"Model type unknown: {args.model}")
-
 
     # --------------------------------------------------------------------------------------- #
     # RUN EVALUATION

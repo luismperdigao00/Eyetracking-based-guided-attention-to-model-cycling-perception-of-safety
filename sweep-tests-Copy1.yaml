@@ -2,7 +2,7 @@
 # W&B Sweep: 5 Backbones + Unfreeze Depth + Pooling + Augmentation
 # ==============================================================================
 program: /home/csantiago/train.py
-project: PCS_guided_by_gaze
+project: PCS_ET_v2
 command:
   - python
   - ${program}
@@ -63,7 +63,7 @@ parameters:
   ties:
     value: false
   gaze:
-    values: ["use", "use_nobp"]
+    values: ["off", "use"]
 
   # ---------------------------------------------------------------------------
   # D) Backbone & Architecture
@@ -112,7 +112,7 @@ parameters:
     value: 8
     
   max_epochs:
-    value: 12
+    value: 15
   grad_clip:
     value: 0.0
 
@@ -120,11 +120,11 @@ parameters:
   # G) Optimizer
   # ---------------------------------------------------------------------------
   base_lr:
-    values: [3e-5]
+    values: [4e-5]
   backbone_lr_scale:
     value: 1
   weight_decay:
-    value: 0.01
+    value: 0.05
   backbone_freeze_epochs:
     value: 0
     
@@ -137,7 +137,7 @@ parameters:
   # H) Ranking / Loss weights
   # ---------------------------------------------------------------------------
   ranking_margin:
-    values: [0.7]
+    values: [0.4]
 #  ranking_margin_ties:
 #    value: 0.7
   rank_w:
@@ -146,7 +146,7 @@ parameters:
   ties_w:
     value: 1.0
   attn_w:
-    value: 1
+    value: 1.0
   label_smoothing:
     value: 0.0
   use_class_weights:
@@ -158,15 +158,15 @@ parameters:
   scheduler:
     value: warmup_cosine
   warmup_frac:
-    value: 0.1
+    value: 0.15
   eta_min:
-    value: 5.0e-7
+    value: 5.0e-6
 
   # ---------------------------------------------------------------------------
   # J) Augmentation
   # ---------------------------------------------------------------------------
   augment:
-    values: ["none"]
+    values: ["heavy", "none"]
   use_seg:
     value: false
 
@@ -186,7 +186,7 @@ parameters:
   early_stop_mode:
     value: min
   early_stop_patience:
-    value: 4
+    value: 3
   early_stop_min_delta:
     value: 0.0
   early_stop_start_epoch:
@@ -202,4 +202,4 @@ parameters:
     value: "{s}x{s}" # Format for subfolders (e.g., "14x14")
 
   attention_mode:
-    values: ["last", "rollout"]
+    values: ["last"]

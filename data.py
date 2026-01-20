@@ -89,7 +89,7 @@ class ComparisonsDataset(Dataset):
         """
         Resolves gaze path.
     
-        If fname is relative and gaze_root is provided, we look under:
+        If fname is relative and gaze_root is provided:
             gaze_root / <subdir_for_map_size> / fname
         where <subdir_for_map_size> defaults to "{s}x{s}" -> "14x14", "16x16", ...
     
@@ -438,80 +438,61 @@ def build_eval_transforms(specs: dict, gaze_grid_size=(14, 14), enable_gaze: boo
 #   - Swap is inherently paired and should not have a paired_* toggle.
 
 AUG_PRESETS = {
-    "light": dict(
-        # Pairing toggles
-        paired_scale=True,
-        paired_hflip=True,
-        paired_crop=True,
-        paired_rotation=True,
-        paired_color_jitter=False,
-        paired_gray=False,
-        paired_erase=True,
+    "light": {
+        "paired_scale": True,
+        "paired_hflip": True,
+        "paired_crop": True,
+        "paired_rotation": True,
+        "paired_color_jitter": False,
+        "paired_gray": False,
+        "paired_erase": True,
 
-        # Params
-        hflip_p=0.20,
-        swap_p=0.50,
+        "swap_p": 0.50,
+        "hflip_p": 0.20,
+        "rot_deg": 0.0,
+        "rot_p": 0.0,
 
-        crop_p=0.00,
+        "crop_scale": (1.00, 1.00),
+        "crop_ratio": (1.00, 1.00),
 
-        scale_p=0.00,
-        scale_range=(1.00, 1.00),
+        "color_jitter": None,
+        "gray_p": 0.0,
+        "blur_p": 0.0,
+        "blur_kernel": 23,
+        "blur_sigma": (0.1, 2.0),
 
-        rotation_p=0.00,
-        max_rotation_deg=0.0,
+        "erase_p": 0.0,
+        "erase_scale": (0.02, 0.06),
+        "erase_ratio": (0.3, 3.3),
+    },
 
-        color_jitter_p=0.00,
-        jitter_brightness=0.0,
-        jitter_contrast=0.0,
-        jitter_saturation=0.0,
-        jitter_hue=0.0,
+    "heavy": {
+        "paired_scale": True,
+        "paired_hflip": True,
+        "paired_crop": True,
+        "paired_rotation": True,
+        "paired_color_jitter": False,
+        "paired_gray": True,
+        "paired_erase": True,
 
-        gray_p=0.00,
+        "swap_p": 0.50,
+        "hflip_p": 0.50,
+        "rot_deg": 3.0,
+        "rot_p": 0.10,
 
-        erase_p=0.00,
-        erase_scale=(0.02, 0.06),
-        erase_ratio=(0.3, 3.3),
-        erase_value=0.0,
-    ),
+        "crop_scale": (0.80, 1.00),
+        "crop_ratio": (0.75, 1.3333333333333333),
 
-    "heavy": dict(
-        # Pairing toggles (ranking-safe defaults)
-        paired_scale=True,
-        paired_hflip=True,
-        paired_crop=True,
-        paired_rotation=True,
-        paired_color_jitter=False,   
-        paired_gray=True,        
-        paired_erase=True,
-    
-        # Pair operations
-        swap_p=0.5,
-    
-        # Geometry (paired)
-        hflip_p=0.5,                 # common for ViTs; paired keeps it label-stable
-        crop_p=0.8,                  # strong, but not always-on to avoid over-randomizing evidence
-        scale_p=0.25,
-        scale_range=(1.0, 1.15),     # mild zoom-in only
-        rotation_p=0.10,
-        max_rotation_deg=3.0,
-    
-        # Photometric (mild, unpaired)
-        color_jitter_p=0.20,
-        jitter_brightness=0.20,
-        jitter_contrast=0.20,
-        jitter_saturation=0.20,
-        jitter_hue=0.03,             
-    
-        # Usually keep off unless color invariance is desired
-        gray_p=0.0,
-    
-        # Regularization (start low; increase after baseline is stable)
-        erase_p=0.10,
-        erase_scale=(0.02, 0.08),
-        erase_ratio=(0.3, 3.3),
-        erase_value=0.0,
-    ),
+        "color_jitter": (0.20, 0.20, 0.20, 0.03),
+        "gray_p": 0.01,
+        "blur_p": 0.3,
+        "blur_kernel": 23,
+        "blur_sigma": (0.1, 2.0),
 
+        "erase_p": 0.1,
+        "erase_scale": (0.02, 0.08),
+        "erase_ratio": (0.3, 3.3),
+    },
 }
 
 # ==============================================================================
@@ -520,58 +501,31 @@ AUG_PRESETS = {
 
 class Augmentation:
     """
-    Pairwise augmentation pipeline for Siamese / ranking tasks.
+    Applies preprocessing + stochastic augmentation to a paired sample:
+      - image_l/image_r: PIL.Image -> torch.Tensor [3, out_size, out_size] (normalized)
+      - Optional gaze alignment when enable_gaze=True:
+          gaze_l/gaze_r follow the same geometric transforms as the corresponding image,
+          then are downsampled to gaze_grid_size.
 
-    Probability semantics:
-      - If paired_* is True: the transform is applied to BOTH images with probability p.
-      - If paired_* is False: the transform is applied to EACH image independently with probability p.
-        (p=1.0 implies each image always receives the transform; p=0.0 implies never.)
-
-    Geometry:
-      - Scale is zoom-in only (scale_min clamped to >= 1.0).
-      - Crop always outputs out_size; when crop is not applied to a side, center-crop is used for that side.
-
-    Swap:
-      - Always a pair operation, updates labels deterministically.
+    Pairing controls:
+      - paired_* flags decide whether random choices/parameters are shared across left/right.
+      - crop_scale/crop_ratio implement a RandomResizedCrop-style crop, resized to (out_size, out_size),
+        sampled in a way that avoids any extra pre-crop.
     """
 
     def __init__(
         self,
-        augment: bool,
-        ties: bool,
-        resize_short: int,
-        out_size: int,
-        interpolation,
-        mean: tuple,
-        std: tuple,
+        augment: bool = True,
+        ties: bool = True,
+        resize_short: int = 256,
+        out_size: int = 224,
+        interpolation=InterpolationMode.BILINEAR,
+        mean=(0.485, 0.456, 0.406),
+        std=(0.229, 0.224, 0.225),
 
-        # Probabilities & ranges
-        hflip_p: float = 0.5,
-        swap_p: float = 0.5,
+        enable_gaze: bool = False,
+        gaze_grid_size=(14, 14),
 
-        crop_p: float = 0.0,
-
-        scale_p: float = 0.0,
-        scale_range=(1.0, 1.0),
-        scale_fill: float = 0.0,
-
-        rotation_p: float = 0.0,
-        max_rotation_deg: float = 0.0,
-
-        color_jitter_p: float = 0.0,
-        jitter_brightness: float = 0.0,
-        jitter_contrast: float = 0.0,
-        jitter_saturation: float = 0.0,
-        jitter_hue: float = 0.0,
-
-        gray_p: float = 0.0,
-
-        erase_p: float = 0.0,
-        erase_scale=(0.02, 0.20),
-        erase_ratio=(0.3, 3.3),
-        erase_value: float = 0.0,
-
-        # Pairing config
         paired_scale: bool = True,
         paired_hflip: bool = True,
         paired_crop: bool = True,
@@ -579,43 +533,53 @@ class Augmentation:
         paired_color_jitter: bool = False,
         paired_gray: bool = False,
         paired_erase: bool = True,
+
+        swap_p: float = 0.5,
+        hflip_p: float = 0.5,
+        rot_deg: float = 0.0,
+        rot_p: float = 0.0,
+        crop_scale=(0.80, 1.00),
+        crop_ratio=(3 / 4, 4 / 3),
+
+        color_jitter=None,
+        gray_p: float = 0.0,
+        blur_p: float = 0.0,
+        blur_kernel: int = 23,
+        blur_sigma=(0.1, 2.0),
+
+        erase_p: float = 0.0,
+        erase_scale=(0.02, 0.20),
+        erase_ratio=(0.3, 3.3),
+
+        **kwargs,
     ):
+        # Legacy alias mapping
+        if "flip_p" in kwargs and kwargs["flip_p"] is not None:
+            hflip_p = kwargs["flip_p"]
+        if "rotation" in kwargs and kwargs["rotation"] is not None:
+            rot_deg = kwargs["rotation"]
+        if "rotation_p" in kwargs and kwargs["rotation_p"] is not None:
+            rot_p = kwargs["rotation_p"]
+        if "scale" in kwargs and kwargs["scale"] is not None:
+            crop_scale = kwargs["scale"]
+        if "ratio" in kwargs and kwargs["ratio"] is not None:
+            crop_ratio = kwargs["ratio"]
+        if "jitter" in kwargs and kwargs["jitter"] is not None:
+            color_jitter = kwargs["jitter"]
+        if "erase" in kwargs and kwargs["erase"] is not None:
+            erase_p = kwargs["erase"]
+
         self.augment = bool(augment)
         self.ties = bool(ties)
 
         self.resize_short = int(resize_short)
         self.out_size = int(out_size)
         self.interpolation = interpolation
+        self.mean = tuple(mean)
+        self.std = tuple(std)
 
-        self.mean = mean
-        self.std = std
-
-        self.hflip_p = float(hflip_p)
-        self.swap_p = float(swap_p)
-
-        self.crop_p = float(crop_p)
-
-        self.scale_p = float(scale_p)
-        s0, s1 = float(scale_range[0]), float(scale_range[1])
-        self.scale_min = max(1.0, min(s0, s1))  # forbid zoom-out
-        self.scale_max = max(1.0, max(s0, s1))
-        self.scale_fill = float(scale_fill)
-
-        self.rotation_p = float(rotation_p)
-        self.max_rotation_deg = float(max_rotation_deg)
-
-        self.color_jitter_p = float(color_jitter_p)
-        self.jitter_brightness = float(jitter_brightness)
-        self.jitter_contrast = float(jitter_contrast)
-        self.jitter_saturation = float(jitter_saturation)
-        self.jitter_hue = float(jitter_hue)
-
-        self.gray_p = float(gray_p)
-
-        self.erase_p = float(erase_p)
-        self.erase_scale_min, self.erase_scale_max = float(erase_scale[0]), float(erase_scale[1])
-        self.erase_ratio_min, self.erase_ratio_max = float(erase_ratio[0]), float(erase_ratio[1])
-        self.erase_value = float(erase_value)
+        self.enable_gaze = bool(enable_gaze)
+        self.gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
 
         self.paired_scale = bool(paired_scale)
         self.paired_hflip = bool(paired_hflip)
@@ -625,329 +589,484 @@ class Augmentation:
         self.paired_gray = bool(paired_gray)
         self.paired_erase = bool(paired_erase)
 
-    # ------------------------------------------------------------------
-    # RNG helpers
-    # ------------------------------------------------------------------
+        self.swap_p = float(swap_p)
+        self.hflip_p = float(hflip_p)
+        self.rot_deg = float(rot_deg)
+        self.rot_p = float(rot_p)
+
+        self.crop_scale = tuple(crop_scale) if crop_scale is not None else None
+        self.crop_ratio = tuple(crop_ratio) if crop_ratio is not None else None
+
+        self.color_jitter = color_jitter
+        self.gray_p = float(gray_p)
+        self.blur_p = float(blur_p)
+        self.blur_kernel = int(blur_kernel)
+        self.blur_sigma = tuple(blur_sigma)
+
+        self.erase_p = float(erase_p)
+        self.erase_scale = tuple(erase_scale)
+        self.erase_ratio = tuple(erase_ratio)
+
+    # -------------------------
+    # Small utilities
+    # -------------------------
+    @staticmethod
+    def _as_bool(x) -> bool:
+        if torch.is_tensor(x):
+            return bool(x.item())
+        return bool(x)
 
     @staticmethod
-    def _coin(p: float) -> bool:
-        p = float(p)
-        if p <= 0.0:
-            return False
-        if p >= 1.0:
-            return True
-        return random.random() < p
-
-    # ------------------------------------------------------------------
-    # Labels
-    # ------------------------------------------------------------------
+    def _to_int(x) -> int:
+        if torch.is_tensor(x):
+            return int(x.item())
+        return int(x)
 
     def _score_r_to_score_c(self, score_r: int) -> int:
-        score_r = int(score_r)
         if self.ties:
-            return score_r + 1  # {-1,0,+1} -> {0,1,2}
-        return 0 if score_r < 0 else 1
-
-    # ------------------------------------------------------------------
-    # PIL helpers
-    # ------------------------------------------------------------------
-
-    def _resize_short_side(self, img):
-        return TF.resize(img, self.resize_short, interpolation=self.interpolation)
+            return int(score_r) + 1
+        if score_r <= 0:
+            return 0
+        return 1
 
     @staticmethod
-    def _center_crop_to_common(img_l, img_r):
-        wl, hl = img_l.size
-        wr, hr = img_r.size
-        w = min(wl, wr)
-        h = min(hl, hr)
-        if (wl, hl) != (w, h):
-            img_l = TF.center_crop(img_l, [h, w])
-        if (wr, hr) != (w, h):
-            img_r = TF.center_crop(img_r, [h, w])
-        return img_l, img_r
+    def _to_1ch_float(g) -> torch.Tensor:
+        if g is None:
+            return torch.zeros((1, 1, 1), dtype=torch.float32)
+        if not torch.is_tensor(g):
+            g = torch.as_tensor(g)
+        g = g.float()
 
-    def _ensure_min_size_pair(self, img_l, img_r, th, tw):
-        w, h = img_l.size
-        if w >= tw and h >= th:
-            return img_l, img_r
-        new_short = max(self.resize_short, th, tw)
-        img_l = TF.resize(img_l, new_short, interpolation=self.interpolation)
-        img_r = TF.resize(img_r, new_short, interpolation=self.interpolation)
-        return self._center_crop_to_common(img_l, img_r)
+        if g.ndim == 2:
+            g = g.unsqueeze(0)
+        elif g.ndim == 3:
+            if g.size(0) != 1:
+                g = g.mean(dim=0, keepdim=True)
+        else:
+            return torch.zeros((1, 1, 1), dtype=torch.float32)
+
+        return g.contiguous()
 
     @staticmethod
-    def _sample_crop_coords(w, h, th, tw):
-        i = random.randint(0, h - th)
-        j = random.randint(0, w - tw)
-        return i, j
+    def _resize_gaze_to_hw(g_1chw: torch.Tensor, size_hw, mode="bilinear") -> torch.Tensor:
+        gh, gw = int(size_hw[0]), int(size_hw[1])
+        x = g_1chw.unsqueeze(0)  # [1,1,H,W]
+        x = nnF.interpolate(x, size=(gh, gw), mode=mode, align_corners=False if mode != "nearest" else None)
+        return x.squeeze(0).contiguous()  # [1,gh,gw]
 
-    def _apply_scale(self, img, s: float):
-        w, h = img.size
-        cx = w // 2
-        cy = h // 2
-        return TF.affine(
-            img,
-            angle=0.0,
-            translate=[0, 0],
-            scale=float(s),
-            shear=[0.0, 0.0],
-            interpolation=self.interpolation,
-            fill=self.scale_fill,
-            center=[cx, cy],
-        )
+    @staticmethod
+    def _hflip_gaze(g_1chw: torch.Tensor) -> torch.Tensor:
+        return torch.flip(g_1chw, dims=[2])
 
-    def _apply_rotate(self, img, angle: float):
+    def _rotate_gaze(self, g_1chw: torch.Tensor, angle: float) -> torch.Tensor:
         return TF.rotate(
-            img,
+            g_1chw,
             angle=float(angle),
-            interpolation=self.interpolation,
+            interpolation=InterpolationMode.BILINEAR,
             expand=False,
-            fill=self.scale_fill,
+            fill=0.0,
+            center=None,
         )
 
-    def _sample_color_jitter_ops(self):
-        def sample_factor(a: float):
-            a = float(a)
-            if a <= 0.0:
-                return None
-            lo = max(0.0, 1.0 - a)
-            hi = 1.0 + a
-            return random.uniform(lo, hi)
-
-        def sample_hue(a: float):
-            a = float(a)
-            if a <= 0.0:
-                return None
-            a = min(0.5, a)
-            return random.uniform(-a, a)
-
-        b = sample_factor(self.jitter_brightness)
-        c = sample_factor(self.jitter_contrast)
-        s = sample_factor(self.jitter_saturation)
-        h = sample_hue(self.jitter_hue)
-
-        ops = []
-        if b is not None:
-            ops.append(("b", b))
-        if c is not None:
-            ops.append(("c", c))
-        if s is not None:
-            ops.append(("s", s))
-        if h is not None:
-            ops.append(("h", h))
-        random.shuffle(ops)
-        return ops
+    def _downsample_gaze_to_grid(self, g_1chw: torch.Tensor) -> torch.Tensor:
+        return self._resize_gaze_to_hw(g_1chw, self.gaze_grid_size, mode="bilinear")
 
     @staticmethod
-    def _apply_color_jitter_ops(img, ops):
-        for k, v in ops:
-            if k == "b":
-                img = TF.adjust_brightness(img, v)
-            elif k == "c":
-                img = TF.adjust_contrast(img, v)
-            elif k == "s":
-                img = TF.adjust_saturation(img, v)
-            elif k == "h":
-                img = TF.adjust_hue(img, v)
-        return img
+    def _cj_range(v, is_hue: bool = False):
+        if v is None:
+            return None
+        if isinstance(v, (tuple, list)):
+            if len(v) != 2:
+                raise ValueError("Color jitter ranges must be (min, max).")
+            lo, hi = float(v[0]), float(v[1])
+            if is_hue:
+                lo = max(lo, -0.5)
+                hi = min(hi, 0.5)
+            return (lo, hi)
 
-    # ------------------------------------------------------------------
-    # Tensor helpers (erase)
-    # ------------------------------------------------------------------
+        v = float(v)
+        if v <= 0.0:
+            return None
 
-    def _sample_erasing_rect(self, H, W, max_tries=10):
+        if is_hue:
+            lo, hi = -v, v
+            lo = max(lo, -0.5)
+            hi = min(hi, 0.5)
+            return (lo, hi)
+
+        return (max(0.0, 1.0 - v), 1.0 + v)
+
+    @staticmethod
+    def _ensure_min_side_pil(img, min_side: int, interpolation):
+        w, h = img.size
+        if min(w, h) >= min_side:
+            return img
+        return TF.resize(img, min_side, interpolation=interpolation)
+
+    @staticmethod
+    def _sample_erase_rect(H: int, W: int, p: float, scale, ratio):
+        if p <= 0.0 or (random.random() >= p):
+            return None
+
         area = H * W
-        for _ in range(max_tries):
-            erase_area = area * random.uniform(self.erase_scale_min, self.erase_scale_max)
-            aspect = random.uniform(self.erase_ratio_min, self.erase_ratio_max)
+        for _ in range(10):
+            erase_area = random.uniform(scale[0], scale[1]) * area
+            aspect = random.uniform(ratio[0], ratio[1])
+
             eh = int(round(math.sqrt(erase_area * aspect)))
             ew = int(round(math.sqrt(erase_area / aspect)))
+
             if 0 < eh < H and 0 < ew < W:
                 top = random.randint(0, H - eh)
                 left = random.randint(0, W - ew)
                 return top, left, eh, ew
+
         return None
 
-    def _apply_erase_rect(self, x, rect):
-        top, left, eh, ew = rect
-        x[:, top : top + eh, left : left + ew] = self.erase_value
-        return x
+    @staticmethod
+    def _sample_crop_hw(H: int, W: int, scale_range, ratio_range):
+        area = H * W
+        log_ratio = (math.log(ratio_range[0]), math.log(ratio_range[1]))
 
-    # ------------------------------------------------------------------
-    # Main
-    # ------------------------------------------------------------------
+        for _ in range(10):
+            target_area = random.uniform(scale_range[0], scale_range[1]) * area
+            aspect = math.exp(random.uniform(log_ratio[0], log_ratio[1]))
 
-    def __call__(self, sample: dict) -> dict:
-        # Gaze safety check
-        has_eye = sample.get("has_eyetracker", False)
-        if torch.is_tensor(has_eye):
-            has_eye = bool(has_eye.item())
+            w = int(round(math.sqrt(target_area * aspect)))
+            h = int(round(math.sqrt(target_area / aspect)))
+
+            if 0 < h <= H and 0 < w <= W:
+                return h, w
+
+        side = min(H, W)
+        return side, side
+
+    @staticmethod
+    def _center_ij(H: int, W: int, h: int, w: int):
+        i = max(0, (H - h) // 2)
+        j = max(0, (W - w) // 2)
+        return i, j
+
+    @staticmethod
+    def _uv_ij(H: int, W: int, h: int, w: int, u: float, v: float):
+        max_i = max(0, H - h)
+        max_j = max(0, W - w)
+        i = 0 if max_i == 0 else int(round(u * max_i))
+        j = 0 if max_j == 0 else int(round(v * max_j))
+        i = max(0, min(max_i, i))
+        j = max(0, min(max_j, j))
+        return i, j
+
+    def _maybe_swap_pair(self, sample: dict, img_l, img_r, score_r: int):
+        if not (self.augment and (random.random() < self.swap_p)):
+            return img_l, img_r, score_r
+
+        img_l, img_r = img_r, img_l
+        score_r = -score_r
+
+        swap_pairs = [
+            ("image_l_name", "image_r_name"),
+            ("gaze_l", "gaze_r"),
+            ("gaze_ok_l", "gaze_ok_r"),
+            ("gaze_path_l", "gaze_path_r"),
+        ]
+        for k1, k2 in swap_pairs:
+            if (k1 in sample) and (k2 in sample):
+                sample[k1], sample[k2] = sample[k2], sample[k1]
+
+        return img_l, img_r, score_r
+    
+    @staticmethod
+    def _sample_color_jitter_params(brightness, contrast, saturation, hue):
+        params = []
+        if brightness is not None:
+            params.append(("brightness", random.uniform(brightness[0], brightness[1])))
+        if contrast is not None:
+            params.append(("contrast", random.uniform(contrast[0], contrast[1])))
+        if saturation is not None:
+            params.append(("saturation", random.uniform(saturation[0], saturation[1])))
+        if hue is not None:
+            params.append(("hue", random.uniform(hue[0], hue[1])))
+
+        random.shuffle(params)
+        return params
+
+    @staticmethod
+    def _apply_color_jitter(img, params):
+        for name, factor in params:
+            if name == "brightness":
+                img = TF.adjust_brightness(img, factor)
+            elif name == "contrast":
+                img = TF.adjust_contrast(img, factor)
+            elif name == "saturation":
+                img = TF.adjust_saturation(img, factor)
+            elif name == "hue":
+                img = TF.adjust_hue(img, factor)
+        return img
+
+    # -------------------------
+    # Crop policy (single crop per side)
+    # -------------------------
+    def _sample_crop_pair(self, img_l, img_r):
+        Hl, Wl = img_l.size[1], img_l.size[0]
+        Hr, Wr = img_r.size[1], img_r.size[0]
+
+        scale_rng = self.crop_scale
+        ratio_rng = self.crop_ratio
+
+        if not (self.augment and (scale_rng is not None) and (ratio_rng is not None)):
+            hl = wl = self.out_size
+            hr = wr = self.out_size
+            il, jl = self._center_ij(Hl, Wl, hl, wl)
+            ir, jr = self._center_ij(Hr, Wr, hr, wr)
+            return (il, jl, hl, wl), (ir, jr, hr, wr)
+
+        if self.paired_crop:
+            u = random.random()
+            v = random.random()
         else:
-            has_eye = bool(has_eye)
-        if has_eye:
-            raise RuntimeError("Augmentation is not supported when gaze alignment is active.")
+            u = v = None
 
+        def sample_hw_for_dims(H, W):
+            return self._sample_crop_hw(H, W, scale_rng, ratio_rng)
+
+        if self.paired_scale:
+            for _ in range(10):
+                hl, wl = sample_hw_for_dims(Hl, Wl)
+                hr, wr = sample_hw_for_dims(Hr, Wr)
+                if (hl <= Hl and wl <= Wl) and (hr <= Hr and wr <= Wr):
+                    break
+            else:
+                sl = min(Hl, Wl)
+                sr = min(Hr, Wr)
+                hl = wl = sl
+                hr = wr = sr
+        else:
+            hl, wl = sample_hw_for_dims(Hl, Wl)
+            hr, wr = sample_hw_for_dims(Hr, Wr)
+
+        if self.paired_crop:
+            il, jl = self._uv_ij(Hl, Wl, hl, wl, u, v)
+            ir, jr = self._uv_ij(Hr, Wr, hr, wr, u, v)
+        else:
+            if self.paired_scale:
+                ul, vl = random.random(), random.random()
+                ur, vr = random.random(), random.random()
+            else:
+                ul, vl = random.random(), random.random()
+                ur, vr = random.random(), random.random()
+
+            il, jl = self._uv_ij(Hl, Wl, hl, wl, ul, vl)
+            ir, jr = self._uv_ij(Hr, Wr, hr, wr, ur, vr)
+
+        return (il, jl, hl, wl), (ir, jr, hr, wr)
+
+    # -------------------------
+    # Main entry point
+    # -------------------------
+    def __call__(self, sample: dict) -> dict:
         img_l = sample["image_l"]
         img_r = sample["image_r"]
 
-        score_r = int(sample["score_r"])
-        score_c = int(sample.get("score_c", self._score_r_to_score_c(score_r)))
+        score_r = self._to_int(sample.get("score_r", 0))
+        has_eye = self._as_bool(sample.get("has_eyetracker", False))
 
-        do_aug = bool(self.augment)
-        pil_inputs = (not torch.is_tensor(img_l)) and (not torch.is_tensor(img_r))
+        img_l, img_r, score_r = self._maybe_swap_pair(sample, img_l, img_r, score_r)
+        sample["score_r"] = score_r
+        sample["score_c"] = self._score_r_to_score_c(score_r)
 
-        # -------------------------
-        # PIL branch
-        # -------------------------
-        if pil_inputs:
-            img_l = self._resize_short_side(img_l)
-            img_r = self._resize_short_side(img_r)
-            img_l, img_r = self._center_crop_to_common(img_l, img_r)
+        img_l = TF.resize(img_l, self.resize_short, interpolation=self.interpolation)
+        img_r = TF.resize(img_r, self.resize_short, interpolation=self.interpolation)
+        img_l = self._ensure_min_side_pil(img_l, self.out_size, self.interpolation)
+        img_r = self._ensure_min_side_pil(img_r, self.out_size, self.interpolation)
 
-            # Scale jitter (zoom-in only)
-            if do_aug and (self.scale_p > 0.0):
-                if self.paired_scale:
-                    if self._coin(self.scale_p):
-                        s = random.uniform(self.scale_min, self.scale_max)
-                        img_l = self._apply_scale(img_l, s)
-                        img_r = self._apply_scale(img_r, s)
-                else:
-                    if self._coin(self.scale_p):
-                        img_l = self._apply_scale(img_l, random.uniform(self.scale_min, self.scale_max))
-                    if self._coin(self.scale_p):
-                        img_r = self._apply_scale(img_r, random.uniform(self.scale_min, self.scale_max))
-                img_l, img_r = self._center_crop_to_common(img_l, img_r)
+        if self.enable_gaze and has_eye:
+            g_l = self._to_1ch_float(sample.get("gaze_l", None))
+            g_r = self._to_1ch_float(sample.get("gaze_r", None))
 
-            # Horizontal flip
-            if do_aug and (self.hflip_p > 0.0):
-                if self.paired_hflip:
-                    if self._coin(self.hflip_p):
-                        img_l = TF.hflip(img_l)
-                        img_r = TF.hflip(img_r)
-                else:
-                    if self._coin(self.hflip_p):
-                        img_l = TF.hflip(img_l)
-                    if self._coin(self.hflip_p):
-                        img_r = TF.hflip(img_r)
-
-            # Rotation
-            if do_aug and (self.rotation_p > 0.0) and (self.max_rotation_deg > 0.0):
-                if self.paired_rotation:
-                    if self._coin(self.rotation_p):
-                        ang = random.uniform(-self.max_rotation_deg, self.max_rotation_deg)
-                        img_l = self._apply_rotate(img_l, ang)
-                        img_r = self._apply_rotate(img_r, ang)
-                else:
-                    if self._coin(self.rotation_p):
-                        img_l = self._apply_rotate(img_l, random.uniform(-self.max_rotation_deg, self.max_rotation_deg))
-                    if self._coin(self.rotation_p):
-                        img_r = self._apply_rotate(img_r, random.uniform(-self.max_rotation_deg, self.max_rotation_deg))
-                img_l, img_r = self._center_crop_to_common(img_l, img_r)
-
-            # Crop to output size
-            th = tw = self.out_size
-            img_l, img_r = self._ensure_min_size_pair(img_l, img_r, th, tw)
-            w, h = img_l.size
-
-            if do_aug and (self.crop_p > 0.0):
-                if self.paired_crop:
-                    if self._coin(self.crop_p):
-                        i, j = self._sample_crop_coords(w, h, th, tw)
-                        img_l = TF.crop(img_l, i, j, th, tw)
-                        img_r = TF.crop(img_r, i, j, th, tw)
-                    else:
-                        img_l = TF.center_crop(img_l, [th, tw])
-                        img_r = TF.center_crop(img_r, [th, tw])
-                else:
-                    if self._coin(self.crop_p):
-                        i, j = self._sample_crop_coords(w, h, th, tw)
-                        img_l = TF.crop(img_l, i, j, th, tw)
-                    else:
-                        img_l = TF.center_crop(img_l, [th, tw])
-
-                    if self._coin(self.crop_p):
-                        i, j = self._sample_crop_coords(w, h, th, tw)
-                        img_r = TF.crop(img_r, i, j, th, tw)
-                    else:
-                        img_r = TF.center_crop(img_r, [th, tw])
-            else:
-                img_l = TF.center_crop(img_l, [th, tw])
-                img_r = TF.center_crop(img_r, [th, tw])
-
-            # Color jitter
-            if do_aug and (self.color_jitter_p > 0.0):
-                if self.paired_color_jitter:
-                    if self._coin(self.color_jitter_p):
-                        ops = self._sample_color_jitter_ops()
-                        img_l = self._apply_color_jitter_ops(img_l, ops)
-                        img_r = self._apply_color_jitter_ops(img_r, ops)
-                else:
-                    if self._coin(self.color_jitter_p):
-                        img_l = self._apply_color_jitter_ops(img_l, self._sample_color_jitter_ops())
-                    if self._coin(self.color_jitter_p):
-                        img_r = self._apply_color_jitter_ops(img_r, self._sample_color_jitter_ops())
-
-            # Grayscale
-            if do_aug and (self.gray_p > 0.0):
-                if self.paired_gray:
-                    if self._coin(self.gray_p):
-                        img_l = TF.rgb_to_grayscale(img_l, num_output_channels=3)
-                        img_r = TF.rgb_to_grayscale(img_r, num_output_channels=3)
-                else:
-                    if self._coin(self.gray_p):
-                        img_l = TF.rgb_to_grayscale(img_l, num_output_channels=3)
-                    if self._coin(self.gray_p):
-                        img_r = TF.rgb_to_grayscale(img_r, num_output_channels=3)
-
-            # Swap (pair operation + label update)
-            if do_aug and (self.swap_p > 0.0) and self._coin(self.swap_p):
-                img_l, img_r = img_r, img_l
-                score_r = -score_r
-                score_c = self._score_r_to_score_c(score_r)
-
-            x_l = TF.to_tensor(img_l)
-            x_r = TF.to_tensor(img_r)
-
-        # -------------------------
-        # Tensor branch
-        # -------------------------
+            wl, hl = img_l.size
+            wr, hr = img_r.size
+            g_l = self._resize_gaze_to_hw(g_l, (hl, wl), mode="bilinear")
+            g_r = self._resize_gaze_to_hw(g_r, (hr, wr), mode="bilinear")
         else:
-            x_l = img_l
-            x_r = img_r
+            g_l = None
+            g_r = None
 
-        # Random erasing (tensor level)
-        if do_aug and (self.erase_p > 0.0):
-            if self.paired_erase:
-                if self._coin(self.erase_p):
-                    _, H, W = x_l.shape
-                    rect = self._sample_erasing_rect(H, W)
-                    if rect is not None:
-                        x_l = self._apply_erase_rect(x_l, rect)
-                        x_r = self._apply_erase_rect(x_r, rect)
+        # HFlip
+        if self.augment and self.hflip_p > 0.0:
+            if self.paired_hflip:
+                do_flip = (random.random() < self.hflip_p)
+                if do_flip:
+                    img_l = TF.hflip(img_l)
+                    img_r = TF.hflip(img_r)
+                    if self.enable_gaze and has_eye:
+                        g_l = self._hflip_gaze(g_l)
+                        g_r = self._hflip_gaze(g_r)
             else:
-                if self._coin(self.erase_p):
-                    _, H, W = x_l.shape
-                    rect = self._sample_erasing_rect(H, W)
-                    if rect is not None:
-                        x_l = self._apply_erase_rect(x_l, rect)
+                do_flip_l = (random.random() < self.hflip_p)
+                do_flip_r = (random.random() < self.hflip_p)
+                if do_flip_l:
+                    img_l = TF.hflip(img_l)
+                    if self.enable_gaze and has_eye:
+                        g_l = self._hflip_gaze(g_l)
+                if do_flip_r:
+                    img_r = TF.hflip(img_r)
+                    if self.enable_gaze and has_eye:
+                        g_r = self._hflip_gaze(g_r)
 
-                if self._coin(self.erase_p):
-                    _, H, W = x_r.shape
-                    rect = self._sample_erasing_rect(H, W)
-                    if rect is not None:
-                        x_r = self._apply_erase_rect(x_r, rect)
+        # Rotation
+        if self.augment and self.rot_deg > 0.0 and self.rot_p > 0.0:
+            if self.paired_rotation:
+                do_rot = (random.random() < self.rot_p)
+                if do_rot:
+                    ang = random.uniform(-self.rot_deg, self.rot_deg)
+                    img_l = TF.rotate(img_l, ang, interpolation=self.interpolation, expand=False, fill=0)
+                    img_r = TF.rotate(img_r, ang, interpolation=self.interpolation, expand=False, fill=0)
+                    if self.enable_gaze and has_eye:
+                        g_l = self._rotate_gaze(g_l, ang)
+                        g_r = self._rotate_gaze(g_r, ang)
+            else:
+                do_rot_l = (random.random() < self.rot_p)
+                do_rot_r = (random.random() < self.rot_p)
+                if do_rot_l:
+                    ang_l = random.uniform(-self.rot_deg, self.rot_deg)
+                    img_l = TF.rotate(img_l, ang_l, interpolation=self.interpolation, expand=False, fill=0)
+                    if self.enable_gaze and has_eye:
+                        g_l = self._rotate_gaze(g_l, ang_l)
+                if do_rot_r:
+                    ang_r = random.uniform(-self.rot_deg, self.rot_deg)
+                    img_r = TF.rotate(img_r, ang_r, interpolation=self.interpolation, expand=False, fill=0)
+                    if self.enable_gaze and has_eye:
+                        g_r = self._rotate_gaze(g_r, ang_r)
+
+        # Single crop per side (RandomResizedCrop-style), then resize to out_size
+        (il, jl, hl, wl), (ir, jr, hr, wr) = self._sample_crop_pair(img_l, img_r)
+
+        img_l = TF.resized_crop(img_l, il, jl, hl, wl, [self.out_size, self.out_size], interpolation=self.interpolation)
+        img_r = TF.resized_crop(img_r, ir, jr, hr, wr, [self.out_size, self.out_size], interpolation=self.interpolation)
+
+        if self.enable_gaze and has_eye:
+            g_l = TF.resized_crop(g_l, il, jl, hl, wl, [self.out_size, self.out_size], interpolation=InterpolationMode.BILINEAR)
+            g_r = TF.resized_crop(g_r, ir, jr, hr, wr, [self.out_size, self.out_size], interpolation=InterpolationMode.BILINEAR)
+
+        # Photometric
+        if self.augment:
+            if self.color_jitter is not None:
+                b, c, s, h = self.color_jitter
+                b = self._cj_range(b, is_hue=False)
+                c = self._cj_range(c, is_hue=False)
+                s = self._cj_range(s, is_hue=False)
+                h = self._cj_range(h, is_hue=True)
+
+                if (b is not None) or (c is not None) or (s is not None) or (h is not None):
+                    if self.paired_color_jitter:
+                        params = self._sample_color_jitter_params(b, c, s, h)
+                        img_l = self._apply_color_jitter(img_l, params)
+                        img_r = self._apply_color_jitter(img_r, params)
+                    else:
+                        params_l = self._sample_color_jitter_params(b, c, s, h)
+                        params_r = self._sample_color_jitter_params(b, c, s, h)
+                        img_l = self._apply_color_jitter(img_l, params_l)
+                        img_r = self._apply_color_jitter(img_r, params_r)
+
+
+            if self.gray_p > 0.0:
+                if self.paired_gray:
+                    do_gray = (random.random() < self.gray_p)
+                    if do_gray:
+                        img_l = TF.rgb_to_grayscale(img_l, num_output_channels=3)
+                        img_r = TF.rgb_to_grayscale(img_r, num_output_channels=3)
+                else:
+                    if random.random() < self.gray_p:
+                        img_l = TF.rgb_to_grayscale(img_l, num_output_channels=3)
+                    if random.random() < self.gray_p:
+                        img_r = TF.rgb_to_grayscale(img_r, num_output_channels=3)
+
+            if self.blur_p > 0.0:
+                if self.paired_color_jitter:
+                    do_blur = (random.random() < self.blur_p)
+                    if do_blur:
+                        sigma = random.uniform(self.blur_sigma[0], self.blur_sigma[1])
+                        blur = transforms.GaussianBlur(kernel_size=self.blur_kernel, sigma=(sigma, sigma))
+                        img_l = blur(img_l)
+                        img_r = blur(img_r)
+                else:
+                    if random.random() < self.blur_p:
+                        sigma_l = random.uniform(self.blur_sigma[0], self.blur_sigma[1])
+                        blur_l = transforms.GaussianBlur(kernel_size=self.blur_kernel, sigma=(sigma_l, sigma_l))
+                        img_l = blur_l(img_l)
+                    if random.random() < self.blur_p:
+                        sigma_r = random.uniform(self.blur_sigma[0], self.blur_sigma[1])
+                        blur_r = transforms.GaussianBlur(kernel_size=self.blur_kernel, sigma=(sigma_r, sigma_r))
+                        img_r = blur_r(img_r)
+
+        # ToTensor
+        x_l = TF.to_tensor(img_l)
+        x_r = TF.to_tensor(img_r)
+
+        # Erase
+        erase_rect_l = None
+        erase_rect_r = None
+        if self.augment:
+            if self.paired_erase:
+                rect = self._sample_erase_rect(self.out_size, self.out_size, self.erase_p, self.erase_scale, self.erase_ratio)
+                erase_rect_l = rect
+                erase_rect_r = rect
+            else:
+                erase_rect_l = self._sample_erase_rect(self.out_size, self.out_size, self.erase_p, self.erase_scale, self.erase_ratio)
+                erase_rect_r = self._sample_erase_rect(self.out_size, self.out_size, self.erase_p, self.erase_scale, self.erase_ratio)
+
+        if erase_rect_l is not None:
+            top, left, eh, ew = erase_rect_l
+            x_l[:, top:top + eh, left:left + ew] = 0.0
+        if erase_rect_r is not None:
+            top, left, eh, ew = erase_rect_r
+            x_r[:, top:top + eh, left:left + ew] = 0.0
 
         # Normalize
         x_l = TF.normalize(x_l, mean=self.mean, std=self.std)
         x_r = TF.normalize(x_r, mean=self.mean, std=self.std)
 
-        # Finalize sample
         sample["image_l"] = x_l
         sample["image_r"] = x_r
-        sample["score_r"] = torch.tensor(int(score_r), dtype=torch.long)
-        sample["score_c"] = torch.tensor(int(score_c), dtype=torch.long)
+
+        # Gaze output
+        if self.enable_gaze:
+            if (not has_eye) or (g_l is None) or (g_r is None):
+                sample["gaze_l"] = torch.zeros((1, *self.gaze_grid_size), dtype=torch.float32)
+                sample["gaze_r"] = torch.zeros((1, *self.gaze_grid_size), dtype=torch.float32)
+            else:
+                g_l = self._downsample_gaze_to_grid(g_l)
+                g_r = self._downsample_gaze_to_grid(g_r)
+
+                gh, gw = self.gaze_grid_size
+                if erase_rect_l is not None:
+                    top, left, eh, ew = erase_rect_l
+                    y0 = int(math.floor(top * gh / self.out_size))
+                    x0 = int(math.floor(left * gw / self.out_size))
+                    y1 = int(math.ceil((top + eh) * gh / self.out_size))
+                    x1 = int(math.ceil((left + ew) * gw / self.out_size))
+                    y0 = max(0, min(gh, y0))
+                    y1 = max(0, min(gh, y1))
+                    x0 = max(0, min(gw, x0))
+                    x1 = max(0, min(gw, x1))
+                    if y1 > y0 and x1 > x0:
+                        g_l[:, y0:y1, x0:x1] = 0.0
+
+                if erase_rect_r is not None:
+                    top, left, eh, ew = erase_rect_r
+                    y0 = int(math.floor(top * gh / self.out_size))
+                    x0 = int(math.floor(left * gw / self.out_size))
+                    y1 = int(math.ceil((top + eh) * gh / self.out_size))
+                    x1 = int(math.ceil((left + ew) * gw / self.out_size))
+                    y0 = max(0, min(gh, y0))
+                    y1 = max(0, min(gh, y1))
+                    x0 = max(0, min(gw, x0))
+                    x1 = max(0, min(gw, x1))
+                    if y1 > y0 and x1 > x0:
+                        g_r[:, y0:y1, x0:x1] = 0.0
+
+                sample["gaze_l"] = g_l
+                sample["gaze_r"] = g_r
+
         return sample
-
-
-        
