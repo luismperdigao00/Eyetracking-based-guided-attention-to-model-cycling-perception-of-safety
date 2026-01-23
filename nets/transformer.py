@@ -745,7 +745,6 @@ class Transformer(nn.Module):
     
                 return out
     
-            # No args/kwargs: we can fully reproduce timm Attention and store attention
             try:
                 if x.ndim != 3:
                     return _orig(x, *args, **kwargs)
@@ -827,7 +826,6 @@ class Transformer(nn.Module):
         if len(self._attn_mats) == 0:
             return None
     
-        # We want stable rollout when we backprop through attention
         use_fp32 = bool(self.gaze_requires_grad and self.training)
     
         device = feats_for_dtype.device
@@ -1016,7 +1014,7 @@ class Transformer(nn.Module):
         finally:
             self._active_attn_sink = None
             self._active_last_attn = None
-            # DO NOT force gaze_requires_grad=False here
+
     
         pooled = self._extract_features(feats)
         score = self._rank_score(pooled)
@@ -1071,8 +1069,7 @@ class Transformer(nn.Module):
 
     def remove_attention_hooks(self) -> None:
         """
-        Restore original forward() methods for any attention modules we monkeypatched.
-        Safe to call multiple times.
+        Restore original forward() methods.
         """
         if not self._original_attn_forwards:
             self._attn_hooked = False
@@ -1088,5 +1085,4 @@ class Transformer(nn.Module):
         self._original_attn_forwards.clear()
         self._attn_hooked = False
     
-        # Optional: clear caches too
         self._reset_attention_cache()

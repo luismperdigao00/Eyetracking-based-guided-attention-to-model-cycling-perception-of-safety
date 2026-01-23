@@ -20,7 +20,7 @@ parameters:
   cuda:
     value: true
   cuda_id:
-    value: 1
+    value: 0
   amp:
     value: false
   
@@ -37,7 +37,7 @@ parameters:
     value: true
 
   dataset:
-    value: images/
+    value: images/printart/subjectivesafety_images/
   model_dir:
     value: models
   comparisons:
@@ -53,7 +53,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: berlin
+    value: "berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -120,7 +120,7 @@ parameters:
   # G) Optimizer
   # ---------------------------------------------------------------------------
   base_lr:
-    values: [4e-5]
+    values: [2e-5]
   backbone_lr_scale:
     value: 1
   weight_decay:

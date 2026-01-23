@@ -11,24 +11,39 @@ import pickle
 import pandas as pd
 import numpy as np
 import wandb
-from data import (
-    ComparisonsDataset,
-    _get_interp_mode,
-    build_eval_transforms,
-    AUG_PRESETS,
-    Augmentation,
-)
 
 from train_utils import (
     validate_and_normalize_args,
     resolve_backbone,
-    infer_vit_grid_size,
-    compute_class_weights_from_df,
-    print_run_plan,
     )
 
-import logging
-from datetime import date
+from train_main_utils import (
+    _seed_everything,
+    initialize_logging,
+    initialize_wandb,
+    read_data,
+    _boolish_series_to_bool_mask,
+    _ensure_dir,
+    _split_paths,
+    _load_or_create_splits,
+    _print_filtered_dataset_summary,
+    _print_image_overlap_stats,
+    _print_has_eyetracker_by_split,
+    _print_split_sizes,
+    _print_label_distribution_by_split,
+    _compute_and_attach_class_weights,
+    _parse_gpu_ids,
+    _select_device,
+    _load_state_dict_safely,
+    _resolve_gaze_grid,
+    _build_transforms_and_specs,
+    _build_dataloaders,
+    _build_model,
+    _maybe_wrap_dataparallel,
+    _maybe_resume,
+    _cleanup_between_trials,
+)
+
 from scripts.train_script import train
 import warnings
 import gc
@@ -37,10 +52,7 @@ from sklearn.model_selection import train_test_split, GroupShuffleSplit
 import os
 from torchvision import models
 from typing import Tuple, Dict, Any, Iterable, Set, Optional
-#from __future__ import annotations
-#from typing import Tuple, Dict, Any, Set, Optional
-#import numpy as np
-#import pandas as pd
+
 
 warnings.filterwarnings("ignore")
 
@@ -291,748 +303,164 @@ def arg_parse():
     return parser
 
 
-def read_data(args):
-    # ------------------------------------------------------------------
-    # 0) LOAD
-    # ------------------------------------------------------------------
-    try:
-        comparisons_df = pickle.load(open(args.comparisons, "rb"))
-    except Exception:
-        comparisons_df = pd.read_pickle(args.comparisons)
 
-    print(f"[read_data] Loaded raw rows: {len(comparisons_df):,}")
-    print(f"[read_data] Raw columns: {list(comparisons_df.columns)}")
-
-    # ------------------------------------------------------------------
-    # 1) KEEP ONLY COLUMNS THAT EXIST
-    # ------------------------------------------------------------------
-    cols_we_need = [
-        "score",
-        "image_l", "image_r",
-        "dataset",
-        "has_eyetracker",
-        "npy_file_l", "npy_file_r",
-        "survey_id", "trial_id",
-    ]
-    existing_cols = [c for c in cols_we_need if c in comparisons_df.columns]
-    comparisons_df = comparisons_df[existing_cols].copy()
-
-    print(f"[read_data] Columns kept: {existing_cols}")
-    print(f"[read_data] Rows after column selection: {len(comparisons_df):,}")
-
-    # ------------------------------------------------------------------
-    # 2) CITY / DATASET FILTER
-    # ------------------------------------------------------------------
-    if "dataset" in comparisons_df.columns:
-        print("\n[read_data] Available datasets:")
-        print(comparisons_df["dataset"].value_counts())
-
-        cities_arg = getattr(args, "cities", "all")
-        if cities_arg.lower() != "all":
-            selected_cities = [c.strip() for c in cities_arg.split(",") if c.strip()]
-            print(f"\n[read_data] Filtering to cities: {selected_cities}")
-
-            before = len(comparisons_df)
-            comparisons_df = comparisons_df[
-                comparisons_df["dataset"].isin(selected_cities)
-            ].copy()
-            after = len(comparisons_df)
-
-            print(f"[read_data] Rows after city filter: {after}/{before}")
-            if after == 0:
-                print("[WARN] City filter removed all rows.")
-
-    # ------------------------------------------------------------------
-    # 3) IMAGE FILENAME NORMALIZATION
-    # ------------------------------------------------------------------
-    for side in ("image_l", "image_r"):
-        if side in comparisons_df.columns:
-            comparisons_df[side] = (
-                comparisons_df[side]
-                .astype(str)
-                .apply(lambda x: x if x.lower().endswith(".jpg") else f"{x}.jpg")
-            )
-
-    # ------------------------------------------------------------------
-    # 4) GAZE FLAG NORMALIZATION + FILTERING
-    # ------------------------------------------------------------------
-    if "has_eyetracker" in comparisons_df.columns:
-        comparisons_df["has_eyetracker"] = (
-            comparisons_df["has_eyetracker"]
-            .replace({"True": True, "False": False, "true": True, "false": False})
-            .fillna(False)
-            .astype(bool)
-        )
-
-        print(
-            "\n[read_data] has_eyetracker distribution:",
-            comparisons_df["has_eyetracker"].value_counts(dropna=False).to_dict(),
-        )
-
-        if args.gaze == "only":
-            before = len(comparisons_df)
-            comparisons_df = comparisons_df[comparisons_df["has_eyetracker"]].copy()
-            after = len(comparisons_df)
-
-            print(f"[read_data] Rows after gaze=only filter: {after}/{before}")
-            if after == 0:
-                print("[WARN] --gaze only removed all rows.")
-
-    # ------------------------------------------------------------------
-    # 5) LABEL HANDLING / TIES
-    # ------------------------------------------------------------------
-    if "score" not in comparisons_df.columns:
-        raise ValueError("[read_data] Missing required column: 'score'")
-
-    if not args.ties:
-        before = len(comparisons_df)
-        comparisons_df = comparisons_df[comparisons_df["score"] != 0].copy()
-        after = len(comparisons_df)
-
-        print(f"\n[read_data] Rows after ties=False filter: {after}/{before}")
-        if after == 0:
-            print("[WARN] ties=False removed all rows.")
-
-        comparisons_df["score_classification"] = comparisons_df["score"].replace(
-            {-1: 0, +1: 1}
-        )
-    else:
-        comparisons_df["score_classification"] = comparisons_df["score"] + 1
-
-    # ------------------------------------------------------------------
-    # 6) FINAL SANITY CHECK
-    # ------------------------------------------------------------------
-    print("\n[read_data] FINAL ROW COUNT:", len(comparisons_df))
-    if len(comparisons_df) > 0:
-        print(
-            "[read_data] Final score distribution:",
-            comparisons_df["score"].value_counts(dropna=False).to_dict(),
-        )
-    else:
-        print("[FATAL] Dataset is EMPTY after all filters.")
-
-    return comparisons_df
-
-
-
-def initialize_logging():
-    """Initialize run logs."""
-    if 'logs' not in os.listdir():
-        os.mkdir('logs')
-    logging.basicConfig(format='%(message)s', filename=f'logs/{date.today().strftime("%d-%m-%Y")}.log')
-    logger = logging.getLogger('timer')
-    logger.setLevel(logging.INFO)
-    #logger.info('HELLO')
-    return logger
-
-
-def initialize_wandb(args):
-    """Initialize WandB run logs."""
-    checkpoint_path = (
-        os.path.join(args.model_dir, f"{args.resume_checkpoint}")
-        if getattr(args, "resume_checkpoint", None)
-        else None
-    )
-
-    wandb.init(
-        project=args.wandb_project,
-        config={
-            "early_stop": getattr(args, "early_stop", False),
-            "early_stop_metric": getattr(args, "early_stop_metric", "accuracy_validation"),
-            "early_stop_mode": getattr(args, "early_stop_mode", "max"),
-            "early_stop_patience": getattr(args, "early_stop_patience", 3),
-            "early_stop_min_delta": getattr(args, "early_stop_min_delta", 0.0),
-            "early_stop_start_epoch": getattr(args, "early_stop_start_epoch", 1),
-            "dataset": args.comparisons,
-            "gaze_mode": args.gaze,
-            "ties": args.ties,
-            "ties_w": args.ties_w,
-            "rank_w": args.rank_w,
-            "rank_margin": args.ranking_margin,
-            "rank_margin_ties": args.ranking_margin_ties,
-            "seed": args.seed,
-            "epochs": args.max_epochs,
-            "batch_size": args.batch_size,
-            "architecture_backbone": args.backbone,
-            "architecture_model": args.model,
-            "finetune_backbone": args.finetune,
-            "num_ft_blocks": getattr(args, "num_ft_blocks", None),
-            "base_lr": args.base_lr,
-            "weight_decay": args.weight_decay,
-            #"backbone_lr_scale": getattr(args, "backbone_lr_scale", None),
-            "scheduler": args.scheduler,
-            "warmup_frac": getattr(args, "warmup_frac", None),
-            "eta_min": getattr(args, "eta_min", None),
-            "T_0": getattr(args, "T_0", None),
-            "T_mult": getattr(args, "T_mult", None),
-            "rank_dropout": getattr(args, "rank_dropout", None),
-            "cross_dropout": getattr(args, "cross_dropout", None),
-            "label_smoothing": getattr(args, "label_smoothing", None),
-            "use_class_weights": getattr(args, "use_class_weights", None),
-            "augment": args.augment,
-            "resume": args.resume,
-            "resume_epoch": args.epoch,
-            "checkpoint": checkpoint_path,
-        },
-    )
-
-    wandb.define_metric("iteration")
-    wandb.define_metric("epoch")
-    wandb.define_metric("loss_train", step_metric="iteration")
-    wandb.define_metric("loss_validation", step_metric="epoch")
-    wandb.define_metric("loss_test", step_metric="epoch")
-    wandb.define_metric("accuracy_validation", step_metric="epoch")
-    wandb.define_metric("accuracy_test", step_metric="epoch")
-    wandb.define_metric("max_accuracy_train", step_metric="epoch")
-    wandb.define_metric("max_accuracy_validation", step_metric="epoch")
-    wandb.define_metric("max_accuracy_test", step_metric="epoch")
-
+# -------------------------------------------------------------------------------------------------
+# Main entrypoint 
+# -------------------------------------------------------------------------------------------------
 
 def run_training_with_args(args, trial=None):
     """
-    Run ONE full training session given a filled args Namespace.
+    Runs one full training session given a filled args Namespace.
     Returns best validation accuracy from train().
     """
 
-    # Central consistency / dependency checks
+    # ==============================================================================================
+    # 0) ARG VALIDATION / NORMALIZATION
+    # ==============================================================================================
     validate_and_normalize_args(args, strict=False, verbose=True)
 
-    #args.batch_size = resolve_batch_size(args)
     print("=== Args ===")
     print(args, "\n")
 
-    # =============================================================================================== #
-    # 0) PARSE & SEED
-    # =============================================================================================== #
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # ==============================================================================================
+    # 1) REPRODUCIBILITY (SEEDS)
+    # ==============================================================================================
+    _seed_everything(args.seed)
 
-    # =============================================================================================== #
-    # 1) LOGGING / WANDB
-    # =============================================================================================== #
+    # ==============================================================================================
+    # 2) LOGGING / WANDB
+    # ==============================================================================================
     logger = initialize_logging()
-    if args.log_wandb:
+
+    if getattr(args, "log_wandb", False):
         initialize_wandb(args)
 
-    # =============================================================================================== #
-    # 2) DATA: LOAD + SUMMARIZE (POST-FILTERING, PRE-SPLIT)
-    # =============================================================================================== #
+    # ==============================================================================================
+    # 3) DATA INGESTION (POST-FILTERING, PRE-SPLIT)
+    # ==============================================================================================
     print("Reading input data...")
     comparisons_df = read_data(args)
 
-    # This summary is intentionally focused on "what data will be used from now on".
-    # (Detailed plan/architecture is printed later by RUN PLAN.)
-    print("\n=== Effective Dataset (after all filters, before split) ===")
-    print(f"Comparisons file : {args.comparisons}")
-    print(f"Cities requested : {args.cities}")
-    print(f"Gaze mode        : {args.gaze}  (rows kept depend on has_eyetracker + gaze setting)")
-    print(f"Ties enabled     : {args.ties}  (ties=False removes score==0 rows)")
-    print(f"Final row count  : {len(comparisons_df):,}")
+    # Summary describes the effective dataset used for splitting/training
+    _print_filtered_dataset_summary(args, comparisons_df)
 
-    # Score distribution AFTER filtering (this is the distribution it's suupose to train on)
-    if "score" in comparisons_df.columns:
-        print("\nScore distribution (post-filtering):")
-        score_counts = comparisons_df["score"].value_counts().sort_index()
-        total_rows = len(comparisons_df)
-        for s, c in score_counts.items():
-            print(f"  score={s:>2}: {c:>6,} ({(100.0*c/total_rows):5.2f}%)")
-
-    # Eyetracker availability AFTER filtering (helps explain what gaze mode kept/removed)
-    if "has_eyetracker" in comparisons_df.columns:
-        print("\nEyetracker availability (post-filtering):")
-        et_counts = comparisons_df["has_eyetracker"].value_counts(dropna=False)
-        for k, v in et_counts.items():
-            print(f"  {str(k):>5}: {v:>6,} ({(100.0*v/len(comparisons_df)):5.2f}%)")
-
-    # Minimal sanity peek (do not spam; run plan later covers the rest)
-    print("\nExample rows (post-filtering):")
-    print(comparisons_df.head(3))
-    print("========================================================\n")
-
-    # =============================================================================================== #
-    # 3) TRAIN/VAL/TEST SPLIT
-    # =============================================================================================== #
-    # Precomputed split loading
-    splits_dir = "splits_v4"
-    os.makedirs(splits_dir, exist_ok=True)
-    
-    split_prefix = os.path.splitext(os.path.basename(args.comparisons))[0]
-    train_path = os.path.join(splits_dir, f"{split_prefix}_train.pkl")
-    val_path   = os.path.join(splits_dir, f"{split_prefix}_val.pkl")
-    test_path  = os.path.join(splits_dir, f"{split_prefix}_test.pkl")
-    
-    if os.path.exists(train_path) and os.path.exists(val_path) and os.path.exists(test_path):
-        X_train = pd.read_pickle(train_path)
-        X_val   = pd.read_pickle(val_path)
-        X_test  = pd.read_pickle(test_path)
-    
-        print("\n[SPLITS] Loaded precomputed train/val/test splits:")
-        print(" -", train_path)
-        print(" -", val_path)
-        print(" -", test_path)
-    else:
-        # Fallback to the current random split
-        X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
-        X_train, X_val  = train_test_split(X_train,        test_size=0.13, random_state=args.seed)
-    
-        X_train.to_pickle(train_path)
-        X_val.to_pickle(val_path)
-        X_test.to_pickle(test_path)
-    
-        print("\n[SPLITS] Saved train/val/test splits:")
-        print(" -", train_path)
-        print(" -", val_path)
-        print(" -", test_path)
-        
-    a, b = "image_l", "image_r"
-    
-    tr = set(pd.concat([X_train[a].astype(str), X_train[b].astype(str)], ignore_index=True))
-    va = set(pd.concat([X_val[a].astype(str),   X_val[b].astype(str)], ignore_index=True))
-    te = set(pd.concat([X_test[a].astype(str),  X_test[b].astype(str)], ignore_index=True))
-    
-    print("train∩val :", len(tr & va))
-    print("train∩test:", len(tr & te))
-    print("val∩test  :", len(va & te))
-
-    # --- has_eyetracker counts per split ---
-    if "has_eyetracker" in comparisons_df.columns:
-        def _eyetrack_counts(df_):
-            s = df_["has_eyetracker"]
-            # robust to bool / int / float / strings
-            s = s.astype(str).str.lower().str.strip().isin(["1", "true", "t", "yes", "y"])
-            n_true = int(s.sum())
-            n_total = len(df_)
-            return n_true, n_total, (n_true / max(1, n_total))
-    
-        tr_n, tr_tot, tr_rate = _eyetrack_counts(X_train)
-        va_n, va_tot, va_rate = _eyetrack_counts(X_val)
-        te_n, te_tot, te_rate = _eyetrack_counts(X_test)
-    
-        print("\nhas_eyetracker per split:")
-        print(f"  Train: {tr_n}/{tr_tot} = {tr_rate:.2%}")
-        print(f"  Val  : {va_n}/{va_tot} = {va_rate:.2%}")
-        print(f"  Test : {te_n}/{te_tot} = {te_rate:.2%}")
-    else:
-        print("\nColumn 'has_eyetracker' not found in comparisons_df.")
-    
-    total = len(comparisons_df)
-    print("=== Splits (on the filtered dataset above) ===")
-    print(f"- Train: {len(X_train):,}  [{len(X_train)/total:.2%}]")
-    print(f"- Val  : {len(X_val):,}  [{len(X_val)/total:.2%}]")
-    print(f"- Test : {len(X_test):,}  [{len(X_test)/total:.2%}]")
-    print("========================================================\n")
-    
-    # =============================================================================================== #
-    # 3b) LABEL DISTRIBUTION PER SPLIT + CLASS WEIGHTS (TRAIN ONLY)
-    # =============================================================================================== #
-    print("=== Label distribution per split (score, after filtering) ===")
-    for part_name, df in [("Train", X_train), ("Val", X_val), ("Test", X_test)]:
-        counts = df["score"].value_counts().sort_index()
-        total_part = len(df)
-        print(f"- {part_name}: {total_part:,} samples")
-        for cls_val, cls_count in counts.items():
-            pct = 100.0 * cls_count / total_part
-            print(f"    score={cls_val:>2d}: {cls_count:>6,} ({pct:5.2f}%)")
-    print("============================================================")
-
-    # Class weights are computed ONLY from the training split
-    args.class_weights = compute_class_weights_from_df(
-        X_train["score_classification"],
-        use_ties=args.ties,
-        enable_weights=args.use_class_weights,
+    # ==============================================================================================
+    # 4) TRAIN / VAL / TEST SPLITS
+    # ==============================================================================================
+    X_train, X_val, X_test = _load_or_create_splits(
+        df=comparisons_df,
+        seed=args.seed,
+        comparisons_path=args.comparisons,
+        splits_dir="parvo",
+        test_size=0.20,
+        val_size_of_train=0.13,
     )
 
-    # Optional: a compact confirmation (no duplication with RUN PLAN)
-    if args.use_class_weights and args.class_weights is not None:
-        cw = args.class_weights.detach().cpu().numpy().tolist()
-        print(f"Class weights: ON  (computed from Train split) → {cw}")
-    else:
-        print("Class weights: OFF")
-    print()
+    # Sanity checks: image overlap and optional eyetracker balance across splits
+    _print_image_overlap_stats(X_train, X_val, X_test)
+    _print_has_eyetracker_by_split(X_train, X_val, X_test)
+    _print_split_sizes(comparisons_df, X_train, X_val, X_test)
 
-    # =============================================================================================== #
-    # 4) TRANSFORMS & MODEL CONFIG
-    # =============================================================================================== #
-    # Transformer backbones:
-    #   - resolve backbone + timm preprocessing specs
-    #   - infer ViT token grid size for gaze alignment (or override via --gaze_map_size)
-    #
-    # CNN backbones:
-    #   - use fixed ImageNet-style SPECS (no timm resolve, no grid inference)
-    # =============================================================================================== #
-    
-    # ------BACKBONE FAMILIES--------
-    TRANSFORMER_BACKBONES = [
-        "dinov3_vitb16",
-        "beitv2_base_patch16_224",
-        "deit3_base_patch16_224",
-        "siglip_base_patch16_224",
-        "vit_base_patch16_clip_224",
-        "dinov2_base",
-        "dinov2_reg_base",
-        "eva02_base",
-        "vit_base_patch16_224",
-        "vit_base_dino",
-        "vit_small",
-        "deit_base",
-        "deit_small",
-        "deit_tiny",
-        "deit_base_distilled",
-    ]
-    
-    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
-    is_cnn_backbone = str(args.backbone).lower().strip() in CNN_BACKBONES
-    
-    # Fixed preprocessing for CNNs (exactly as requested)
-    SPECS = {
-        "input_size": (3, 224, 224),
-        "crop_pct": 0.875,
-        "mean": (0.485, 0.456, 0.406),
-        "std": (0.229, 0.224, 0.225),
-        "interpolation": "bilinear",
-    }
-    
-    # 1) Resolve specs + (optionally) build transformer backbone for grid inference
-    if is_cnn_backbone:
-        backbone_model = None  # CNN path later uses torchvision models; no ViT grid exists here
-        model_specs = {
-            "alias": args.backbone,
-            "timm_id": None,
-            **SPECS,
-            "img_size": int(SPECS["input_size"][-1]),
-        }
-    
-        # For CNNs we cannot infer a token grid; use CLI override if provided,
-        # otherwise default to 14 (works with your gaze folders like 14x14 by default).
-        if str(args.gaze_map_size).lower() != "auto":
-            forced = int(args.gaze_map_size)
-            grid_h, grid_w = forced, forced
-        else:
-            grid_h, grid_w = 14, 14
-    
-    else:
-        # Transformer path: resolve backbone + preprocessing specs once
-        backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
-    
-        # Determine gaze grid size from patch embedding
-        grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
-    
-        # Optional override from CLI
-        if str(args.gaze_map_size).lower() != "auto":
-            forced = int(args.gaze_map_size)
-            grid_h, grid_w = forced, forced
-    
-    args.gaze_grid_size = (int(grid_h), int(grid_w))
-    args.gaze_map_size_int = int(grid_h)
-    
-    # 2) Decide whether gaze is enabled for alignment / supervision
-    use_gaze_requested = (str(args.gaze).lower().strip() != "off")
-    
-    # Keep model-specific gaze-loss logic (independent of transform policy)
-    use_gaze_loss = (
-        args.model == "rsscnn"
-        and use_gaze_requested
-        and float(args.attn_w) > 0.0
+    # ==============================================================================================
+    # 5) LABEL DISTRIBUTION + CLASS WEIGHTS (TRAIN ONLY)
+    # ==============================================================================================
+    _print_label_distribution_by_split(X_train, X_val, X_test)
+    _compute_and_attach_class_weights(args, X_train)
+
+    # ==============================================================================================
+    # 6) BACKBONE RESOLUTION + TRANSFORMS
+    # ==============================================================================================
+    # Returns:
+    #  - backbone_model / model_specs: resolved backbone + preprocessing specs
+    #  - train_tfms / eval_tfms: training/eval transform pipelines
+    #  - use_gaze_requested: whether gaze mode is enabled (args.gaze != "off")
+    #  - use_gaze_loss: whether attention/gaze supervision is active for the chosen model config
+    #  - is_cnn_backbone: whether the backbone family uses torchvision CNN path
+    backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone = (
+        _build_transforms_and_specs(args)
     )
-    
-    # 3) Build eval transforms (always deterministic; optionally align gaze)
-    eval_tfms, eval_meta = build_eval_transforms(
-        model_specs,
-        gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=use_gaze_requested,
-    )
-    
-    # 4) Build training transforms
-    augment_level = str(getattr(args, "augment", "none")).lower().strip()
-    if augment_level not in ("none", "light", "heavy"):
-        augment_level = "none"
-    
-    if augment_level == "none":
-        train_tfms = eval_tfms
-        train_meta = {
-            "train_policy": "deterministic (same as eval)",
-            "augment": "none",
-        }
-    else:
-        preset = AUG_PRESETS[augment_level]
-        train_tfms = Augmentation(
-            augment=True,
-            ties=bool(getattr(args, "ties", True)),
-            resize_short=int(eval_meta["resize_dim"]),
-            out_size=int(eval_meta["target_crop"]),
-            interpolation=_get_interp_mode(eval_meta["interpolation"]),
-            mean=tuple(eval_meta["mean"]),
-            std=tuple(eval_meta["std"]),
-    
-            #enable gaze-aware augmentation when gaze is not off
-            enable_gaze=use_gaze_requested,
-            gaze_grid_size=tuple(args.gaze_grid_size),
-    
-            **preset,
-        )
-        train_meta = {
-            "train_policy": f"pairwise augmentation ({augment_level})",
-            "augment": augment_level,
-            "gaze_aware": bool(use_gaze_requested),
-            "params": dict(preset),
-        }
 
-    # Expected model image size (for logging / checks)
-    args.expected_img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
-    
-    # Record transform configuration for reproducibility
-    args.transforms_meta = {
-        "backbone": args.backbone,
-        "backbone_family": "cnn" if is_cnn_backbone else "transformer",
-        "model_specs": dict(model_specs),
-        "gaze": {
-            "requested": bool(use_gaze_requested),
-            "use_gaze_loss": bool(use_gaze_loss),
-            "grid_size": tuple(args.gaze_grid_size),
-        },
-        "eval": dict(eval_meta),
-        "train": dict(train_meta),
-        "train_transform_class": train_tfms.__class__.__name__,
-        "eval_transform_class": eval_tfms.__class__.__name__,
-    }
-
-
-    # =============================================================================================== #
-    # 5) DATA LOADERS
-    # =============================================================================================== #
-    use_gaze = (args.gaze != "off")
-
-    train_set = ComparisonsDataset(
-        dataframe=X_train,
-        root_dir=args.dataset,
-        transform=train_tfms,
+    # ==============================================================================================
+    # 7) DATALOADERS
+    # ==============================================================================================
+    train_loader, val_loader, test_loader = _build_dataloaders(
+        args=args,
         logger=logger,
-        gaze_root=args.gaze_root,
-        use_gaze=use_gaze,
-        use_seg=args.use_seg,
-        map_size=args.gaze_map_size_int,
-        gaze_subdir_fmt=args.gaze_subdir_fmt,
-    )
-    
-    val_set = ComparisonsDataset(
-        dataframe=X_val,
-        root_dir=args.dataset,
-        transform=eval_tfms,
-        logger=logger,
-        gaze_root=args.gaze_root,
-        use_gaze=use_gaze,
-        use_seg=args.use_seg,
-        map_size=args.gaze_map_size_int,
-        gaze_subdir_fmt=args.gaze_subdir_fmt,
-    )
-    
-    test_set = ComparisonsDataset(
-        dataframe=X_test,
-        root_dir=args.dataset,
-        transform=eval_tfms,
-        logger=logger,
-        gaze_root=args.gaze_root,
-        use_gaze=use_gaze,
-        use_seg=args.use_seg,
-        map_size=args.gaze_map_size_int,
-        gaze_subdir_fmt=args.gaze_subdir_fmt,
-    )
-
-
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
-
-    # =============================================================================================== #
-    # 6) DEVICE & MODEL
-    # =============================================================================================== #
-    # Define cpu/gpu device
-    if args.cuda:
-        assert torch.cuda.is_available(), "ERROR: --cuda was passed but CUDA is not available."
-        if args.multi_gpu:
-            gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip() != ""]
-            assert len(gpu_ids) >= 2, "--multi_gpu requires at least 2 GPU ids, e.g. --gpu_ids 0,1"
-            device = torch.device(f"cuda:{gpu_ids[0]}")
-        else:
-            device = torch.device(f"cuda:{args.cuda_id}")
-    else:
-        device = torch.device("cpu")
-    print("Device:", device)
-    
-    # ---------------------------------------------------------------------------
-    # Gaze-loss switch 
-    # ---------------------------------------------------------------------------
-    use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and float(getattr(args, "attn_w", 0.0) or 0.0) > 0.0)
-    
-    # TRANSFORMER PATH
-    if args.backbone in TRANSFORMER_BACKBONES:
-        print(f"Using TRANSFORMER architecture: {args.backbone}")
-        from nets.transformer import Transformer as Net
-    
-        # Instantiate the Siamese Transformer Wrapper
-        net = Net(
-            backbone=backbone_model,
-            model=args.model,
-            # Pooling & Architecture
-            pooling=getattr(args, "pooling", "cls"),
-            pool_k=getattr(args, "pool_k", 10),
-            num_classes=3 if args.ties else 2,
-            # Training Dynamics
-            finetune=args.finetune,
-            num_ft_blocks=args.num_ft_blocks,
-            rank_dropout=args.rank_dropout,
-            cross_dropout=args.cross_dropout,
-            # Gaze & Attention
-            use_attn_hook=use_gaze_loss,
-            return_attn=use_gaze_loss,
-            attention_mode=args.attention_mode,
-            attn_topk=args.attn_topk,
-            attn_out_hw=tuple(args.gaze_grid_size),
-        )
-    
-        # If the Transformer wrapper uses this flag, keep it consistent
-        net.attn_grad = use_gaze_loss
-    
-        # -----------------------------------------------------------------------
-        # ensure attention map resolution == gaze map resolution
-        # -----------------------------------------------------------------------
-        if use_gaze_loss:
-            if not hasattr(args, "gaze_grid_size") or args.gaze_grid_size is None:
-                raise ValueError(
-                    "args.gaze_grid_size is missing. "
-                    "You must compute gaze_grid_size (e.g., (14,14) or (16,16)) before model creation."
-                )
-    
-            # Update attn_cfg.out_hw if the Transformer has an AttnConfig dataclass
-            try:
-                from dataclasses import replace
-                if hasattr(net, "attn_cfg"):
-                    net.attn_cfg = replace(net.attn_cfg, out_hw=tuple(args.gaze_grid_size))
-            except Exception as e:
-                raise RuntimeError(f"Failed to set net.attn_cfg.out_hw to gaze_grid_size={args.gaze_grid_size}: {e}")
-    
-    elif args.backbone in CNN_BACKBONES:
-        print(f"Using CNN architecture: {args.backbone}")
-        from nets.cnn import CNN as Net
-        from torchvision import models
-    
-        cnn_factory = {
-            "alex": models.alexnet,
-            "vgg": models.vgg19,
-            "dense": models.densenet121,
-            "resnet": models.resnet50,
-        }
-    
-        flatten_spatial = (getattr(args, "cnn_pool", "gap") == "flatten")
-    
-        net = Net(
-            backbone=cnn_factory[args.backbone],
-            model=args.model,
-            finetune=args.finetune,
-            num_classes=3 if args.ties else 2,
-            flatten_spatial=flatten_spatial,
-            flat_dim_override=None,  # scratch training: no ckpt inference
-            gaze_grid_size=getattr(args, "gaze_grid_size", (14, 14))[0] if hasattr(args, "gaze_grid_size") else 14,
-        )
-    
-        #print(f"[CNN] cnn_pool={args.cnn_pool} -> flatten_spatial={flatten_spatial}, flat_dim={net.flat_dim}")
-
-    
-    else:
-        known_models = TRANSFORMER_BACKBONES + CNN_BACKBONES
-        raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known_models}")
-    
-    # Move to device
-    net.to(device)
-    
-    # DataParallel (after moving to device)
-    if args.cuda and args.multi_gpu:
-        net = torch.nn.DataParallel(net, device_ids=gpu_ids)
-        print(f"[DataParallel] Using GPUs: {gpu_ids} (primary cuda:{gpu_ids[0]})")
-    
-    # Resume 
-    if args.resume:
-        print("\nResuming training.")
-        checkpoint_name = os.path.join(args.model_dir, f"{args.resume_checkpoint}")
-        print("Loading model:", checkpoint_name)
-    
-        state = torch.load(checkpoint_name, map_location=device)
-        is_dp = isinstance(net, torch.nn.DataParallel)
-    
-        if not is_dp and any(k.startswith("module.") for k in state.keys()):
-            state = {k.replace("module.", "", 1): v for k, v in state.items()}
-    
-        if is_dp and not any(k.startswith("module.") for k in state.keys()):
-            state = {f"module.{k}": v for k, v in state.items()}
-    
-        net.load_state_dict(state, strict=True)
-        print()
-
-    # =============================================================================================== #
-    # 7) RUN PLAN (centralized)
-    # =============================================================================================== #
-    """    
-    print_run_plan(
-        args,
-        train_df=X_train,
-        val_df=X_val,
-        test_df=X_test,
-        train_loader=train_loader,
-        val_loader=val_loader,
+        X_train=X_train,
+        X_val=X_val,
+        X_test=X_test,
         train_tfms=train_tfms,
         eval_tfms=eval_tfms,
-        model=net,
-        optimizer=None,
-        scheduler=None,
     )
-    """
 
-    # =============================================================================================== #
-    # 8) TRAIN
-    # =============================================================================================== #
+    # ==============================================================================================
+    # 8) DEVICE SELECTION
+    # ==============================================================================================
+    # Returns:
+    #  - device: torch.device('cpu') or torch.device('cuda:n')
+    #  - gpu_ids: list of GPU ids for DataParallel when enabled
+    device, gpu_ids = _select_device(args)
+    print("Device:", device)
+
+    # ==============================================================================================
+    # 9) MODEL INSTANTIATION
+    # ==============================================================================================
+    # Transformer path uses resolved backbone_model.
+    # CNN path uses torchvision factory inside _build_model.
+    net = _build_model(
+        args=args,
+        backbone_model=backbone_model,
+        use_gaze_loss=use_gaze_loss,
+        is_cnn_backbone=is_cnn_backbone,
+    )
+
+    # Move model parameters to the selected device before wrapping
+    net.to(device)
+
+    # Optional DataParallel wrapper for multi-GPU
+    net = _maybe_wrap_dataparallel(args, net, gpu_ids)
+
+    # Optional checkpoint restore (handles DP/non-DP key formats)
+    _maybe_resume(args, net, device)
+
+    # ==============================================================================================
+    # 10) WANDB RUN NAME (OPTIONAL)
+    # ==============================================================================================
     run_name = ""
-    if args.log_wandb and wandb.run is not None:
+    if getattr(args, "log_wandb", False) and wandb is not None and wandb.run is not None:
         run_name = wandb.run.name
+
     print("\n[Wandb]")
     print(f"  Run Name     : {run_name}")
-    
+
     if trial is not None:
         trial.set_user_attr("wandb_run_name", run_name)
 
+    # ==============================================================================================
+    # 11) TRAIN LOOP
+    # ==============================================================================================
     best_val_acc = train(
-        device,
-        net,
-        train_loader,
-        val_loader,
-        test_loader,
-        args,
-        logger,
+        device=device,
+        net=net,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        args=args,
+        logger=logger,
         trial=trial,
         train_df=X_train,
         val_df=X_val,
         test_df=X_test,
-        train_tfms=train_tfms,   
+        train_tfms=train_tfms,
         eval_tfms=eval_tfms,
     )
-    
-    net_for_hooks = net.module if isinstance(net, torch.nn.DataParallel) else net
-    if hasattr(net_for_hooks, "remove_attention_hooks"):
-        net_for_hooks.remove_attention_hooks()
 
-
-    # -------- GPU / memory cleanup BETWEEN trials --------
-    try:
-        del net
-        del train_loader, val_loader, test_loader
-    except NameError:
-        pass
-
-    gc.collect()
-    if args.cuda and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # ==============================================================================================
+    # 12) CLEANUP (BETWEEN TRIALS / RUNS)
+    # ==============================================================================================
+    _cleanup_between_trials(args, net, train_loader, val_loader, test_loader)
 
     return best_val_acc
-
 
 if __name__ == "__main__":
     args = arg_parse().parse_args()

@@ -471,7 +471,7 @@ AUG_PRESETS = {
         "paired_hflip": True,
         "paired_crop": True,
         "paired_rotation": True,
-        "paired_color_jitter": False,
+        "paired_color_jitter": True,
         "paired_gray": True,
         "paired_erase": True,
 
@@ -743,9 +743,6 @@ class Augmentation:
 
         return None
 
-
-
-    
     @staticmethod
     def _sample_crop_hw(H: int, W: int, scale_range, ratio_range):
         area = H * W

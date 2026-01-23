@@ -208,6 +208,7 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     p.add_argument("--cnn_pool", type=str)  # only relevant for CNN backbones
 
+
     known, _unknown = p.parse_known_args(train_cli_args)
 
     for k, v in vars(known).items():
@@ -383,18 +384,22 @@ def build_model(args):
 
     if args.backbone in CNN_BACKBONES:
         from nets.cnn import CNN as Net
-
+    
         cnn_backbones = {
             "alex": tv_models.alexnet,
             "vgg": tv_models.vgg19,
             "dense": tv_models.densenet121,
             "resnet": tv_models.resnet50,
         }
+    
+        flatten_spatial = (getattr(args, "cnn_pool", "gap") == "flatten")
+    
         return Net(
             backbone=cnn_backbones[args.backbone],
             model=args.model,
             finetune=args.finetune,
             num_classes=3 if args.ties else 2,
+            flatten_spatial=flatten_spatial,
         )
 
     raise ValueError(f"Unknown backbone: {args.backbone}")
@@ -502,6 +507,9 @@ def parse_args():
     
     p.add_argument("--gaze_map_size", default="auto", help="Gaze folder size: 'auto' or integer (e.g., 14, 16).")
     p.add_argument("--gaze_subdir_fmt", type=str, default="{s}x{s}", help="Gaze subdir format under gaze_root.")
+
+    p.add_argument("--cnn_pool",type=str,default="flatten",choices=["gap", "flatten"],help="CNN feature pooling: gap (global average pool) or flatten (flatten spatial grid).",)
+
 
     # --- ADDED Missing Pooling Arguments ---
     p.add_argument(

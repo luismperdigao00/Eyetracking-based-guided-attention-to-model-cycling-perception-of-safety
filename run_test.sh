@@ -10,11 +10,9 @@ VENV_PATH=".venv"
 # ----------------------------------
 # Test configuration
 # ----------------------------------
-RUN_NAME="dw1th1vv"
-CHECKPOINT="confused-sweep-2_best_model_8_0.7899.pt"
-#CHECKPOINT="quiet-sweep-2_best_model_3_0.7382.pt"   #"vgg_syn+ber.pt" #fluent-sweep-18_model_2_0.7382.pt"
-#CHECKPOINT="resilient-sweep-3_best_model_5_0.7333.pt" #GAZE
-#TEST_SET="splits/comparisons_df_test.pkl"
+RUN_NAME="61441nj1"
+CHECKPOINT="crimson-sweep-3_best_model_5_0.7689.pt"
+#TEST_SET="comparisons_df_with_synthetic_berlin.pickle"
 TEST_SET="build_datasets/comparisons_tests.pkl"
 
 PYTHON_SCRIPT="test.py"
@@ -33,18 +31,47 @@ source "$VENV_PATH/bin/activate"
 # Run test (CORRECT ARGS)
  #--wandb_run_id "$RUN_NAME" \
 # ----------------------------------
+
 python "$PYTHON_SCRIPT" \
     --comparisons "$TEST_SET" \
     --dataset images/printart/subjectivesafety_images \
-    --cities "all" \
+    --cities "berlin" \
     --wandb_run_id "$RUN_NAME" \
     --checkpoint "$CHECKPOINT" \
     --cuda \
-    --cuda_id 0
+    --cuda_id 1
 
 echo "Test finished: $RUN_NAME ($TEST_SET)"
 
+#python "$PYTHON_SCRIPT" \
+#    --comparisons "$TEST_SET" \
+#    --dataset images/printart/subjectivesafety_images \
+#    --cities berlin \
+#    --cnn_pool "flatten" \
 #    --backbone "vgg" \
+#    --checkpoint "vgg_syn+ber.pt" \
 #    --model rsscnn \
-#    --gaze off \
+#    --gaze "off" \
 #    --ties \
+#    --cuda \
+#    --cuda_id 0
+
+#python "$PYTHON_SCRIPT" \
+#    --comparisons "$TEST_SET" \
+#    --dataset images/printart/subjectivesafety_images \
+#    --cities "paris, barcelona, munich" \
+#    --wandb_run_id "$RUN_NAME" \
+#    --checkpoint "$CHECKPOINT" \
+#    --cuda \
+#    --cuda_id 0
+
+
+#BEST NON GAZE:
+#RUN_NAME="mbg8xvwg"
+#CHECKPOINT="lemon-sweep-1_best_model_10_0.7847.pt"
+#Best gaze:
+#RUN_NAME="dw1th1vv"
+#CHECKPOINT="confused-sweep-2_best_model_8_0.7899.pt"
+
+#RUN_NAME="rwoa07zg"
+#CHECKPOINT="divine-sweep-1_best_model_6_0.8021.pt"
