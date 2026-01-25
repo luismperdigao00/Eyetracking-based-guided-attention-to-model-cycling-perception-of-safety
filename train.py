@@ -25,7 +25,7 @@ from train_main_utils import (
     _boolish_series_to_bool_mask,
     _ensure_dir,
     _split_paths,
-    _load_or_create_splits,
+    _load_or_split,
     _print_filtered_dataset_summary,
     _print_image_overlap_stats,
     _print_has_eyetracker_by_split,
@@ -347,14 +347,17 @@ def run_training_with_args(args, trial=None):
     # ==============================================================================================
     # 4) TRAIN / VAL / TEST SPLITS
     # ==============================================================================================
-    X_train, X_val, X_test = _load_or_create_splits(
+    X_train, X_val, X_test = _load_or_split(
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir="parvo",
-        test_size=0.20,
-        val_size_of_train=0.13,
+        splits_dir="nahs",
+        train_pct=0.95,
+        val_pct=0.0025,
+        test_pct=0.0475,
+        load_if_exists=True,   # loads if files exist, otherwise splits
     )
+
 
     # Sanity checks: image overlap and optional eyetracker balance across splits
     _print_image_overlap_stats(X_train, X_val, X_test)

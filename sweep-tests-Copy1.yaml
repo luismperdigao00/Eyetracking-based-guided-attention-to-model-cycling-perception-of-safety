@@ -53,7 +53,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: "berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
+    value: "berlin"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -63,7 +63,7 @@ parameters:
   ties:
     value: false
   gaze:
-    values: ["off", "use"]
+    values: ["off"]
 
   # ---------------------------------------------------------------------------
   # D) Backbone & Architecture
@@ -166,7 +166,7 @@ parameters:
   # J) Augmentation
   # ---------------------------------------------------------------------------
   augment:
-    values: ["heavy", "none"]
+    values: ["heavy"]
   use_seg:
     value: false
 
@@ -180,7 +180,7 @@ parameters:
   # L) Early stopping
   # ---------------------------------------------------------------------------
   early_stop:
-    value: true
+    value: false
   early_stop_metric:
     value: loss_validation
   early_stop_mode:

@@ -476,7 +476,7 @@ AUG_PRESETS = {
         "paired_erase": True,
 
         "swap_p": 0.50,
-        "hflip_p": 0.50,
+        "hflip_p": 0.30,
         "rot_deg": 3.0,
         "rot_p": 0.10,
 
@@ -485,11 +485,11 @@ AUG_PRESETS = {
 
         "color_jitter": (0.20, 0.20, 0.20, 0.03),
         "gray_p": 0.01,
-        "blur_p": 0.3,
+        "blur_p": 0.2,
         "blur_kernel": 23,
-        "blur_sigma": (0.1, 2.0),
+        "blur_sigma": (0.75, 2.0),
 
-        "erase_p": 0.1,
+        "erase_p": 0.04,
         "erase_scale": (0.02, 0.08),
         "erase_ratio": (0.3, 3.3),
     },

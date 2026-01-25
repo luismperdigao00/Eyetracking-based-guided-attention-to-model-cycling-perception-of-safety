@@ -10,10 +10,12 @@ VENV_PATH=".venv"
 # ----------------------------------
 # Test configuration
 # ----------------------------------
-RUN_NAME="61441nj1"
-CHECKPOINT="crimson-sweep-3_best_model_5_0.7689.pt"
+RUN_NAME="6f92g02q"
+CHECKPOINT="astral-sweep-1_best_model_5_0.7708.pt"
 #TEST_SET="comparisons_df_with_synthetic_berlin.pickle"
 TEST_SET="build_datasets/comparisons_tests.pkl"
+DATASET_DIR="images/printart/subjectivesafety_images"
+CITIES="berlin"
 
 PYTHON_SCRIPT="test.py"
 
@@ -28,21 +30,20 @@ fi
 source "$VENV_PATH/bin/activate"
 
 # ----------------------------------
-# Run test (CORRECT ARGS)
- #--wandb_run_id "$RUN_NAME" \
+# Run test
 # ----------------------------------
-
 python "$PYTHON_SCRIPT" \
-    --comparisons "$TEST_SET" \
-    --dataset images/printart/subjectivesafety_images \
-    --cities "berlin" \
-    --wandb_run_id "$RUN_NAME" \
-    --checkpoint "$CHECKPOINT" \
-    --cuda \
-    --cuda_id 1
+  --comparisons "$TEST_SET" \
+  --dataset "$DATASET_DIR" \
+  --cities "$CITIES" \
+  --wandb_run_id "$RUN_NAME" \
+  --checkpoint "$CHECKPOINT" \
+  --cuda \
+  --cuda_id 0
 
 echo "Test finished: $RUN_NAME ($TEST_SET)"
 
+#"berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov" \
 #python "$PYTHON_SCRIPT" \
 #    --comparisons "$TEST_SET" \
 #    --dataset images/printart/subjectivesafety_images \

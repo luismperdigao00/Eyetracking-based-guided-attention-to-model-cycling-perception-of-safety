@@ -245,40 +245,63 @@ def _split_paths(comparisons_path: str, splits_dir: str) -> tuple[str, str, str]
     return train_path, val_path, test_path
 
 
-def _load_or_create_splits(
+def _load_or_split(
     df: pd.DataFrame,
     seed: int,
     comparisons_path: str,
-    splits_dir: str = "splits_v4",
-    test_size: float = 0.20,
-    val_size_of_train: float = 0.13,
+    splits_dir: str = "splits",
+    train_pct: float = 0.67,
+    val_pct: float = 0.13,
+    test_pct: float = 0.20,
+    load_if_exists: bool = True,
+    save_splits: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     _ensure_dir(splits_dir)
     train_path, val_path, test_path = _split_paths(comparisons_path, splits_dir)
 
-    if os.path.exists(train_path) and os.path.exists(val_path) and os.path.exists(test_path):
-        X_train = pd.read_pickle(train_path)
-        X_val = pd.read_pickle(val_path)
-        X_test = pd.read_pickle(test_path)
-        print("\n[SPLITS] Loaded precomputed train/val/test splits:")
-        print(" -", train_path)
-        print(" -", val_path)
-        print(" -", test_path)
-        return X_train, X_val, X_test
+    if load_if_exists and all(os.path.exists(p) for p in (train_path, val_path, test_path)):
+        return (
+            pd.read_pickle(train_path),
+            pd.read_pickle(val_path),
+            pd.read_pickle(test_path),
+        )
 
-    X_train, X_test = train_test_split(df, test_size=test_size, random_state=int(seed))
-    X_train, X_val = train_test_split(X_train, test_size=val_size_of_train, random_state=int(seed))
+    total = float(train_pct + val_pct + test_pct)
+    if abs(total - 1.0) > 1e-9:
+        raise ValueError(f"train_pct + val_pct + test_pct must sum to 1.0, got {total}")
 
-    X_train.to_pickle(train_path)
-    X_val.to_pickle(val_path)
-    X_test.to_pickle(test_path)
+    if test_pct <= 0.0 or test_pct >= 1.0:
+        raise ValueError("test_pct must be in (0, 1)")
 
-    print("\n[SPLITS] Saved train/val/test splits:")
-    print(" -", train_path)
-    print(" -", val_path)
-    print(" -", test_path)
+    if val_pct < 0.0 or train_pct < 0.0:
+        raise ValueError("train_pct and val_pct must be >= 0")
+
+    X_train, X_test = train_test_split(
+        df,
+        test_size=test_pct,
+        shuffle=True,
+        random_state=int(seed),
+    )
+
+    remaining = 1.0 - test_pct
+    if remaining <= 0.0:
+        raise ValueError("test_pct leaves no data for train/val")
+
+    val_size_of_train = val_pct / remaining
+
+    X_train, X_val = train_test_split(
+        X_train,
+        test_size=val_size_of_train,
+        shuffle=True,
+        random_state=int(seed),
+    )
+
+    if save_splits:
+        X_train.to_pickle(train_path)
+        X_val.to_pickle(val_path)
+        X_test.to_pickle(test_path)
+
     return X_train, X_val, X_test
-
 
 def _print_filtered_dataset_summary(args, df: pd.DataFrame) -> None:
     print("\n=== Effective Dataset (after all filters, before split) ===")
@@ -306,12 +329,37 @@ def _print_filtered_dataset_summary(args, df: pd.DataFrame) -> None:
     print("========================================================\n")
 
 
-def _print_image_overlap_stats(X_train: pd.DataFrame, X_val: pd.DataFrame, X_test: pd.DataFrame) -> None:
-    a, b = "image_l", "image_r"
-    tr = set(pd.concat([X_train[a].astype(str), X_train[b].astype(str)], ignore_index=True))
-    va = set(pd.concat([X_val[a].astype(str), X_val[b].astype(str)], ignore_index=True))
-    te = set(pd.concat([X_test[a].astype(str), X_test[b].astype(str)], ignore_index=True))
+def _print_image_overlap_stats(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    left_col: str = "image_l",
+    right_col: str = "image_r",
+    dataset_col: str | None = "dataset",
+) -> None:
+    def _unique_images(df: pd.DataFrame) -> set[str]:
+        if len(df) == 0:
+            return set()
 
+        df2 = df[[c for c in [left_col, right_col, dataset_col] if c is not None and c in df.columns]].copy()
+        df2[left_col] = df2[left_col].astype(str)
+        df2[right_col] = df2[right_col].astype(str)
+
+        if dataset_col is not None and dataset_col in df2.columns:
+            ds = df2[dataset_col].astype(str)
+            left = (ds + "/" + df2[left_col])
+            right = (ds + "/" + df2[right_col])
+        else:
+            left = df2[left_col]
+            right = df2[right_col]
+
+        return set(pd.concat([left, right], ignore_index=True).tolist())
+
+    tr = _unique_images(X_train)
+    va = _unique_images(X_val)
+    te = _unique_images(X_test)
+
+    print("Images : train=", len(tr), "| val=", len(va), "| test=", len(te))
     print("train∩val :", len(tr & va))
     print("train∩test:", len(tr & te))
     print("val∩test  :", len(va & te))
