@@ -11,28 +11,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# -------------------------------------------------------------------------------------------------
-# Attention extraction
-# -------------------------------------------------------------------------------------------------
+# ================================================================================================
+# Basic tensor helpers
+# ================================================================================================
 
-@dataclass(frozen=True)
-class AttentionConfig:
-    """
-    Attention map extraction configuration.
-
-    mode:
-      - "last":    last block CLS->patch attention (head-averaged)
-      - "rollout": attention rollout across blocks (identity-augmented, row-normalized)
-      - "topk":    same as "last" but sparsified to keep only top-k patch attentions
-
-    out_hw:
-      output attention-map resolution (H,W), typically matching gaze-grid size (e.g., 14x14 or 16x16).
-    """
-    enabled: bool = False
-    return_attn: bool = True
-    mode: str = "last"                  # {"last","rollout","topk"}
-    topk: Optional[int] = None
-    out_hw: Tuple[int, int] = (14, 14)
+def _ensure_gaze_4d(gaze: torch.Tensor) -> torch.Tensor:
+    if gaze.ndim == 4:
+        return gaze
+    if gaze.ndim == 3:
+        return gaze.unsqueeze(1)
+    if gaze.ndim == 2:
+        return gaze.unsqueeze(1).unsqueeze(1)
+    raise ValueError(f"Unsupported gaze tensor shape: {tuple(gaze.shape)}")
 
 
 def uniform_attention_map(
@@ -46,14 +36,157 @@ def uniform_attention_map(
     return m / float(h * w)
 
 
+def _safe_module_device(module: nn.Module) -> torch.device:
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _get_backbone_input_hw(backbone: nn.Module) -> Tuple[int, int]:
+    for cfg_name in ("pretrained_cfg", "default_cfg"):
+        cfg = getattr(backbone, cfg_name, None)
+        if isinstance(cfg, dict):
+            inp = cfg.get("input_size", None)
+            if isinstance(inp, (tuple, list)) and len(inp) == 3:
+                return int(inp[1]), int(inp[2])
+    return 224, 224
+
+
+# ================================================================================================
+# Backbone output normalization / inference helpers
+# ================================================================================================
+
+def _normalize_backbone_output(feats: Any) -> torch.Tensor:
+    if torch.is_tensor(feats):
+        return feats
+
+    if isinstance(feats, dict):
+        cls_k = None
+        patch_k = None
+
+        for ck in ("x_norm_clstoken", "clstoken", "cls_token", "x_clstoken"):
+            v = feats.get(ck, None)
+            if torch.is_tensor(v) and v.ndim == 2:
+                cls_k = ck
+                break
+
+        for pk in ("x_norm_patchtokens", "patchtokens", "patch_tokens", "x_patchtokens"):
+            v = feats.get(pk, None)
+            if torch.is_tensor(v) and v.ndim == 3:
+                patch_k = pk
+                break
+
+        if cls_k is not None and patch_k is not None:
+            cls_tok = feats[cls_k].unsqueeze(1)
+            patch_tok = feats[patch_k]
+            return torch.cat([cls_tok, patch_tok], dim=1)
+
+        candidate_keys = ("x", "tokens", "last_hidden_state", "feats", "features", "penultimate", "pre_logits", "logits")
+        for k in candidate_keys:
+            v = feats.get(k, None)
+            if torch.is_tensor(v):
+                return v
+
+        for v in feats.values():
+            if torch.is_tensor(v):
+                return v
+
+        raise TypeError(f"Backbone returned dict with no tensor values. Keys={list(feats.keys())}")
+
+    if isinstance(feats, (tuple, list)):
+        for v in feats:
+            if torch.is_tensor(v) and v.ndim == 3:
+                return v
+        for v in feats:
+            if torch.is_tensor(v) and v.ndim == 2:
+                return v
+        for v in feats:
+            if torch.is_tensor(v):
+                return v
+        raise TypeError("Backbone returned tuple/list with no tensor entries.")
+
+    raise TypeError(f"Unsupported backbone output type: {type(feats)}")
+
+
+def infer_embed_dim(backbone: nn.Module) -> int:
+    if hasattr(backbone, "embed_dim"):
+        return int(getattr(backbone, "embed_dim"))
+    if hasattr(backbone, "num_features"):
+        return int(getattr(backbone, "num_features"))
+
+    device = _safe_module_device(backbone)
+    h, w = _get_backbone_input_hw(backbone)
+    dummy = torch.zeros(1, 3, h, w, device=device)
+
+    with torch.no_grad():
+        feats = backbone.forward_features(dummy) if hasattr(backbone, "forward_features") else backbone(dummy)
+
+    t = _normalize_backbone_output(feats)
+    if t.ndim in (2, 3):
+        return int(t.shape[-1])
+    raise ValueError(f"Unexpected normalized backbone output shape: {tuple(t.shape)}")
+
+
+def infer_num_prefix_tokens(backbone: nn.Module, force: Optional[int] = None) -> int:
+    if force is not None:
+        return int(force)
+    npt = getattr(backbone, "num_prefix_tokens", None)
+    if npt is not None:
+        return int(npt)
+    return 1
+
+
+def infer_patch_grid(backbone: nn.Module, num_patches: Optional[int] = None) -> Tuple[int, int]:
+    pe = getattr(backbone, "patch_embed", None)
+    if pe is not None:
+        gs = getattr(pe, "grid_size", None)
+        if isinstance(gs, (tuple, list)) and len(gs) == 2:
+            return int(gs[0]), int(gs[1])
+
+        np = getattr(pe, "num_patches", None)
+        if isinstance(np, int) and np > 0:
+            g = int(math.isqrt(np))
+            if g * g == int(np):
+                return g, g
+
+    if num_patches is not None and int(num_patches) > 0:
+        g = int(math.isqrt(int(num_patches)))
+        if g * g == int(num_patches):
+            return g, g
+
+    return 14, 14
+
+
+# ================================================================================================
+# Attention extraction (align mode)
+# ================================================================================================
+
+@dataclass(frozen=True)
+class AttentionConfig:
+    """
+    mode:
+      - "last":    last block CLS->patch attention (head-averaged)
+      - "rollout": rollout across blocks (identity-augmented, row-normalized)
+      - "topk":    "last" attention sparsified to top-k patches
+
+    out_hw:
+      attention map spatial output size (H,W), typically gaze grid size.
+    """
+    enabled: bool = False
+    return_attn: bool = True
+    mode: str = "last"                  # {"last","rollout","topk"}
+    topk: Optional[int] = None
+    out_hw: Tuple[int, int] = (14, 14)
+
+
 class AttentionRecorder:
     """
     Monkeypatch-based recorder for timm-style ViT Attention modules.
 
-    Compatible modules:
-      - have .qkv (nn.Linear), .proj (nn.Linear), .num_heads, .attn_drop, .proj_drop
-
-    Captured attention is the softmax attention before dropout (attn_pre).
+    The hooked forward computes and stores attn_pre = softmax(qk^T * scale) before dropout.
+    When args/kwargs are present, the original forward is called and attention is approximated
+    from qkv(x) as a fallback.
     """
     def __init__(self, cfg: AttentionConfig) -> None:
         self.cfg = cfg
@@ -118,12 +251,10 @@ class AttentionRecorder:
             self.reset()
             return
 
-        restored = 0
         for m in backbone.modules():
             mid = id(m)
             if mid in self._original_attn_forwards:
                 m.forward = self._original_attn_forwards[mid]
-                restored += 1
 
         self._original_attn_forwards.clear()
         self._hooked_modules.clear()
@@ -165,9 +296,6 @@ class AttentionRecorder:
             if num_heads <= 0 or (c % num_heads) != 0:
                 return None
 
-            if not hasattr(_mod, "qkv"):
-                return None
-
             head_dim = c // num_heads
             qkv = _mod.qkv(x_in)
             qkv = qkv.reshape(b, n, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
@@ -195,9 +323,8 @@ class AttentionRecorder:
                 if self._fallback_warned < 5:
                     self._fallback_warned += 1
                     warnings.warn(
-                        "Attention hook fallback: Attention module called with args/kwargs "
-                        "(mask/bias/rope/etc). Returning original output and attempting to "
-                        "compute/store attention from qkv(x)."
+                        "Attention hook fallback triggered due to args/kwargs (mask/bias/etc). "
+                        "Attention is approximated from qkv(x)."
                     )
 
                 try:
@@ -286,14 +413,12 @@ class AttentionRecorder:
 
         out_hw_eff = self.cfg.out_hw if out_hw is None else tuple(out_hw)
 
-        m: Optional[torch.Tensor] = None
-        used_uniform = False
-
         if self.cfg.mode == "rollout":
             m = self._attention_rollout_map(feats_for_dtype, num_prefix_tokens, out_hw_eff)
         else:
             m = self._attention_last_map(feats_for_dtype, num_prefix_tokens, out_hw_eff)
 
+        used_uniform = False
         if m is None:
             b = int(feats_for_dtype.shape[0])
             m = uniform_attention_map(b=b, out_hw=out_hw_eff, device=feats_for_dtype.device, dtype=feats_for_dtype.dtype)
@@ -379,17 +504,54 @@ class AttentionRecorder:
         )
 
 
-# -------------------------------------------------------------------------------------------------
-# Guidance (gaze injection)
-# -------------------------------------------------------------------------------------------------
+# ================================================================================================
+# Gaze token embedding (C)
+# ================================================================================================
+
+class GazeTokenEmbedder(nn.Module):
+    """
+    Converts a gaze map M_g into patch-aligned gaze tokens G.
+
+    Input:
+      gaze_map: (B,H,W) or (B,1,H,W)
+      grid_hw: (Gh,Gw)
+
+    Output:
+      gaze_tokens: (B, P, dg), where P = Gh*Gw
+    """
+    def __init__(self, gaze_token_dim: int) -> None:
+        super().__init__()
+        self.gaze_token_dim = int(gaze_token_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(1, self.gaze_token_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, gaze_map: torch.Tensor, grid_hw: Tuple[int, int]) -> torch.Tensor:
+        gh, gw = int(grid_hw[0]), int(grid_hw[1])
+        g = _ensure_gaze_4d(gaze_map).float()  # (B,1,H,W)
+        g = F.interpolate(g, size=(gh, gw), mode="bilinear", align_corners=False)
+        g = g.clamp_min(0.0)
+
+        g_flat = g.flatten(2).transpose(1, 2).contiguous()  # (B,P,1)
+
+        g_max = g_flat.amax(dim=1, keepdim=True).clamp_min(1e-12)  # (B,1,1)
+        g_flat = g_flat / g_max
+
+        return self.proj(g_flat)  # (B,P,dg)
+
+
+# ================================================================================================
+# GII injector (A) with per-layer parameters (B)
+# ================================================================================================
 
 @dataclass(frozen=True)
 class GuideGuidanceConfig:
     """
-    Gaze injection configuration.
-
-    drop_prob:
-      stochastic gaze dropout during training (sample-level), typically used to improve robustness.
+    bottleneck_dim: d' in the paper
+    gaze_hidden_dim: dg (gaze token embedding dim)
+    drop_prob: stochastic gaze disabling during training (p in {0,1})
+    strength: scale applied to injected residual
     """
     enabled: bool = False
     bottleneck_dim: int = 128
@@ -399,289 +561,160 @@ class GuideGuidanceConfig:
     strength: float = 1.0
 
 
-def _ensure_gaze_4d(gaze: torch.Tensor) -> torch.Tensor:
-    if gaze.ndim == 4:
-        return gaze
-    if gaze.ndim == 3:
-        return gaze.unsqueeze(1)
-    if gaze.ndim == 2:
-        return gaze.unsqueeze(1).unsqueeze(1)
-    raise ValueError(f"Unsupported gaze tensor shape: {tuple(gaze.shape)}")
-
-
-def gaze_to_patch_weights(
-    gaze_map: torch.Tensor,
-    grid_hw: Tuple[int, int],
-    eps: float = 1e-12,
-) -> torch.Tensor:
+class GIIInjectorLayer(nn.Module):
     """
-    Convert a gaze map (B,H,W) or (B,1,H,W) into patch weights (B,P) aligned to grid_hw.
-
-    Normalization:
-      - clamp to >=0
-      - divide by per-sample max to map into [0,1] when max>0
+    Computes bar_Z_l from tilde_Z_l and gaze tokens, matching the paper layout:
+      - down-projection (d -> d')
+      - gaze projection into d'
+      - GFF spatial attention via concat(avg,max) -> conv -> sigmoid
+      - reweight visual tokens and up-projection (d' -> d)
     """
-    gh, gw = int(grid_hw[0]), int(grid_hw[1])
-    g = _ensure_gaze_4d(gaze_map).float()  # (B,1,H,W)
-    g = F.interpolate(g, size=(gh, gw), mode="bilinear", align_corners=False)
-    g = g.clamp_min(0.0)
-
-    g_flat = g.flatten(2)  # (B,1,P)
-    g_max = g_flat.max(dim=-1, keepdim=True).values.clamp_min(eps)
-    g_flat = g_flat / g_max
-    return g_flat.squeeze(1)  # (B,P)
-
-
-class GuideGuidance(nn.Module):
-    """
-    Gaze-guided residual injector operating on token sequences.
-
-    Input:
-      tokens: (B,N,D)
-      gaze_map: (B,H,W) or (B,1,H,W)
-      has_eye_mask: (B,) bool, True when gaze is valid
-
-    Output:
-      residual tokens (B,N,D) intended to be added to tokens after a transformer block.
-    """
-    def __init__(self, token_dim: int, cfg: GuideGuidanceConfig) -> None:
+    def __init__(self, token_dim: int, gaze_token_dim: int, cfg: GuideGuidanceConfig) -> None:
         super().__init__()
         self.cfg = cfg
         d = int(token_dim)
-        d_b = int(cfg.bottleneck_dim)
-        d_g = int(cfg.gaze_hidden_dim)
-        c_h = int(cfg.conv_hidden_channels)
+        dg = int(gaze_token_dim)
+        db = int(cfg.bottleneck_dim)
+        ch = int(cfg.conv_hidden_channels)
 
-        self.mlp_down = nn.Sequential(
-            nn.Linear(d, d_b),
+        self.down = nn.Sequential(
+            nn.Linear(d, db),
             nn.GELU(),
         )
 
         self.gaze_proj = nn.Sequential(
-            nn.Linear(1, d_g),
-            nn.GELU(),
-            nn.Linear(d_g, d_b),
+            nn.Linear(dg, db),
             nn.GELU(),
         )
 
-        self.spatial_conv = nn.Sequential(
-            nn.Conv2d(2 * d_b, c_h, kernel_size=3, padding=1),
+        # GFF input is concat(avg_pool, max_pool) -> 2 channels
+        self.gff = nn.Sequential(
+            nn.Conv2d(2, ch, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(c_h, 1, kernel_size=1, padding=0),
+            nn.Conv2d(ch, 1, kernel_size=1, padding=0),
         )
 
-        self.mlp_up = nn.Linear(d_b, d)
+        self.up = nn.Linear(db, d)
 
     def forward(
         self,
-        tokens: torch.Tensor,
-        gaze_map: Optional[torch.Tensor],
-        has_eye_mask: Optional[torch.Tensor],
+        z_tilde: torch.Tensor,
+        gaze_tokens: torch.Tensor,
+        p_mask: torch.Tensor,
         num_prefix_tokens: int,
         grid_hw: Tuple[int, int],
     ) -> torch.Tensor:
-        if (not self.cfg.enabled) or (gaze_map is None):
-            return tokens.new_zeros(tokens.shape)
+        if not self.cfg.enabled:
+            return z_tilde.new_zeros(z_tilde.shape)
 
-        if tokens.ndim != 3:
-            raise ValueError(f"GuideGuidance expects tokens (B,N,D), got {tuple(tokens.shape)}")
+        if z_tilde.ndim != 3:
+            raise ValueError(f"Expected z_tilde (B,N,D), got {tuple(z_tilde.shape)}")
 
-        b, n, d = tokens.shape
-        t_pref = int(num_prefix_tokens)
-        if n <= t_pref:
-            return tokens.new_zeros(tokens.shape)
+        b, n, _ = z_tilde.shape
+        t = int(num_prefix_tokens)
+        if n <= t:
+            return z_tilde.new_zeros(z_tilde.shape)
 
-        patches = tokens[:, t_pref:, :]  # (B,P,D)
-        P = int(patches.shape[1])
         gh, gw = int(grid_hw[0]), int(grid_hw[1])
-        if (gh * gw) != P:
-            gh = int(math.isqrt(P))
-            gw = gh
+        p = n - t
+        if gh * gw != p:
+            g = int(math.isqrt(p))
+            gh, gw = g, g
 
-        w_patch = gaze_to_patch_weights(gaze_map, (gh, gw))  # (B,P)
+        gaze_tokens = gaze_tokens.to(device=z_tilde.device, dtype=z_tilde.dtype)
 
-        if has_eye_mask is None:
-            has_eye_mask = torch.ones((b,), device=tokens.device, dtype=torch.bool)
-        else:
-            has_eye_mask = has_eye_mask.to(device=tokens.device, dtype=torch.bool)
+        z_hat = self.down(z_tilde)          # (B,N,db)
+        z_hat_c = z_hat[:, :t, :]           # (B,T,db)
+        z_hat_v = z_hat[:, t:, :]           # (B,P,db)
 
-        p_use = has_eye_mask.float().view(b, 1)  # (B,1)
+        g_hat = self.gaze_proj(gaze_tokens) # (B,P,db)
 
-        if self.training and (float(self.cfg.drop_prob) > 0.0):
-            drop = (torch.rand((b,), device=tokens.device) < float(self.cfg.drop_prob)).float().view(b, 1)
-            p_use = p_use * (1.0 - drop)
+        # p_mask is (B,1,1) and broadcasts over (B,P,db)
+        z_vg = z_hat_v + (p_mask * g_hat)   # (B,P,db)
 
-        z_down = self.mlp_down(patches)  # (B,P,d')
-        cls_tok = tokens[:, :t_pref, :]  # (B,T,D)
-        cls_down = self.mlp_down(cls_tok)  # (B,T,d')
+        avg_pool = z_vg.mean(dim=-1, keepdim=True)        # (B,P,1)
+        max_pool = z_vg.amax(dim=-1, keepdim=True)        # (B,P,1)
 
-        g_scalar = w_patch.unsqueeze(-1)  # (B,P,1)
-        g_emb = self.gaze_proj(g_scalar)  # (B,P,d')
+        f = torch.cat([avg_pool, max_pool], dim=-1)       # (B,P,2)
+        f = f.view(b, gh, gw, 2).permute(0, 3, 1, 2)      # (B,2,gh,gw)
 
-        z_mix = z_down + (p_use.unsqueeze(-1) * g_emb)  # (B,P,d')
+        a = torch.sigmoid(self.gff(f))                    # (B,1,gh,gw)
+        a = a.flatten(2).transpose(1, 2).contiguous()     # (B,P,1)
 
-        avg_pool = z_mix.mean(dim=-1, keepdim=True)  # (B,P,1)
-        max_pool = z_mix.amax(dim=-1, keepdim=True)  # (B,P,1)
-        f_map = torch.cat([avg_pool, max_pool], dim=-1)  # (B,P,2)
+        z_hat_v_prime = z_hat_v * a                       # (B,P,db)
 
-        f_map = f_map.view(b, gh, gw, 2).permute(0, 3, 1, 2).contiguous()  # (B,2,gh,gw)
-        att = torch.sigmoid(self.spatial_conv(f_map))  # (B,1,gh,gw)
+        z_hat_prime = torch.cat([z_hat_c, z_hat_v_prime], dim=1)  # (B,N,db)
+        z_bar = self.up(z_hat_prime)                                # (B,N,D)
 
-        att_flat = att.flatten(2).transpose(1, 2).contiguous()  # (B,P,1)
-        z_adj = z_down * att_flat  # (B,P,d')
-
-        z_all = torch.cat([cls_down, z_adj], dim=1)  # (B,T+P,d')
-        res = self.mlp_up(z_all)  # (B,N,D)
-        return float(self.cfg.strength) * res
+        return float(self.cfg.strength) * z_bar
 
 
-# -------------------------------------------------------------------------------------------------
-# Backbone helpers
-# -------------------------------------------------------------------------------------------------
+# ================================================================================================
+# Guided forward that injects inside each transformer block (A)
+# ================================================================================================
 
-def _safe_module_device(module: nn.Module) -> torch.device:
-    try:
-        return next(module.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
-
-
-def _get_backbone_input_hw(backbone: nn.Module) -> Tuple[int, int]:
-    for cfg_name in ("pretrained_cfg", "default_cfg"):
-        cfg = getattr(backbone, cfg_name, None)
-        if isinstance(cfg, dict):
-            inp = cfg.get("input_size", None)
-            if isinstance(inp, (tuple, list)) and len(inp) == 3:
-                return int(inp[1]), int(inp[2])
-    return 224, 224
+def _resolve_drop_path(blk: nn.Module, which: int) -> Optional[nn.Module]:
+    if which == 1:
+        return getattr(blk, "drop_path1", getattr(blk, "drop_path", None))
+    return getattr(blk, "drop_path2", getattr(blk, "drop_path", None))
 
 
-def _normalize_backbone_output(feats: Any) -> torch.Tensor:
-    if torch.is_tensor(feats):
-        return feats
-
-    if isinstance(feats, dict):
-        cls_k = None
-        patch_k = None
-
-        for ck in ("x_norm_clstoken", "clstoken", "cls_token", "x_clstoken"):
-            v = feats.get(ck, None)
-            if torch.is_tensor(v) and v.ndim == 2:
-                cls_k = ck
-                break
-
-        for pk in ("x_norm_patchtokens", "patchtokens", "patch_tokens", "x_patchtokens"):
-            v = feats.get(pk, None)
-            if torch.is_tensor(v) and v.ndim == 3:
-                patch_k = pk
-                break
-
-        if cls_k is not None and patch_k is not None:
-            cls_tok = feats[cls_k].unsqueeze(1)
-            patch_tok = feats[patch_k]
-            return torch.cat([cls_tok, patch_tok], dim=1)
-
-        candidate_keys = ("x", "tokens", "last_hidden_state", "feats", "features", "penultimate", "pre_logits", "logits")
-        for k in candidate_keys:
-            v = feats.get(k, None)
-            if torch.is_tensor(v):
-                return v
-
-        for v in feats.values():
-            if torch.is_tensor(v):
-                return v
-
-        raise TypeError(f"Backbone returned dict with no tensor values. Keys={list(feats.keys())}")
-
-    if isinstance(feats, (tuple, list)):
-        for v in feats:
-            if torch.is_tensor(v) and v.ndim == 3:
-                return v
-        for v in feats:
-            if torch.is_tensor(v) and v.ndim == 2:
-                return v
-        for v in feats:
-            if torch.is_tensor(v):
-                return v
-        raise TypeError("Backbone returned tuple/list with no tensor entries.")
-
-    raise TypeError(f"Unsupported backbone output type: {type(feats)}")
+def _maybe_layer_scale(blk: nn.Module, which: int, x: torch.Tensor) -> torch.Tensor:
+    ls = getattr(blk, "ls1", None) if which == 1 else getattr(blk, "ls2", None)
+    if isinstance(ls, nn.Module):
+        return ls(x)
+    return x
 
 
-def infer_embed_dim(backbone: nn.Module) -> int:
-    if hasattr(backbone, "embed_dim"):
-        return int(getattr(backbone, "embed_dim"))
-    if hasattr(backbone, "num_features"):
-        return int(getattr(backbone, "num_features"))
+def _gaze_presence_mask(
+    b: int,
+    has_eye_mask: Optional[torch.Tensor],
+    drop_prob: float,
+    training: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    if has_eye_mask is None:
+        p = torch.ones((b,), device=device, dtype=torch.float32)
+    else:
+        m = has_eye_mask.to(device=device, dtype=torch.bool)
+        p = m.float()
 
-    device = _safe_module_device(backbone)
-    h, w = _get_backbone_input_hw(backbone)
-    dummy = torch.zeros(1, 3, h, w, device=device)
+    if training and (float(drop_prob) > 0.0):
+        drop = (torch.rand((b,), device=device) < float(drop_prob)).float()
+        p = p * (1.0 - drop)
 
-    with torch.no_grad():
-        if hasattr(backbone, "forward_features"):
-            feats = backbone.forward_features(dummy)
-        else:
-            feats = backbone(dummy)
-
-    t = _normalize_backbone_output(feats)
-    if t.ndim in (2, 3):
-        return int(t.shape[-1])
-    raise ValueError(f"Unexpected normalized backbone output shape: {tuple(t.shape)}")
-
-
-def infer_num_prefix_tokens(backbone: nn.Module, force: Optional[int] = None) -> int:
-    if force is not None:
-        return int(force)
-    npt = getattr(backbone, "num_prefix_tokens", None)
-    if npt is not None:
-        return int(npt)
-    return 1
-
-
-def infer_patch_grid(backbone: nn.Module, num_patches: Optional[int] = None) -> Tuple[int, int]:
-    pe = getattr(backbone, "patch_embed", None)
-    if pe is not None:
-        gs = getattr(pe, "grid_size", None)
-        if isinstance(gs, (tuple, list)) and len(gs) == 2:
-            return int(gs[0]), int(gs[1])
-
-        np = getattr(pe, "num_patches", None)
-        if isinstance(np, int) and np > 0:
-            g = int(math.isqrt(np))
-            if g * g == int(np):
-                return g, g
-
-    if num_patches is not None and int(num_patches) > 0:
-        g = int(math.isqrt(int(num_patches)))
-        if g * g == int(num_patches):
-            return g, g
-
-    return 14, 14
+    return p.view(b, 1, 1)  # (B,1,1)
 
 
 def forward_backbone_tokens(
     backbone: nn.Module,
     x: torch.Tensor,
-    attention_recorder: Optional[AttentionRecorder] = None,
-    guidance: Optional[GuideGuidance] = None,
+    attention_recorder: Optional[Any] = None,
+    gaze_embedder: Optional[GazeTokenEmbedder] = None,
+    gii_layers: Optional[nn.ModuleList] = None,
     gaze_map: Optional[torch.Tensor] = None,
     has_eye_mask: Optional[torch.Tensor] = None,
     num_prefix_tokens: int = 1,
+    guidance_drop_prob: float = 0.0,
 ) -> torch.Tensor:
     """
-    Forward path selection:
+    If gaze_embedder + gii_layers + gaze_map are provided, runs an explicit ViT-style loop:
 
-    - When guidance is disabled: use backbone.forward_features/backbone(x) (legacy-compatible).
-    - When guidance is enabled: run a ViT-like explicit loop when attributes exist; otherwise fall back.
+      z_tilde = x + DropPath( Attn( Norm1(x) ) )
+      z_ffn   = z_tilde + DropPath( MLP( Norm2(z_tilde) ) )
+      x       = z_ffn + bar_z( z_tilde, gaze )
+
+    Otherwise, falls back to backbone.forward_features/backbone(x).
     """
-    guidance_enabled = bool((guidance is not None) and getattr(guidance, "cfg", None) is not None and guidance.cfg.enabled)
+    guidance_enabled = (
+        (gii_layers is not None)
+        and (gaze_embedder is not None)
+        and (gaze_map is not None)
+        and (len(gii_layers) > 0)
+    )
 
-    if (not guidance_enabled) or (gaze_map is None):
-        if hasattr(backbone, "forward_features"):
-            feats = backbone.forward_features(x)
-        else:
-            feats = backbone(x)
+    if not guidance_enabled:
+        feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
         return _normalize_backbone_output(feats)
 
     patch_embed = getattr(backbone, "patch_embed", None)
@@ -689,18 +722,28 @@ def forward_backbone_tokens(
     norm = getattr(backbone, "norm", None)
 
     if (patch_embed is None) or (blocks is None):
-        if hasattr(backbone, "forward_features"):
-            feats = backbone.forward_features(x)
-        else:
-            feats = backbone(x)
+        feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
         return _normalize_backbone_output(feats)
 
     tok = patch_embed(x)
+    
     if tok.ndim == 4:
-        b, c, h, w = tok.shape
-        tok = tok.flatten(2).transpose(1, 2).contiguous()
-
-    b, p, d = tok.shape
+        # patch_embed may return:
+        #   - NCHW: (B, D, Gh, Gw)
+        #   - NHWC: (B, Gh, Gw, D)
+        cls_token = getattr(backbone, "cls_token", None)
+        d_ref = int(cls_token.shape[-1]) if torch.is_tensor(cls_token) else None
+    
+        if d_ref is not None and tok.shape[-1] == d_ref:
+            # NHWC -> (B, P, D)
+            b, gh, gw, d = tok.shape
+            tok = tok.view(b, gh * gw, d).contiguous()
+        else:
+            # NCHW -> (B, P, D)
+            b, d, gh, gw = tok.shape
+            tok = tok.flatten(2).transpose(1, 2).contiguous()
+    
+    b, p, _ = tok.shape
 
     cls_token = getattr(backbone, "cls_token", None)
     dist_token = getattr(backbone, "dist_token", None)
@@ -712,9 +755,7 @@ def forward_backbone_tokens(
     if dist_token is not None and torch.is_tensor(dist_token):
         prefix.append(dist_token.expand(b, -1, -1))
     if reg_token is not None and torch.is_tensor(reg_token):
-        rt = reg_token
-        if rt.ndim == 2:
-            rt = rt.unsqueeze(0)
+        rt = reg_token if reg_token.ndim == 3 else reg_token.unsqueeze(0)
         prefix.append(rt.expand(b, -1, -1))
 
     if len(prefix) > 0:
@@ -732,17 +773,62 @@ def forward_backbone_tokens(
     if isinstance(pos_drop, nn.Module):
         tok = pos_drop(tok)
 
+    t = int(num_prefix_tokens)
     grid_hw = infer_patch_grid(backbone, num_patches=p)
-    for blk in blocks:
-        tok = blk(tok)
-        res = guidance(tok, gaze_map=gaze_map, has_eye_mask=has_eye_mask, num_prefix_tokens=int(num_prefix_tokens), grid_hw=grid_hw)
-        tok = tok + res
+
+    p_mask = _gaze_presence_mask(
+        b=b,
+        has_eye_mask=has_eye_mask,
+        drop_prob=float(guidance_drop_prob),
+        training=bool(backbone.training),
+        device=tok.device,
+    )
+
+    gaze_tokens = gaze_embedder(gaze_map, grid_hw=grid_hw)  # (B,P,dg)
+
+    for i, blk in enumerate(blocks):
+        if i >= len(gii_layers):
+            tok = blk(tok)
+            continue
+
+        # Falls back to the original block forward when the structure does not match timm ViT blocks.
+        if not (hasattr(blk, "norm1") and hasattr(blk, "attn") and hasattr(blk, "norm2") and hasattr(blk, "mlp")):
+            tok = blk(tok)
+            continue
+
+        y = blk.attn(blk.norm1(tok))
+        y = _maybe_layer_scale(blk, which=1, x=y)
+        dp1 = _resolve_drop_path(blk, which=1)
+        if isinstance(dp1, nn.Module):
+            y = dp1(y)
+        z_tilde = tok + y
+
+        y2 = blk.mlp(blk.norm2(z_tilde))
+        y2 = _maybe_layer_scale(blk, which=2, x=y2)
+        dp2 = _resolve_drop_path(blk, which=2)
+        if isinstance(dp2, nn.Module):
+            y2 = dp2(y2)
+        z_ffn = z_tilde + y2
+
+        z_bar = gii_layers[i](
+            z_tilde=z_tilde,
+            gaze_tokens=gaze_tokens,
+            p_mask=p_mask,
+            num_prefix_tokens=t,
+            grid_hw=grid_hw,
+        )
+
+        tok = z_ffn + z_bar
 
     if isinstance(norm, nn.Module):
         tok = norm(tok)
 
     return tok
 
+
+# ================================================================================================
+# Token pooling (supports legacy pooling modes)
+# ================================================================================================
 
 def pool_tokens(
     feats: torch.Tensor,
@@ -752,22 +838,6 @@ def pool_tokens(
     apply_token_norm: bool = False,
     token_norm: Optional[nn.Module] = None,
 ) -> torch.Tensor:
-    """
-    Pool tokens into a feature vector.
-
-    Pooling modes (legacy-compatible):
-      - "cls"
-      - "mean"            : patch mean
-      - "patch_mean"
-      - "reg_mean"
-      - "prefix_mean"
-      - "max"
-      - "cls_max_concat"
-      - "cls_reg_concat"
-      - "cls_reg_add"
-      - "concat"
-      - "topk"
-    """
     pooling = str(pooling).lower().strip()
     t_pref = int(num_prefix_tokens)
 
@@ -790,17 +860,13 @@ def pool_tokens(
     prefix = tokens[:, :t_pref, :]
     patches = tokens[:, t_pref:, :]
 
-    if prefix.shape[1] >= 1:
-        cls = prefix[:, 0, :]
-    else:
-        cls = tokens[:, 0, :]
+    cls = prefix[:, 0, :] if prefix.shape[1] >= 1 else tokens[:, 0, :]
 
     has_regs = (prefix.shape[1] > 1)
     regs = prefix[:, 1:, :] if has_regs else None
 
     has_patches = (patches.shape[1] > 0)
     patch_mean = patches.mean(dim=1) if has_patches else cls
-
     reg_mean = regs.mean(dim=1) if has_regs else cls
 
     if pooling == "cls":
@@ -810,9 +876,7 @@ def pool_tokens(
     elif pooling == "cls_max_concat":
         patch_max = patches.max(dim=1).values if has_patches else cls
         pooled = torch.cat([cls, patch_max], dim=-1)
-    elif pooling == "mean":
-        pooled = patch_mean
-    elif pooling == "patch_mean":
+    elif pooling in ("mean", "patch_mean"):
         pooled = patch_mean
     elif pooling == "reg_mean":
         pooled = reg_mean

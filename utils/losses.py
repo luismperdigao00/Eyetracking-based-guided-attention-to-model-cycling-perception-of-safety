@@ -483,50 +483,45 @@ def compute_loss(
         loss_rank_combo = (rank_w * loss_nonties) + (ties_w * loss_ties)
 
         # -----------------------------------------------------------------
-        # 4.3) Gaze KL (optional)
+        # 4.3) Gaze KL (always computed; weighted only in align modes)
         # -----------------------------------------------------------------
         w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
+
         gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
         if gaze_mode not in ("off", "align", "guide", "align+guide"):
             gaze_mode = "off"
 
         use_gaze_kl = (gaze_mode in ("align", "align+guide"))
 
-        gaze_any = False
-        gaze_count = 0
+        if "has_eye_mask" not in labels:
+            raise KeyError("labels['has_eye_mask'] missing.")
+        if ("gaze_l" not in labels) or ("gaze_r" not in labels):
+            raise KeyError("labels['gaze_l'] / labels['gaze_r'] missing.")
+        if ("attn_map" not in network_output_dict["left"]) or ("attn_map" not in network_output_dict["right"]):
+            raise KeyError("network_output_dict['left/right']['attn_map'] missing.")
 
-        if (not use_gaze_kl) or (w_kl <= 0.0):
+        has_eye_mask = labels["has_eye_mask"]  # BoolTensor [B]
+        gaze_count = int(has_eye_mask.long().sum().item())
+        gaze_any = bool(has_eye_mask.any().item())
+
+        if not gaze_any:
             loss_kl = loss_class.new_zeros(())
-            w_kl_eff = 0.0
         else:
-            if "has_eye_mask" not in labels:
-                raise KeyError("labels['has_eye_mask'] missing.")
-            if ("gaze_l" not in labels) or ("gaze_r" not in labels):
-                raise KeyError("labels['gaze_l'] / labels['gaze_r'] missing.")
-            if ("attn_map" not in network_output_dict["left"]) or ("attn_map" not in network_output_dict["right"]):
-                raise KeyError("network_output_dict['left/right']['attn_map'] missing.")
-
             attn_l = network_output_dict["left"]["attn_map"]
             attn_r = network_output_dict["right"]["attn_map"]
             if (attn_l is None) or (attn_r is None):
-                raise ValueError("Attention maps are None while gaze KL is enabled.")
+                raise ValueError("Attention maps are None while KL is being computed.")
 
-            has_eye_mask = labels["has_eye_mask"]  # BoolTensor [B]
-            gaze_count = int(has_eye_mask.long().sum().item())
-            gaze_any = bool(has_eye_mask.any().item())
+            loss_kl = attention_kl_loss(
+                attn_l,
+                attn_r,
+                labels["gaze_l"],
+                labels["gaze_r"],
+                has_mask=has_eye_mask,
+            )
 
-            if not gaze_any:
-                loss_kl = loss_class.new_zeros(())
-                w_kl_eff = 0.0
-            else:
-                loss_kl = attention_kl_loss(
-                    attn_l,
-                    attn_r,
-                    labels["gaze_l"],
-                    labels["gaze_r"],
-                    has_mask=has_eye_mask,
-                )
-                w_kl_eff = w_kl
+        w_kl_eff = (w_kl if use_gaze_kl else 0.0)
+
 
         # -----------------------------------------------------------------
         # 4.4) Total loss

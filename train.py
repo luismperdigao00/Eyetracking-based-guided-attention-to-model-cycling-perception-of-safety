@@ -158,23 +158,13 @@ def arg_parse():
         default="off",
         choices=["off", "align", "guide", "align+guide"],
         help=(
-            "Gaze usage mode:\n"
-            "  off         : do not use gaze anywhere\n"
-            "  align       : use gaze only for KL alignment loss (model runs image-only)\n"
-            "  guide       : inject gaze into the transformer (no KL required)\n"
-            "  align+guide : both injection and KL alignment\n"
+            "Gaze behavior:\n"
+            "  off         : no gaze injection; KL is computed for diagnostics only\n"
+            "  align       : KL is computed and added to total loss (attn_w * KL)\n"
+            "  guide       : gaze injected; KL is computed for diagnostics only\n"
+            "  align+guide : gaze injected and KL is added to total loss (attn_w * KL)\n"
         ),
     )
-
-    parser.add_argument(
-        "--use_nobp",
-        nargs="?",
-        const=True,
-        default=False,
-        type=str2bool,
-        help="If True, compute forward/loss/metrics but skip backward and optimizer updates.",
-    )
-
 
     parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
     help=(
@@ -327,27 +317,22 @@ def run_training_with_args(args, trial=None):
     # ----------------------------------------------------------------------------------------------
     # Gaze mode normalization (new interface) + backward-compatible alias (legacy: args.gaze)
     # ----------------------------------------------------------------------------------------------
-    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    gaze_mode = getattr(args, "gaze", None)
+    if gaze_mode is None:
+        gaze_mode = getattr(args, "gaze_mode", "off")
+    gaze_mode = str(gaze_mode).lower().strip()
     if gaze_mode not in ("off", "align", "guide", "align+guide"):
         gaze_mode = "off"
+
     args.gaze_mode = gaze_mode
+    args.gaze = gaze_mode  # unified alias used across modules
 
-    use_nobp = bool(getattr(args, "use_nobp", False))
-    args.use_nobp = use_nobp
-
-    # Legacy alias used by existing validation/logging paths until all modules are migrated.
-    if gaze_mode == "off":
-        args.gaze = "off"
-    elif gaze_mode == "guide":
-        args.gaze = "off"
-    else:
-        args.gaze = "use_nobp" if use_nobp else "use"
 
     # ==============================================================================================
     # 0) ARG VALIDATION / NORMALIZATION
     # ==============================================================================================
     validate_and_normalize_args(args, strict=False, verbose=True)
-    args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
+    args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=7e-5)
 
     print("=== Args ===")
     print(args, "\n")
@@ -381,7 +366,7 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir="splits_yolo",
+        splits_dir="ya",
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,

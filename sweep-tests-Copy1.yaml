@@ -53,7 +53,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: "berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
+    value: "berlin"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -62,8 +62,6 @@ parameters:
     value: rsscnn
   ties:
     value: false
-  gaze_mode:
-    values: ["off"]
 
   # ---------------------------------------------------------------------------
   # D) Backbone & Architecture
@@ -71,9 +69,9 @@ parameters:
   backbone:
     values:
       #- "vit_small"
-      - "dinov3_vitb16"
+      #- "dinov3_vitb16"
       #- "deit3_base_patch16_224"
-      #- "vit_base_patch16_224"
+      - "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
     
 
@@ -147,7 +145,7 @@ parameters:
   ties_w:
     value: 1.0
   attn_w:
-    value: 1.0
+    value: 1
   label_smoothing:
     value: 0.0
   use_class_weights:
@@ -167,7 +165,7 @@ parameters:
   # J) Augmentation
   # ---------------------------------------------------------------------------
   augment:
-    values: ["heavy"]
+    values: ["none"]
   use_seg:
     value: false
 
@@ -196,6 +194,9 @@ parameters:
   # ---------------------------------------------------------------------------
   # Gaze Configuration
   # ---------------------------------------------------------------------------
+  gaze_mode:
+    values: ["guide", "off", "align"]
+    
   gaze_map_size:
     value: "auto"    # Options: "auto" or an integer (e.g., 14, 16)
   

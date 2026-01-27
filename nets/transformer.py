@@ -1,4 +1,4 @@
-# transformer.py
+# nets/transformer.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,8 +10,9 @@ import torch.nn as nn
 from .transformer_utils import (
     AttentionConfig,
     AttentionRecorder,
-    GuideGuidance,
     GuideGuidanceConfig,
+    GazeTokenEmbedder,
+    GIIInjectorLayer,
     forward_backbone_tokens,
     infer_embed_dim,
     infer_num_prefix_tokens,
@@ -78,8 +79,9 @@ class Transformer(nn.Module):
       }
 
     Gaze support:
-      - Guidance injection is active when guidance config is enabled and gaze maps are provided.
-      - Attention maps are produced when attention recorder is enabled (typically for KL alignment loss).
+      - Guide (based on 10.1016/j.bspc.2025.108298): gaze injection occurs inside each ViT block using explicit MHSA/FFN steps
+        when GII modules are available and gaze maps are provided.
+      - Align: attention maps are produced when attention recorder is enabled.
     """
 
     def __init__(
@@ -106,7 +108,7 @@ class Transformer(nn.Module):
         super().__init__()
 
         # ----------------------------------------------------------------------------------
-        # Step 1) Store backbone references 
+        # Step 1) Store backbone references
         # ----------------------------------------------------------------------------------
         self.backbone = backbone
         self.transformer = backbone
@@ -163,10 +165,10 @@ class Transformer(nn.Module):
             raise ValueError(f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: last/rollout/topk.")
 
         # ----------------------------------------------------------------------------------
-        # Step 3) Gaze/attention runtime flags (controlled externally by training loop)
+        # Step 3) Runtime flags (controlled externally)
         # ----------------------------------------------------------------------------------
-        self.gaze_backprop_enabled = True   # toggled by train_script _set_gaze_bp(...)
-        self.gaze_requires_grad = False     # computed per forward (depends on finetune + training)
+        self.gaze_backprop_enabled = True
+        self.gaze_requires_grad = False
 
         # ----------------------------------------------------------------------------------
         # Step 4) Freeze/finetune backbone parameters
@@ -176,7 +178,7 @@ class Transformer(nn.Module):
             self._unfreeze_last_blocks(self.cfg.num_ft_blocks)
 
         # ----------------------------------------------------------------------------------
-        # Step 5) Infer backbone token dimensions
+        # Step 5) Infer token dimensions and prefix tokens
         # ----------------------------------------------------------------------------------
         self.embed_dim = infer_embed_dim(self.backbone)
         self.num_prefix_tokens = infer_num_prefix_tokens(
@@ -184,7 +186,7 @@ class Transformer(nn.Module):
             force=self.cfg.force_num_prefix_tokens,
         )
 
-        # Optional token normalization (applied before pooling)
+        # Token normalization (optional; applied inside pool_tokens)
         self.apply_token_norm = bool(self.cfg.apply_token_norm)
         self.token_norm: Optional[nn.Module] = self.backbone.norm if hasattr(self.backbone, "norm") else None
 
@@ -194,21 +196,18 @@ class Transformer(nn.Module):
         two_d_poolings = {"concat", "cls_reg_concat", "cls_max_concat"}
         self.feat_dim = (int(self.embed_dim) * 2) if (self.cfg.pooling in two_d_poolings) else int(self.embed_dim)
 
-        # Normalization for pooled features and paired features
         self.feat_norm = nn.LayerNorm(self.feat_dim) if (self.cfg.pooling in two_d_poolings) else nn.Identity()
         self.pair_norm = nn.LayerNorm(self.feat_dim * 2)
 
         # ----------------------------------------------------------------------------------
-        # Step 7) Heads 
+        # Step 7) Heads (legacy preserved)
         # ----------------------------------------------------------------------------------
-        # Rank head: 2 hidden layers + dropout + scalar output
         self.rank_fc_1 = nn.Linear(self.feat_dim, 384)
         self.rank_fc_2 = nn.Linear(384, 162)
         self.rank_relu = nn.ReLU()
         self.rank_drop = nn.Dropout(float(self.cfg.rank_dropout))
         self.rank_fc_out = nn.Linear(162, 1)
 
-        # Pairwise class head: 3 hidden layers + dropout + class logits
         self.cross_fc_1 = nn.Linear(self.feat_dim * 2, 512)
         self.cross_relu_1 = nn.ReLU()
         self.cross_drop_1 = nn.Dropout(float(self.cfg.cross_dropout))
@@ -234,14 +233,31 @@ class Transformer(nn.Module):
             self.attn_recorder.attach(self.backbone)
 
         # ----------------------------------------------------------------------------------
-        # Step 9) Guidance module (guide path)
+        # Step 9) Paper-faithful guidance wiring (guide path)
         # ----------------------------------------------------------------------------------
         self.guidance_cfg = self.cfg.guidance
-        self.guidance: Optional[GuideGuidance] = (
-            GuideGuidance(token_dim=int(self.embed_dim), cfg=self.guidance_cfg)
-            if self.guidance_cfg.enabled
-            else None
-        )
+
+        self.gaze_embedder: Optional[GazeTokenEmbedder] = None
+        self.gii_layers: Optional[nn.ModuleList] = None
+
+        if self.guidance_cfg.enabled:
+            blocks = getattr(self.backbone, "blocks", None)
+            if blocks is not None and len(blocks) > 0:
+                gaze_token_dim = int(self.guidance_cfg.gaze_hidden_dim)
+
+                self.gaze_embedder = GazeTokenEmbedder(gaze_token_dim=gaze_token_dim)
+
+                # One injector per block (layer-indexed parameters)
+                self.gii_layers = nn.ModuleList(
+                    [
+                        GIIInjectorLayer(
+                            token_dim=int(self.embed_dim),
+                            gaze_token_dim=gaze_token_dim,
+                            cfg=self.guidance_cfg,
+                        )
+                        for _ in range(len(blocks))
+                    ]
+                )
 
     # -------------------------------------------------------------------------------------------------
     # Backbone finetune management
@@ -296,9 +312,6 @@ class Transformer(nn.Module):
     def set_gaze_backprop(self, enabled: bool) -> None:
         """
         Controls whether attention tensors are kept with gradients (for KL backward) or detached.
-
-        Training code sets this based on:
-          use_gaze_kl AND (not use_nobp)
         """
         self.gaze_backprop_enabled = bool(enabled)
         if self.attn_recorder is not None:
@@ -311,7 +324,7 @@ class Transformer(nn.Module):
 
     def train(self, mode: bool = True):
         """
-        If the backbone is fully frozen, force backbone eval mode.
+        If the backbone is fully frozen, keeps backbone in eval mode.
         """
         super().train(mode)
         backbone_has_grad = any(p.requires_grad for p in self.backbone.parameters())
@@ -357,13 +370,6 @@ class Transformer(nn.Module):
     # -------------------------------------------------------------------------------------------------
 
     def _compute_attention_require_grad(self) -> bool:
-        """
-        Attention gradients are meaningful only when:
-          - attention recording is enabled
-          - attention maps are requested (return_attn)
-          - model is in training mode
-          - backbone has trainable parameters
-        """
         if not (self.attn_cfg.enabled and self.attn_cfg.return_attn):
             return False
         if not self.training:
@@ -377,35 +383,31 @@ class Transformer(nn.Module):
         gaze_map: Optional[torch.Tensor],
         has_eye_mask: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        # --------------------------------------------------------------
         # Step A) Configure attention recorder gradient behavior
-        # --------------------------------------------------------------
         self.gaze_requires_grad = self._compute_attention_require_grad()
 
         if self.attn_recorder is not None:
             self.attn_recorder.set_keep_grad(bool(self.gaze_requires_grad and self.gaze_backprop_enabled))
             self.attn_recorder.begin_capture()
 
-        # --------------------------------------------------------------
-        # Step B) Backbone forward (optionally guided)
-        # --------------------------------------------------------------
+        # Step B) Backbone forward (guided path is enabled only when gii_layers + gaze_map exist)
         try:
             feats = forward_backbone_tokens(
-                self.backbone,
-                x,
+                backbone=self.backbone,
+                x=x,
                 attention_recorder=self.attn_recorder,
-                guidance=self.guidance,
+                gaze_embedder=self.gaze_embedder,
+                gii_layers=self.gii_layers,
                 gaze_map=gaze_map,
                 has_eye_mask=has_eye_mask,
                 num_prefix_tokens=int(self.num_prefix_tokens),
+                guidance_drop_prob=float(self.guidance_cfg.drop_prob),
             )
         finally:
             if self.attn_recorder is not None:
                 self.attn_recorder.end_capture()
 
-        # --------------------------------------------------------------
         # Step C) Pool tokens -> feature vector
-        # --------------------------------------------------------------
         pooled = pool_tokens(
             feats,
             pooling=str(self.cfg.pooling),
@@ -416,14 +418,10 @@ class Transformer(nn.Module):
         )
         pooled = self.feat_norm(pooled)
 
-        # --------------------------------------------------------------
         # Step D) Rank score head
-        # --------------------------------------------------------------
         score = self._rank_score(pooled)
 
-        # --------------------------------------------------------------
         # Step E) Attention map (optional)
-        # --------------------------------------------------------------
         attn_map: Optional[torch.Tensor] = None
         used_uniform = False
 
@@ -448,7 +446,7 @@ class Transformer(nn.Module):
         return pooled, score, attn_map
 
     # -------------------------------------------------------------------------------------------------
-    # Forward (divided into clear steps)
+    # Forward
     # -------------------------------------------------------------------------------------------------
 
     def forward(
@@ -459,38 +457,28 @@ class Transformer(nn.Module):
         gaze_right: Optional[torch.Tensor] = None,
         has_eye_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        # --------------------------------------------------------------
         # Step 1) Left branch forward
-        # --------------------------------------------------------------
         pooled_l, score_l, attn_l = self._forward_one(x_left, gaze_left, has_eye_mask)
         used_uniform_l = bool(getattr(self, "_last_branch_used_uniform", False))
 
-        # --------------------------------------------------------------
         # Step 2) Right branch forward
-        # --------------------------------------------------------------
         pooled_r, score_r, attn_r = self._forward_one(x_right, gaze_right, has_eye_mask)
         used_uniform_r = bool(getattr(self, "_last_branch_used_uniform", False))
 
-        # --------------------------------------------------------------
-        # Step 3) Attention meta tracking (debugging / logging)
-        # --------------------------------------------------------------
+        # Step 3) Attention meta tracking (debugging/logging)
         self.last_attn_meta = {
             "left": {"attn_map_is_none": (attn_l is None), "used_uniform": used_uniform_l},
             "right": {"attn_map_is_none": (attn_r is None), "used_uniform": used_uniform_r},
         }
 
-        # --------------------------------------------------------------
         # Step 4) Pairwise classification logits (model-dependent)
-        # --------------------------------------------------------------
         if self.cfg.model in ("sscnn", "rsscnn"):
             logits = self._fusion_logits(pooled_l, pooled_r)
         else:
             b = int(x_left.shape[0])
             logits = torch.zeros((b, int(self.cfg.num_classes)), device=x_left.device, dtype=pooled_l.dtype)
 
-        # --------------------------------------------------------------
         # Step 5) Package outputs (legacy-compatible)
-        # --------------------------------------------------------------
         return {
             "left": {"output": score_l, "attn_map": attn_l},
             "right": {"output": score_r, "attn_map": attn_r},

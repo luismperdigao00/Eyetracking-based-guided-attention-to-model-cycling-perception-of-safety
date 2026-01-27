@@ -183,22 +183,24 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     # ------------------------------------------------------------------
     # Gaze dependencies
     # ------------------------------------------------------------------
-    gaze_mode = getattr(args, "gaze", "use")
+    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    if gaze_mode not in ("off", "align", "guide", "align+guide"):
+        gaze_mode = "off"
+    args.gaze_mode = gaze_mode
+    args.gaze = gaze_mode
+
     attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
+    if attn_w < 0.0:
+        _err(errors, f"--attn_w must be >= 0 (got {attn_w}).")
 
-    if gaze_mode == "off":
-        if attn_w != 0.0:
-            _warn(warnings, "--gaze off: gaze alignment is disabled; setting --attn_w to 0.")
-            args.attn_w = 0.0
-    else:
-        # gaze is on/use/only
-        if attn_w < 0:
-            _err(errors, f"--attn_w must be >= 0 (got {attn_w}).")
+    use_gaze_kl = (gaze_mode in ("align", "align+guide"))
 
-        # In the code, gaze alignment only makes sense if the model returns attn maps.
-        # That is true for rcnn/rsscnn when return_attn is enabled.
-        if model not in ("rcnn", "rsscnn") and attn_w > 0:
-            _warn(warnings, f"--gaze {gaze_mode} with --attn_w>0 but model={model}; gaze KL is not used.")
+    if (not use_gaze_kl) and attn_w > 0.0:
+        _warn(
+            warnings,
+            f"--attn_w={attn_w} but gaze_mode={gaze_mode}; KL is diagnostic only (w_kl_eff=0).",
+        )
+
 
     # ------------------------------------------------------------------
     # Finetuning dependencies

@@ -512,21 +512,49 @@ def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs:
     grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
     return int(grid_h), int(grid_w)
 
+# -------------------------------------------------------------------------------------------------
+# Gaze flag resolver
+# -------------------------------------------------------------------------------------------------
+
 def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
+    """
+    Normalize gaze mode and derive boolean flags.
+
+    Returns:
+      gaze_mode    : {"off","align","guide","align+guide"}
+      use_gaze_any : True if gaze tensors should be loaded/available (diagnostics or injection)
+      use_gaze_kl  : True if KL is part of the training objective (align modes)
+      use_gaze_inj : True if gaze is injected into transformer (guide modes)
+    """
     gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
     if gaze_mode not in ("off", "align", "guide", "align+guide"):
         gaze_mode = "off"
 
-    use_gaze_any = (gaze_mode != "off")
+    use_gaze_any = True
     use_gaze_kl = (gaze_mode in ("align", "align+guide"))
     use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
     return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
 
 
+# -------------------------------------------------------------------------------------------------
+# Backbone specs + transforms
+# -------------------------------------------------------------------------------------------------
+
 def _build_transforms_and_specs(args):
+    """
+    Resolve backbone + preprocessing specs, and build train/eval transforms.
+
+    Key behavior:
+      - gaze tensors are always enabled in transforms so KL can always be computed for diagnostics
+      - KL contributes to training objective only in align modes when attn_w > 0
+      - guide injection is controlled later at model-forward time by gaze_mode
+    """
     backbone_name = str(args.backbone).lower().strip()
     is_cnn_backbone = backbone_name in set(CNN_BACKBONES)
 
+    # -----------------------------
+    # Backbone resolution
+    # -----------------------------
     if is_cnn_backbone:
         backbone_model = None
         model_specs = {
@@ -538,23 +566,35 @@ def _build_transforms_and_specs(args):
     else:
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
 
+    # -----------------------------
+    # Gaze grid resolution
+    # -----------------------------
     grid_h, grid_w = _resolve_gaze_grid(args, is_cnn_backbone, backbone_model, model_specs)
     args.gaze_grid_size = (int(grid_h), int(grid_w))
     args.gaze_map_size_int = int(grid_h)
 
+    # -----------------------------
+    # Gaze flags (single source of truth)
+    # -----------------------------
     gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
     args.gaze_mode = gaze_mode
+    args.gaze = gaze_mode
 
+    # KL affects gradients only in align modes and only if attn_w > 0
+    attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
     use_gaze_loss = (
         str(getattr(args, "model", "")).lower().strip() == "rsscnn"
         and use_gaze_kl
-        and float(getattr(args, "attn_w", 0.0) or 0.0) > 0.0
+        and attn_w > 0.0
     )
 
+    # -----------------------------
+    # Transforms (gaze always enabled)
+    # -----------------------------
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=use_gaze_any,
+        enable_gaze=True,
     )
 
     augment_level = str(getattr(args, "augment", "none")).lower().strip()
@@ -574,17 +614,20 @@ def _build_transforms_and_specs(args):
             interpolation=_get_interp_mode(eval_meta["interpolation"]),
             mean=tuple(eval_meta["mean"]),
             std=tuple(eval_meta["std"]),
-            enable_gaze=use_gaze_any,
+            enable_gaze=True,
             gaze_grid_size=tuple(args.gaze_grid_size),
             **preset,
         )
         train_meta = {
             "train_policy": f"pairwise augmentation ({augment_level})",
             "augment": augment_level,
-            "gaze_aware": bool(use_gaze_any),
+            "gaze_aware": True,
             "params": dict(preset),
         }
 
+    # -----------------------------
+    # Metadata
+    # -----------------------------
     args.expected_img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
 
     args.transforms_meta = {
@@ -592,13 +635,13 @@ def _build_transforms_and_specs(args):
         "backbone_family": "cnn" if is_cnn_backbone else "transformer",
         "model_specs": dict(model_specs),
         "gaze": {
-            "mode": str(getattr(args, "gaze_mode", "off")),
-            "requested": bool(use_gaze_any),
+            "mode": str(gaze_mode),
+            "requested": True,
             "use_gaze_loss": bool(use_gaze_loss),
             "use_gaze_kl": bool(use_gaze_kl),
             "use_gaze_injection": bool(use_gaze_inj),
-            "use_nobp": bool(getattr(args, "use_nobp", False)),
             "grid_size": tuple(args.gaze_grid_size),
+            "attn_w": float(attn_w),
         },
         "eval": dict(eval_meta),
         "train": dict(train_meta),
@@ -606,13 +649,16 @@ def _build_transforms_and_specs(args):
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
 
-    use_gaze_requested = bool(use_gaze_any)
+    # Gaze tensors are always expected by the dataset/loader in this simplified design
+    use_gaze_requested = True
     return backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone
 
 
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
     
-    use_gaze = (str(getattr(args, "gaze_mode", "off")).lower().strip() != "off")
+    #use_gaze = (str(getattr(args, "gaze_mode", "off")).lower().strip() != "off")
+    use_gaze = True
+
 
     train_set = ComparisonsDataset(
         dataframe=X_train,
@@ -661,14 +707,11 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         known = TRANSFORMER_BACKBONES + CNN_BACKBONES
         raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known}")
 
-    # ----------------------------------------------------------------------------------------------
-    # Resolve gaze interface into explicit booleans
-    # ----------------------------------------------------------------------------------------------
     gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
 
-    # ----------------------------------------------------------------------------------------------
-    # CNN backbones
-    # ----------------------------------------------------------------------------------------------
+    # Attention maps are required because KL is always computed for diagnostics.
+    need_attn_maps = (str(getattr(args, "model", "")).lower().strip() == "rsscnn")
+
     if is_cnn_backbone:
         from nets.cnn import CNN as Net
         from torchvision import models
@@ -693,9 +736,6 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         )
         return net
 
-    # ----------------------------------------------------------------------------------------------
-    # Transformer backbones
-    # ----------------------------------------------------------------------------------------------
     from nets.transformer import Transformer as Net
 
     net = Net(
@@ -708,19 +748,17 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         num_ft_blocks=args.num_ft_blocks,
         rank_dropout=args.rank_dropout,
         cross_dropout=args.cross_dropout,
-        use_attn_hook=bool(use_gaze_loss),
-        return_attn=bool(use_gaze_loss),
+        use_attn_hook=bool(need_attn_maps),
+        return_attn=bool(need_attn_maps),
         attention_mode=args.attention_mode,
         attn_topk=args.attn_topk,
         attn_out_hw=tuple(getattr(args, "gaze_grid_size", (14, 14))),
         use_gaze_injection=bool(use_gaze_inj),
     )
 
-    # Logging/compat flag used elsewhere
-    net.attn_grad = bool(use_gaze_loss)
+    net.attn_grad = bool(need_attn_maps)
 
-    # Ensure attention maps match gaze grid resolution when KL supervision is active
-    if use_gaze_loss:
+    if need_attn_maps:
         try:
             from dataclasses import replace
             if hasattr(net, "attn_cfg"):
@@ -729,6 +767,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
             raise RuntimeError(f"Failed to set attention output size to gaze_grid_size={args.gaze_grid_size}: {e}")
 
     return net
+
 
 
 def _maybe_wrap_dataparallel(args, net: torch.nn.Module, gpu_ids: list[int]) -> torch.nn.Module:
