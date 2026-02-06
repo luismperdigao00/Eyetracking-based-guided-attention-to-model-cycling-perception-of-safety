@@ -186,6 +186,24 @@ class ComparisonsDataset(Dataset):
         score_c = int(row["score_classification"])
 
         # ---------------------------------------------------------------------
+        # 2.5) Fast path: no gaze (avoid any gaze-related I/O and tensors)
+        # ---------------------------------------------------------------------
+        if not self.use_gaze:
+            sample = {
+                "image_l": image_l,
+                "image_r": image_r,
+                "score_r": score_r,
+                "score_c": score_c,
+                "image_l_name": img_l_path,
+                "image_r_name": img_r_path,
+            }
+
+            if self.transform is not None:
+                sample = self.transform(sample)
+
+            return sample
+
+        # ---------------------------------------------------------------------
         # 3) Gaze flags and paths
         # ---------------------------------------------------------------------
         has_eye_flag = False
@@ -195,8 +213,6 @@ class ComparisonsDataset(Dataset):
             except Exception:
                 has_eye_flag = bool(row["has_eyetracker"])
 
-        if not self.use_gaze:
-            has_eye_flag = False
 
         gaze_file_l = row["npy_file_l"] if ("npy_file_l" in row.index and pd.notna(row["npy_file_l"])) else None
         gaze_file_r = row["npy_file_r"] if ("npy_file_r" in row.index and pd.notna(row["npy_file_r"])) else None
@@ -337,7 +353,7 @@ class ResizeCenterCropAlignGaze:
         # 3) If gaze is disabled, leave gaze keys untouched
         if not self.enable_gaze:
             return
-
+        
         out_hw = self._gaze_out_hw()
 
         has_real_gaze = self._as_bool(sample.get("has_eyetracker", False))
@@ -350,11 +366,13 @@ class ResizeCenterCropAlignGaze:
         g = self._resize_gaze(g, size_hw=(h, w))  # match resized image H,W
         g = TF.center_crop(g, [self.target_crop, self.target_crop])
 
+
         if self.gaze_output == "align":
             g = self._resize_gaze(g, size_hw=out_hw)  # supervision grid
-
+    
         sample[gaze_key] = g
-
+        
+    
     def __call__(self, sample: dict) -> dict:
         self._process_side(sample, "l")
         self._process_side(sample, "r")
@@ -362,6 +380,94 @@ class ResizeCenterCropAlignGaze:
 
 
 
+def _get_interp_mode(mode_str):
+    if mode_str is None:
+        raise ValueError("Interpolation mode is None; backbone config may be incomplete.")
+
+    mode_str = str(mode_str).lower()
+    mapping = {
+        "nearest": InterpolationMode.NEAREST,
+        "bilinear": InterpolationMode.BILINEAR,
+        "bicubic": InterpolationMode.BICUBIC,
+        "lanczos": InterpolationMode.LANCZOS,
+    }
+
+    if mode_str not in mapping:
+        raise ValueError(f"Unknown interpolation mode '{mode_str}'")
+
+    return mapping[mode_str]
+
+def build_eval_transforms(
+    specs: dict,
+    gaze_grid_size=(14, 14),
+    enable_gaze: bool = True,
+    gaze_output: str = "align",  # "align" or "guide"
+):
+
+    """
+    Build deterministic validation/test preprocessing.
+
+    Steps:
+      - Resize by short side (preserve aspect ratio), then center-crop to the model input size
+      - If enabled and eyetracker data is present, apply the same geometric ops to gaze and downsample it
+      - Convert left/right images to tensors and normalize with backbone stats
+    """
+    target_crop = int(specs["input_size"][-1])
+    crop_pct = float(specs["crop_pct"])
+
+    # timm-style eval resize: input_size / crop_pct, clamped to >= input_size
+    resize_dim = max(target_crop, int(round(target_crop / crop_pct)))
+
+    img_interp = _get_interp_mode(specs["interpolation"])
+    mean = tuple(specs["mean"])
+    std = tuple(specs["std"])
+
+    def _to_tensor_and_normalize_pair(sample: dict) -> dict:
+        # Apply the same deterministic post-processing to both image views
+        for k in ("image_l", "image_r"):
+            if k in sample:
+                x = TF.to_tensor(sample[k])
+                sample[k] = TF.normalize(x, mean=mean, std=std)
+        return sample
+
+    eval_tfms = transforms.Compose(
+        [
+            ResizeCenterCropAlignGaze(
+                resize_dim=resize_dim,
+                target_crop=target_crop,
+                img_interp=img_interp,
+                gaze_grid_size=gaze_grid_size,
+                enable_gaze=bool(enable_gaze),
+                gaze_output=str(gaze_output),
+            ),
+            transforms.Lambda(_to_tensor_and_normalize_pair),
+        ]
+    )
+
+    gaze_output_norm = str(gaze_output).lower().strip()
+    
+    gaze_policy = "if enable_gaze: Resize(match,gaze)->CenterCrop(gaze)"
+    if gaze_output_norm == "align":
+        gaze_policy += "->ResizeDown(gaze)"
+    
+    meta = {
+        "target_crop": target_crop,
+        "resize_dim": resize_dim,
+        "crop_pct": crop_pct,
+        "interpolation": str(specs.get("interpolation", "bilinear")),
+        "mean": mean,
+        "std": std,
+        "gaze_grid_size": tuple(gaze_grid_size),
+        "enable_gaze": bool(enable_gaze),
+        "gaze_output": str(gaze_output),
+        "eval_policy": (
+            "Resize(short,img) -> CenterCrop(img); "
+            f"{gaze_policy}; "
+            "ToTensor/Norm(img)"
+        ),
+    }
+
+    return eval_tfms, meta
 
 # =============================================================================================== #
 # Augmentation presets (per-op paired toggles)
@@ -541,11 +647,16 @@ class Augmentation:
         self.gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
 
         gaze_output = str(gaze_output).lower().strip()
+        
+        # "align+guide" is a gaze_mode; transform output should follow "align" (grid-sized).
         if gaze_output == "align+guide":
-            gaze_output = "guide"
+            gaze_output = "align"
+        
         if gaze_output not in ("align", "guide"):
             gaze_output = "align"
+        
         self.gaze_output = gaze_output
+
 
 
         self.paired_scale = bool(paired_scale)
@@ -1025,37 +1136,17 @@ class Augmentation:
                 sample["gaze_r"] = torch.zeros((1, out_h, out_w), dtype=torch.float32)
             else:
                 if self.gaze_output == "align":
-                    # Final downsample to transformer/CNN attention grid
-                    g_l = self._downsample_gaze_to_grid(g_l)
-                    g_r = self._downsample_gaze_to_grid(g_r)
-
-                    gh, gw = self.gaze_grid_size
-
+                    # Apply erase on out_size gaze first, then downsample to grid
                     if erase_rect_l is not None:
                         top, left, eh, ew = erase_rect_l
-                        y0 = int(math.floor(top * gh / self.out_size))
-                        x0 = int(math.floor(left * gw / self.out_size))
-                        y1 = int(math.ceil((top + eh) * gh / self.out_size))
-                        x1 = int(math.ceil((left + ew) * gw / self.out_size))
-                        y0 = max(0, min(gh, y0))
-                        y1 = max(0, min(gh, y1))
-                        x0 = max(0, min(gw, x0))
-                        x1 = max(0, min(gw, x1))
-                        if y1 > y0 and x1 > x0:
-                            g_l[:, y0:y1, x0:x1] = 0.0
-
+                        g_l[:, top:top + eh, left:left + ew] = 0.0
+                
                     if erase_rect_r is not None:
                         top, left, eh, ew = erase_rect_r
-                        y0 = int(math.floor(top * gh / self.out_size))
-                        x0 = int(math.floor(left * gw / self.out_size))
-                        y1 = int(math.ceil((top + eh) * gh / self.out_size))
-                        x1 = int(math.ceil((left + ew) * gw / self.out_size))
-                        y0 = max(0, min(gh, y0))
-                        y1 = max(0, min(gh, y1))
-                        x0 = max(0, min(gw, x0))
-                        x1 = max(0, min(gw, x1))
-                        if y1 > y0 and x1 > x0:
-                            g_r[:, y0:y1, x0:x1] = 0.0
+                        g_r[:, top:top + eh, left:left + ew] = 0.0
+                
+                    g_l = self._downsample_gaze_to_grid(g_l)
+                    g_r = self._downsample_gaze_to_grid(g_r)
 
                 else:
                     # guide: keep gaze at out_size x out_size (same as model image input)

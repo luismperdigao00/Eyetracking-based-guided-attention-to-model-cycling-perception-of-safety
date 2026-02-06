@@ -7,14 +7,7 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 import logging
 from datetime import date
-
-import pickle
-
-import inspect
-import torchvision.transforms as transforms
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as TF
-import torchvision.models as torch_models
+import random
 
 
 try:
@@ -27,32 +20,35 @@ from train_utils import (
     infer_vit_grid_size,
     compute_class_weights_from_df,
     print_run_plan,
-    )
+    build_gaze_config,
+)
 
 from data import (
     ComparisonsDataset,
-    ResizeCenterCropAlignGaze,
+    _get_interp_mode,
+    build_eval_transforms,
     AUG_PRESETS,
     Augmentation,
 )
-
-@dataclass(frozen=True)
-class GazeConfig:
-    mode: str
-    load_gaze: bool
-    inject: bool
-    compute_kl: bool
-    use_kl_in_loss: bool
-    need_attn_maps: bool
-    gaze_output: str
-
 # -------------------------------------------------------------------------------------------------
 # Utilities
 # -------------------------------------------------------------------------------------------------
 
-def _seed_everything(seed: int) -> None:
-    torch.manual_seed(int(seed))
-    np.random.seed(int(seed))
+def _seed_everything(seed: int, deterministic: bool = False) -> None:
+    seed = int(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
 
 def initialize_logging():
     """Initialize run logs."""
@@ -110,7 +106,7 @@ def initialize_wandb(args):
             "resume": args.resume,
             "resume_epoch": args.epoch,
             "checkpoint": checkpoint_path,
-            "gaze_mode": str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))),
+            "gaze_mode": str(getattr(args, "gaze_mode", "disable")),
             "use_nobp": bool(getattr(args, "use_nobp", False)),
 
         },
@@ -126,8 +122,6 @@ def initialize_wandb(args):
     wandb.define_metric("max_accuracy_train", step_metric="epoch")
     wandb.define_metric("max_accuracy_validation", step_metric="epoch")
     wandb.define_metric("max_accuracy_test", step_metric="epoch")
-    
-
 
 def read_data(args):
     # ------------------------------------------------------------------
@@ -207,14 +201,14 @@ def read_data(args):
             comparisons_df["has_eyetracker"].value_counts(dropna=False).to_dict(),
         )
 
-        if args.gaze == "only":
+        if str(getattr(args, "eyetracker_filter", "all")).lower().strip() == "only":
             before = len(comparisons_df)
             comparisons_df = comparisons_df[comparisons_df["has_eyetracker"]].copy()
             after = len(comparisons_df)
 
-            print(f"[read_data] Rows after gaze=only filter: {after}/{before}")
+            print(f"[read_data] Rows after eyetracker_filter=only: {after}/{before}")
             if after == 0:
-                print("[WARN] --gaze only removed all rows.")
+                print("[WARN] --eyetracker_filter only removed all rows.")
 
     # ------------------------------------------------------------------
     # 5) LABEL HANDLING / TIES
@@ -330,7 +324,7 @@ def _print_filtered_dataset_summary(args, df: pd.DataFrame) -> None:
     print("\n=== Effective Dataset (after all filters, before split) ===")
     print(f"Comparisons file : {args.comparisons}")
     print(f"Cities requested : {args.cities}")
-    print(f"Gaze mode        : {args.gaze}  (rows kept depend on has_eyetracker + gaze setting)")
+    print(f"Gaze mode        : {getattr(args, 'gaze_mode', 'disable')}  (rows kept depend on has_eyetracker + eyetracker_filter)")
     print(f"Ties enabled     : {args.ties}  (ties=False removes score==0 rows)")
     print(f"Final row count  : {len(df):,}")
 
@@ -440,34 +434,18 @@ def _print_label_distribution_by_split(X_train: pd.DataFrame, X_val: pd.DataFram
 
 
 def _compute_and_attach_class_weights(args, X_train: pd.DataFrame) -> None:
-    if not args.use_class_weights:
-        args.class_weights = None
-        print("Class weights: OFF")
-        print()
-        return
-
-    expected = 3 if bool(args.ties) else 2
-
-    if args.class_weights is not None:
-        w = [float(x) for x in args.class_weights]
-        if len(w) != expected:
-            raise ValueError(f"--class_weights must have length {expected} (got {len(w)}).")
-        if any(v < 0 for v in w):
-            raise ValueError("--class_weights entries must be >= 0.")
-        args.class_weights = w
-        print(f"Class weights: ON  (manual override) → {w}")
-        print()
-        return
-
-    cw = compute_class_weights_from_df(
+    args.class_weights = compute_class_weights_from_df(
         X_train["score_classification"],
-        use_ties=bool(args.ties),
-        enable_weights=True,
+        use_ties=args.ties,
+        enable_weights=args.use_class_weights,
     )
-    args.class_weights = cw.detach().cpu().numpy().tolist()
-    print(f"Class weights: ON  (computed from Train split) → {args.class_weights}")
-    print()
 
+    if args.use_class_weights and args.class_weights is not None:
+        cw = args.class_weights.detach().cpu().numpy().tolist()
+        print(f"Class weights: ON  (computed from Train split) → {cw}")
+    else:
+        print("Class weights: OFF")
+    print()
 
 
 def _parse_gpu_ids(args) -> list[int]:
@@ -527,59 +505,29 @@ TRANSFORMER_BACKBONES = [
     "deit_base_distilled",
 ]
 
-CNN_BACKBONES = ["alex", "vgg", "dense", "resnet", "convnext_base", "efficientnet_v2_s", "regnet_y_8gf"]
+CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-CNN_SPECS_DEFAULT = {
+CNN_SPECS = {
     "input_size": (3, 224, 224),
     "crop_pct": 0.875,
+    "mean": (0.485, 0.456, 0.406),
+    "std": (0.229, 0.224, 0.225),
     "interpolation": "bilinear",
-    "mean": IMAGENET_MEAN,
-    "std": IMAGENET_STD,
-    "alias": "cnn_default",
-    "img_size": 224,
-}
-
-CNN_SPECS_BY_BACKBONE = {
-    "alex": CNN_SPECS_DEFAULT,
-    "vgg": CNN_SPECS_DEFAULT,
-    "dense": CNN_SPECS_DEFAULT,
-    "resnet": CNN_SPECS_DEFAULT,
-
-    "convnext_base": {
-        "input_size": (3, 224, 224),
-        "crop_pct": 224.0 / 232.0,
-        "interpolation": "bilinear",
-        "mean": IMAGENET_MEAN,
-        "std": IMAGENET_STD,
-        "alias": "convnext_base",
-        "img_size": 224,
-    },
-
-    "regnet_y_8gf": {
-        "input_size": (3, 224, 224),
-        "crop_pct": 224.0 / 232.0,
-        "interpolation": "bilinear",
-        "mean": IMAGENET_MEAN,
-        "std": IMAGENET_STD,
-        "alias": "regnet_y_8gf",
-        "img_size": 224,
-    },
-
-    "efficientnet_v2_s": {
-        "input_size": (3, 384, 384),
-        "crop_pct": 1.0,
-        "interpolation": "bilinear",
-        "mean": IMAGENET_MEAN,
-        "std": IMAGENET_STD,
-        "alias": "efficientnet_v2_s",
-        "img_size": 384,
-    },
 }
 
 
+def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs: dict) -> tuple[int, int]:
+    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
+        forced = int(getattr(args, "gaze_map_size"))
+        return forced, forced
+
+    if is_cnn_backbone:
+        return 14, 14
+
+    grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
+    return int(grid_h), int(grid_w)
+
+import inspect
 
 # -------------------------------------------------------------------------------------------------
 # Gaze grid resolver
@@ -605,166 +553,60 @@ def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs:
     return int(grid_h), int(grid_w)
 
 # -------------------------------------------------------------------------------------------------
-# Gaze flag resolver
-# -------------------------------------------------------------------------------------------------
-
-def _get_interp_mode(mode_str):
-    if mode_str is None:
-        raise ValueError("Interpolation mode is None; backbone config may be incomplete.")
-
-    mode_str = str(mode_str).lower()
-    mapping = {
-        "nearest": InterpolationMode.NEAREST,
-        "bilinear": InterpolationMode.BILINEAR,
-        "bicubic": InterpolationMode.BICUBIC,
-        "lanczos": InterpolationMode.LANCZOS,
-    }
-
-    if mode_str not in mapping:
-        raise ValueError(f"Unknown interpolation mode '{mode_str}'")
-
-    return mapping[mode_str]
-
-
-
-# -------------------------------------------------------------------------------------------------
 # Backbone specs + transforms
 # -------------------------------------------------------------------------------------------------
 
-def build_eval_transforms(
-    specs: dict,
-    gaze_grid_size=(14, 14),
-    enable_gaze: bool = True,
-    gaze_output: str = "align",  # "align" or "guide"
-):
-
-    """
-    Build deterministic validation/test preprocessing.
-
-    Steps:
-      - Resize by short side (preserve aspect ratio), then center-crop to the model input size
-      - If enabled and eyetracker data is present, apply the same geometric ops to gaze and downsample it
-      - Convert left/right images to tensors and normalize with backbone stats
-    """
-    target_crop = int(specs["input_size"][-1])
-    crop_pct = float(specs["crop_pct"])
-
-    # timm-style eval resize: input_size / crop_pct, clamped to >= input_size
-    resize_dim = max(target_crop, int(round(target_crop / crop_pct)))
-
-    img_interp = _get_interp_mode(specs["interpolation"])
-    mean = tuple(specs["mean"])
-    std = tuple(specs["std"])
-
-    def _to_tensor_and_normalize_pair(sample: dict) -> dict:
-        # Apply the same deterministic post-processing to both image views
-        for k in ("image_l", "image_r"):
-            if k in sample:
-                x = TF.to_tensor(sample[k])
-                sample[k] = TF.normalize(x, mean=mean, std=std)
-        return sample
-
-    eval_tfms = transforms.Compose(
-        [
-            ResizeCenterCropAlignGaze(
-                resize_dim=resize_dim,
-                target_crop=target_crop,
-                img_interp=img_interp,
-                gaze_grid_size=gaze_grid_size,
-                enable_gaze=bool(enable_gaze),
-                gaze_output=str(gaze_output),
-            ),
-            transforms.Lambda(_to_tensor_and_normalize_pair),
-        ]
-    )
-
-    gaze_output_norm = str(gaze_output).lower().strip()
-    
-    gaze_policy = "if enable_gaze: Resize(match,gaze)->CenterCrop(gaze)"
-    if gaze_output_norm == "align":
-        gaze_policy += "->ResizeDown(gaze)"
-    
-    meta = {
-        "target_crop": target_crop,
-        "resize_dim": resize_dim,
-        "crop_pct": crop_pct,
-        "interpolation": str(specs.get("interpolation", "bilinear")),
-        "mean": mean,
-        "std": std,
-        "gaze_grid_size": tuple(gaze_grid_size),
-        "enable_gaze": bool(enable_gaze),
-        "gaze_output": str(gaze_output),
-        "eval_policy": (
-            "Resize(short,img) -> CenterCrop(img); "
-            f"{gaze_policy}; "
-            "ToTensor/Norm(img)"
-        ),
-    }
-
-    return eval_tfms, meta
-    
 def _build_transforms_and_specs(args):
     """
     Resolve the backbone configuration and build preprocessing pipelines.
 
-    Responsibilities:
-      - Instantiate the requested backbone (CNN or transformer) and obtain its preprocessing specs.
-      - Resolve the gaze operating mode and the corresponding supervision grid size.
-      - Build evaluation transforms (deterministic resize + center-crop) and training transforms
-        (either identical to eval, or gaze-aware pairwise augmentation).
+    Central gaze policy:
+      - build_gaze_config(...) defines all gaze dependencies (load/inject/KL/hook needs)
+      - transforms only receive enable_gaze and gaze_output
+      - args.gaze_map_size_int only matters when gaze maps are actually loaded
     """
+
     backbone_name = str(args.backbone).lower().strip()
     is_cnn_backbone = backbone_name in set(CNN_BACKBONES)
 
-    # -----------------------------
-    # Gaze flags (single source of truth)
-    # -----------------------------
-    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
-    args.gaze_mode = gaze_mode
-    args.gaze = gaze_mode
-
-    # build_eval_transforms expects "align" or "guide"
-    gaze_output = "guide" if gaze_mode == "guide" else "align"
-
-    attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
-
-    # KL affects gradients only in align modes and only if attn_w > 0
-    use_gaze_loss = (
-        str(getattr(args, "model", "")).lower().strip() == "rsscnn"
-        and bool(use_gaze_kl)
-        and attn_w > 0.0
-    )
-
-    # -----------------------------
     # Backbone resolution
-    # -----------------------------
     if is_cnn_backbone:
         backbone_model = None
-        model_specs = dict(CNN_SPECS_BY_BACKBONE.get(backbone_name, CNN_SPECS_DEFAULT))
+        model_specs = {
+            "alias": args.backbone,
+            "timm_id": None,
+            **CNN_SPECS,
+            "img_size": int(CNN_SPECS["input_size"][-1]),
+        }
     else:
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
 
-    # Expected image crop resolution (square). Matches build_eval_transforms target_crop.
+    # Expected eval crop resolution (square)
     out_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
 
-    # -----------------------------
-    # Gaze grid resolution (supervision grid for align-mode KL)
-    # -----------------------------
+    # Attention/KL grid size (used by align-style KL and align-style gaze maps)
     grid_h, grid_w = _resolve_gaze_grid(args, is_cnn_backbone, backbone_model, model_specs)
     args.gaze_grid_size = (int(grid_h), int(grid_w))
 
-    # Default folder selector for dataset gaze loading:
-    # - align modes typically load gaze saved at the supervision grid size
-    # - guide mode typically loads gaze saved at out_size (crop resolution)
-    args.gaze_map_size_int = int(out_size) if gaze_output == "guide" else int(grid_h)
+    # Central gaze policy object (single source of truth)
+    gaze_cfg = build_gaze_config(args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
 
-    # -----------------------------
+    # gaze_output is only meaningful when gaze is loaded; kept stable for transform signatures
+    gaze_output = str(getattr(gaze_cfg, "gaze_output", "align")).lower().strip()
+    if gaze_output not in ("align", "guide"):
+        gaze_output = "align"
+
+    # Select gaze folder size only when gaze maps are loaded
+    if bool(getattr(gaze_cfg, "load_gaze", False)) and (gaze_output == "guide"):
+        args.gaze_map_size_int = int(out_size)
+    else:
+        args.gaze_map_size_int = int(grid_h)
+
     # Eval transforms
-    # -----------------------------
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=bool(use_gaze_any),
+        enable_gaze=bool(getattr(gaze_cfg, "load_gaze", False)),
         gaze_output=gaze_output,
     )
 
@@ -772,15 +614,13 @@ def _build_transforms_and_specs(args):
     if augment_level not in ("none", "light", "heavy"):
         augment_level = "none"
 
-    # -----------------------------
     # Train transforms
-    # -----------------------------
     if augment_level == "none":
         train_tfms = eval_tfms
         train_meta = {"train_policy": "deterministic (same as eval)", "augment": "none"}
     else:
         preset = AUG_PRESETS[augment_level]
-        aug_kwargs = dict(
+        train_tfms = Augmentation(
             augment=True,
             ties=bool(getattr(args, "ties", True)),
             resize_short=int(eval_meta["resize_dim"]),
@@ -788,34 +628,33 @@ def _build_transforms_and_specs(args):
             interpolation=_get_interp_mode(eval_meta["interpolation"]),
             mean=tuple(eval_meta["mean"]),
             std=tuple(eval_meta["std"]),
-            enable_gaze=bool(use_gaze_any),
+            enable_gaze=bool(getattr(gaze_cfg, "load_gaze", False)),
             gaze_grid_size=tuple(args.gaze_grid_size),
-            gaze_output=str(gaze_output),
+            gaze_output=gaze_output,
             **preset,
         )
-        train_tfms = Augmentation(**aug_kwargs)
         train_meta = {
-            "train_policy": f"augmentation ({augment_level})",
-            "augment": str(augment_level),
-            "gaze_output": str(gaze_output),
+            "train_policy": "deterministic (same as eval)",
+            "augment": augment_level,
+            "gaze_output": gaze_output,
         }
 
-    # -----------------------------
-    # Metadata
-    # -----------------------------
+    # Metadata for logging/printing
     args.expected_img_size = int(out_size)
+    attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
 
     args.transforms_meta = {
         "backbone": args.backbone,
         "backbone_family": "cnn" if is_cnn_backbone else "transformer",
         "model_specs": dict(model_specs),
         "gaze": {
-            "mode": str(gaze_mode),
-            "gaze_output": str(gaze_output),
-            "requested": bool(use_gaze_any),
-            "use_gaze_loss": bool(use_gaze_loss),
-            "use_gaze_kl": bool(use_gaze_kl),
-            "use_gaze_injection": bool(use_gaze_inj),
+            "mode": str(getattr(gaze_cfg, "mode", "disable")),
+            "load_gaze": bool(getattr(gaze_cfg, "load_gaze", False)),
+            "inject": bool(getattr(gaze_cfg, "inject", False)),
+            "compute_kl": bool(getattr(gaze_cfg, "compute_kl", False)),
+            "use_kl_in_loss": bool(getattr(gaze_cfg, "use_kl_in_loss", False)),
+            "need_attn_maps": bool(getattr(gaze_cfg, "need_attn_maps", False)),
+            "gaze_output": gaze_output,
             "grid_size": tuple(args.gaze_grid_size),
             "out_size": int(out_size),
             "attn_w": float(attn_w),
@@ -826,14 +665,16 @@ def _build_transforms_and_specs(args):
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
 
-    use_gaze_requested = bool(use_gaze_any)
+    use_gaze_requested = bool(getattr(gaze_cfg, "load_gaze", False))
+    use_gaze_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+
     return backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone
 
 
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
-    
-    #use_gaze = (str(getattr(args, "gaze_mode", "off")).lower().strip() != "off")
-    use_gaze = True
+
+    cfg = getattr(args, "gaze_cfg", None)
+    use_gaze = bool(getattr(cfg, "load_gaze", False))
 
     train_set = ComparisonsDataset(
         dataframe=X_train,
@@ -866,7 +707,6 @@ def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tf
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
-    
     return train_loader, val_loader, test_loader
 
 
@@ -877,24 +717,19 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         known = TRANSFORMER_BACKBONES + CNN_BACKBONES
         raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known}")
 
-    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
-
-    # Attention maps are required because KL is always computed for diagnostics.
-    need_attn_maps = (str(getattr(args, "model", "")).lower().strip() == "rsscnn")
+    gaze_cfg = getattr(args, "gaze_cfg", None)
+    need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False))
+    use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
 
     if is_cnn_backbone:
         from nets.cnn import CNN as Net
         from torchvision import models
 
         cnn_factory = {
-            "alex": torch_models.alexnet,
-            "vgg": torch_models.vgg19_bn,
-            "dense": torch_models.densenet121,
-            "resnet": torch_models.resnet50,
-        
-            "convnext_base": torch_models.convnext_base,
-            "efficientnet_v2_s": torch_models.efficientnet_v2_s,
-            "regnet_y_8gf": torch_models.regnet_y_8gf,
+            "alex": models.alexnet,
+            "vgg": models.vgg19,
+            "dense": models.densenet121,
+            "resnet": models.resnet50,
         }
 
         flatten_spatial = (str(getattr(args, "cnn_pool", "gap")).lower().strip() == "flatten")
@@ -930,7 +765,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         use_gaze_injection=bool(use_gaze_inj),
     )
 
-    net.attn_grad = bool(need_attn_maps)
+    net.attn_grad = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
 
     if need_attn_maps:
         try:
@@ -941,7 +776,6 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
             raise RuntimeError(f"Failed to set attention output size to gaze_grid_size={args.gaze_grid_size}: {e}")
 
     return net
-
 
 
 def _maybe_wrap_dataparallel(args, net: torch.nn.Module, gpu_ids: list[int]) -> torch.nn.Module:

@@ -37,7 +37,7 @@ from utils.losses import compute_loss
 from utils.log import log
 
 from ignite.exceptions import NotComputableError
-from train_utils import print_run_plan
+from train_utils import print_run_plan, normalize_gaze_mode
 
         
 class EarlyStopper:
@@ -132,69 +132,64 @@ def _set_gaze_bp(model: torch.nn.Module, enabled: bool) -> None:
         return
 
 def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
-    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-    if gaze_mode not in ("off", "align", "guide", "align+guide"):
-        gaze_mode = "off"
+    gaze_cfg = getattr(args, "gaze_cfg", None)
 
+    if gaze_cfg is not None:
+        gaze_mode = str(getattr(gaze_cfg, "mode", "disable"))
+        use_gaze_any = bool(getattr(gaze_cfg, "load_gaze", False))
+        use_gaze_kl = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+        use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
+        return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+
+    gaze_mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
     w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
 
-    use_gaze_any = (gaze_mode != "off")
-    use_gaze_kl = (gaze_mode in ("align", "align+guide")) and (w_kl > 0.0)
-    use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
+    use_gaze_inj = gaze_mode in ("guide", "align+gaze")
+    kl_requested = gaze_mode in ("diag", "guide", "align", "align+gaze")
+    use_gaze_kl = bool(gaze_mode in ("align", "align+gaze") and (w_kl > 0.0))
+    use_gaze_any = bool(gaze_mode != "disable") and bool(use_gaze_inj or kl_requested)
 
     return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+
 
 def _prepare_batch(
     data: Dict[str, torch.Tensor],
     device: torch.device,
     args,
 ) -> Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]:
-    """
-    Prepare a single mini-batch produced by the DataLoader.
-
-    Behavior:
-      - Always returns image tensors as model inputs.
-      - Always returns gaze tensors + has-eye mask in labels so KL can always be computed for diagnostics.
-      - Only passes gaze tensors into the model inputs when gaze injection is enabled (guide / align+guide).
-    """
     input_left = data["image_l"].to(device)
     input_right = data["image_r"].to(device)
 
     label_r = data["score_r"].to(device).float()
     label_c = data["score_c"].to(device).long()
 
-    gaze_mode, _use_gaze_any, _use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+    _gaze_mode, use_gaze_any, _use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
 
-    labels: Dict[str, torch.Tensor] = {
-        "label_r": label_r,
-        "label_c": label_c,
-    }
+    labels: Dict[str, torch.Tensor] = {"label_r": label_r, "label_c": label_c}
 
-    # Gaze labels are always present for KL diagnostics
-    if ("gaze_l" not in data) or ("gaze_r" not in data):
-        raise KeyError("Batch missing gaze_l/gaze_r. Gaze tensors must be provided for KL diagnostics.")
+    gaze_l = gaze_r = has_eye_mask = None
+    if use_gaze_any:
+        if ("gaze_l" not in data) or ("gaze_r" not in data):
+            raise KeyError("Batch missing gaze_l/gaze_r while gaze is enabled.")
+        if "has_eyetracker" not in data:
+            raise KeyError("Batch missing has_eyetracker while gaze is enabled.")
 
-    if "has_eyetracker" not in data:
-        raise KeyError("Batch missing has_eyetracker. Mask must be provided for KL diagnostics.")
+        gaze_l = data["gaze_l"].to(device)
+        gaze_r = data["gaze_r"].to(device)
+        has_eye_mask = data["has_eyetracker"].to(device)
 
-    gaze_l = data["gaze_l"].to(device)
-    gaze_r = data["gaze_r"].to(device)
-    has_eye_mask = data["has_eyetracker"].to(device)
+        labels["gaze_l"] = gaze_l
+        labels["gaze_r"] = gaze_r
+        labels["has_eye_mask"] = has_eye_mask
 
-    labels["gaze_l"] = gaze_l
-    labels["gaze_r"] = gaze_r
-    labels["has_eye_mask"] = has_eye_mask
-
-    # Model input packing:
-    # - off / align: image-only model execution
-    # - guide / align+guide: pass gaze and mask for injection
     if use_gaze_inj:
+        if gaze_l is None or gaze_r is None or has_eye_mask is None:
+            raise ValueError("Gaze injection enabled but gaze tensors are missing from batch.")
         inputs: Tuple[torch.Tensor, ...] = (input_left, input_right, gaze_l, gaze_r, has_eye_mask)
     else:
         inputs = (input_left, input_right)
 
     return inputs, labels
-
 
 
 def _build_metrics_output(
@@ -629,30 +624,27 @@ def _make_train_step(
     """
     Ignite training-step factory.
 
-    Behavior:
-      - Runs forward under AMP when enabled
-      - Computes composite loss + parts via compute_loss
-      - Gaze behavior controlled by args.gaze_mode:
-          * off        : no injection; KL computed/logged if gaze exists, not weighted in loss
-          * align      : KL computed/logged and weighted into loss_total via attn_w
-          * guide      : injection enabled; KL computed/logged if gaze exists, not weighted in loss
-          * align+guide: injection enabled; KL computed/logged and weighted into loss_total via attn_w
-      - Backprop always uses loss_total (KL contributes only when w_kl_eff > 0 inside compute_loss)
-      - Supports gradient accumulation, optional grad clipping, optimizer step, scheduler step
+    Centralized gaze behavior:
+      - _prepare_batch uses args.gaze_cfg to decide whether gaze tensors are present and whether
+        gaze is injected into the model forward.
+      - compute_loss uses args.gaze_cfg to decide whether KL(attn↔gaze) is computed and whether
+        it contributes to loss_total.
+
+    Supported gaze modes:
+      - disable     : no gaze tensors, no KL diagnostics, no injection
+      - diag        : KL computed for diagnostics only
+      - guide       : gaze injection enabled; KL computed for diagnostics only
+      - align       : KL weighted into objective via attn_w
+      - align+gaze  : injection enabled + KL weighted into objective via attn_w
     """
     accum = max(1, int(accum_steps))
 
     def train_step(engine, data):
-        # -----------------------------
-        # Hard stop marker
-        # -----------------------------
         if os.path.exists("SKIP_TRIAL"):
             print("[USER REQUEST] SKIPPING THIS RUN NOW.")
             os.remove("SKIP_TRIAL")
-
             if trial is not None:
                 raise optuna.TrialPruned()
-
             engine.terminate()
             return {"skipped": True}
 
@@ -661,23 +653,12 @@ def _make_train_step(
 
         use_amp = scaler.is_enabled()
 
-        # -----------------------------
-        # Forward pass (AMP-capable)
-        # -----------------------------
         inputs, labels = _prepare_batch(data, device, args)
 
         with autocast(enabled=use_amp):
             forward_dict = net(*inputs)
-
-            # loss_total includes KL only when gaze_mode in align modes and attn_w > 0
             loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
 
-            # Diagnostic objective (class + rank only)
-            loss_no_kl = parts["loss_class_raw"] + parts["loss_rank_combo_raw"]
-
-        # -----------------------------
-        # NaN/Inf guard
-        # -----------------------------
         if not torch.isfinite(loss_total.detach()).item():
             label_r = labels["label_r"]
             n_ties = (label_r == 0).sum().item()
@@ -690,9 +671,6 @@ def _make_train_step(
             )
             raise ValueError("Non-finite loss detected; stopping for debugging.")
 
-        # -----------------------------
-        # Backward pass (accumulation + AMP-safe)
-        # -----------------------------
         loss_scaled = loss_total / accum
 
         if use_amp:
@@ -700,9 +678,6 @@ def _make_train_step(
         else:
             loss_scaled.backward()
 
-        # -----------------------------
-        # Optimizer / scheduler step (only on accumulation boundary)
-        # -----------------------------
         if engine.state.iteration % accum == 0:
             if use_amp:
                 scaler.unscale_(optimizer)
@@ -721,9 +696,6 @@ def _make_train_step(
             if scheduler and scheduler_type != "plateau":
                 scheduler.step()
 
-        # -----------------------------
-        # Logging output
-        # -----------------------------
         if logger:
             logger.info(f"TRAIN_STEP, {timer() - start:.4f}")
 
@@ -734,13 +706,10 @@ def _make_train_step(
             loss=loss_total.detach(),
             parts=parts,
         )
-
-        # Optional extra diagnostics
-        # out["loss_no_kl"] = float(loss_no_kl.detach().item())
-
         return out
 
     return train_step
+
 
 
 def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
@@ -1041,6 +1010,7 @@ def _make_validation_handler(
       8) Apply early stopping and terminate training if criteria are met.
       9) Emit a consolidated metrics dictionary through the project's logging utility.
     """
+    
     def log_validation_results(engine):
         # ---------------------------------------------------------------------
         # 1) Switch model to evaluation mode and run evaluators
@@ -1456,7 +1426,7 @@ def train(
             eng.add_event_handler(Events.STARTED, _set_max_epoch)
 
     optimizer.zero_grad(set_to_none=True)  # clean gradient state at start
-
+    
     # Optional backbone unfreeze controller (epoch-gated)
     @trainer.on(Events.EPOCH_STARTED)
     def _maybe_unfreeze_backbone(engine):
@@ -1543,4 +1513,3 @@ def train(
         trial.set_user_attr("final_val_acc", float(final_val_acc))
     
     return final_val_acc
-

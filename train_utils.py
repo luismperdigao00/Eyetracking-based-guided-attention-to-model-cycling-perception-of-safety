@@ -37,6 +37,88 @@ class ArgsCheckReport:
     errors: List[str]
 
 
+@dataclass(frozen=True)
+class GazeConfig:
+    mode: str
+    load_gaze: bool
+    inject: bool
+    compute_kl: bool
+    use_kl_in_loss: bool
+    need_attn_maps: bool
+    gaze_output: str
+
+
+def normalize_gaze_mode(raw_mode: str | None) -> str:
+    m = str(raw_mode or "disable").lower().strip()
+
+    aliases = {
+        "off": "diag",           # legacy: "off" meant diagnostic-only
+        "disable": "disable",
+        "none": "disable",
+        "no": "disable",
+        "false": "disable",
+        "0": "disable",
+        "diag": "diag",
+        "diagnostic": "diag",
+        "diagnostics": "diag",
+        "guide": "guide",
+        "align": "align",
+        "align+gaze": "align+gaze",
+        "align+guide": "align+gaze",  # legacy name
+        "gaze": "align+gaze",
+    }
+
+    m = aliases.get(m, m)
+    if m not in ("disable", "diag", "guide", "align", "align+gaze"):
+        m = "disable"
+    return m
+
+
+def build_gaze_config(
+    args,
+    *,
+    is_cnn_backbone: bool,
+    out_size: int | None = None,
+) -> GazeConfig:
+    # Single source of truth for gaze-related feature flags.
+
+    mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
+
+    # CNN backbones never use gaze.
+    if bool(is_cnn_backbone):
+        mode = "disable"
+
+    inject = mode in ("guide", "align+gaze")
+
+    kl_requested = mode in ("diag", "guide", "align", "align+gaze")
+    supports_kl = (str(getattr(args, "model", "")).lower().strip() == "rsscnn") and (not bool(is_cnn_backbone))
+    compute_kl = bool(kl_requested and supports_kl)
+
+    w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
+    use_kl_in_loss_requested = mode in ("align", "align+gaze")
+    use_kl_in_loss = bool(compute_kl and use_kl_in_loss_requested and (w_kl > 0.0))
+
+    load_gaze = bool(mode != "disable") and bool(inject or compute_kl)
+    need_attn_maps = bool(compute_kl)
+
+    gaze_output = "guide" if mode == "guide" else "align"
+
+    cfg = GazeConfig(
+        mode=str(mode),
+        load_gaze=bool(load_gaze),
+        inject=bool(inject),
+        compute_kl=bool(compute_kl),
+        use_kl_in_loss=bool(use_kl_in_loss),
+        need_attn_maps=bool(need_attn_maps),
+        gaze_output=str(gaze_output),
+    )
+
+    args.gaze_mode = str(mode)
+    args.gaze_cfg = cfg
+
+    return cfg
+
+
 def _warn(warnings: List[str], msg: str) -> None:
     warnings.append(msg)
 
@@ -170,7 +252,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
             _warn(warnings, "--model sscnn: --ties_w is ignored.")
         if getattr(args, "ranking_margin", 0.0) != 0.3:
             _warn(warnings, "--model sscnn: --ranking_margin is ignored.")
-        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and getattr(args, "gaze", "off") != "off":
+        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_gaze_mode(getattr(args, "gaze_mode", None)) != "disable":
             _warn(warnings, "--model sscnn: gaze alignment loss is not applicable; --attn_w will be ignored.")
 
     # Ranking-only model ignores classification knobs
@@ -183,23 +265,25 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     # ------------------------------------------------------------------
     # Gaze dependencies
     # ------------------------------------------------------------------
-    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-    if gaze_mode not in ("off", "align", "guide", "align+guide"):
-        gaze_mode = "off"
+    gaze_mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
     args.gaze_mode = gaze_mode
-    args.gaze = gaze_mode
 
     attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
     if attn_w < 0.0:
         _err(errors, f"--attn_w must be >= 0 (got {attn_w}).")
 
-    use_gaze_kl = (gaze_mode in ("align", "align+guide"))
+    # KL is only used by the RSSCNN objective in this codebase.
+    model = str(getattr(args, "model", "rcnn")).lower().strip()
+    wants_kl = gaze_mode in ("diag", "align", "align+gaze")
 
-    if (not use_gaze_kl) and attn_w > 0.0:
-        _warn(
-            warnings,
-            f"--attn_w={attn_w} but gaze_mode={gaze_mode}; KL is diagnostic only (w_kl_eff=0).",
-        )
+    if (model != "rsscnn") and wants_kl:
+        _warn(warnings, f"--gaze_mode={gaze_mode} requests KL diagnostics/supervision, but --model={model}; KL will be disabled.")
+
+    if gaze_mode in ("disable", "diag", "guide") and attn_w > 0.0:
+        _warn(warnings, f"--attn_w={attn_w} but --gaze_mode={gaze_mode}; KL will not contribute to the objective (w_kl_eff=0).")
+
+    if gaze_mode in ("align", "align+gaze") and attn_w == 0.0:
+        _warn(warnings, f"--gaze_mode={gaze_mode} but --attn_w=0; KL supervision is effectively disabled.")
 
 
     # ------------------------------------------------------------------
@@ -270,10 +354,10 @@ BACKBONE_ALIAS_TO_TIMM_ID = {
     "vit_base_patch16_clip_224": "vit_base_patch16_clip_224.openai",
 
     # --- Modern High-Performance Alternates ---
-    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",        
+    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",         
     "dinov2_reg_base": "vit_base_patch14_reg4_dinov2.lvd142m",
     "eva02_base": "eva02_base_patch14_448.mim_in22k_ft_in1k",
-
+    "convnext_base": "convnext_base.fb_in22k_ft_in1k",
 
     # --- Original / Canonical ViT ---
     "vit_base_patch16_224": "vit_base_patch16_224.augreg_in21k_ft_in1k",  
@@ -287,14 +371,21 @@ BACKBONE_ALIAS_TO_TIMM_ID = {
     "deit_base_distilled": "deit_base_distilled_patch16_224.fb_in1k",
 
     # --- CNNs (Mapped for Preprocessing Specs) ---
+    # Note: train.py loads these via torchvision, but data.py needs these
+    # to fetch mean/std/crop info from timm.
     "alex": "alexnet",
     "vgg": "vgg19",
     "dense": "densenet121",
     "resnet": "resnet50",
-    "convnext_base": "convnext_base.fb_in22k_ft_in1k",
-    "efficientnet_v2_s": "tf_efficientnetv2_s.in21k_ft_in1k",
-    "regnet_y_8gf": "regnety_080.ra3_in1k",
+}
 
+
+DEFAULT_SPECS = {
+    "input_size": (3, 224, 224),
+    "crop_pct": 0.875,
+    "interpolation": "bilinear",
+    "mean": (0.485, 0.456, 0.406),
+    "std": (0.229, 0.224, 0.225),
 }
 
 def resolve_backbone(backbone_alias: str, *, pretrained: bool = True, strict: bool = True):
@@ -424,9 +515,15 @@ def compute_class_weights_from_df(
 def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     """
     Print a concise, behavior-accurate summary of the current transform policy.
-    Aligned with data.py:
+
+    Transform families:
       - Deterministic eval: build_eval_transforms() / ResizeCenterCropAlignGaze
-      - Training aug: Augmentation (swap/hflip/rotation + RandomResizedCrop-style crop + photometric + erase)
+      - Training aug: Augmentation (pairwise swap/hflip/rotation + crop + photometric + erase)
+
+    Gaze printing rules (centralized):
+      - Gaze mode and dependencies come from args.gaze_cfg when present
+      - When gaze is disabled, no gaze output/grid/out_size lines are printed
+      - Gaze out_size is printed only when gaze is enabled and gaze_output == "guide"
     """
 
     def _as_str(x):
@@ -458,6 +555,33 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     train_class = train_tfms.__class__.__name__ if train_tfms is not None else str(tm.get("train_transform_class", "unknown"))
     eval_class = eval_tfms.__class__.__name__ if eval_tfms is not None else str(tm.get("eval_transform_class", "unknown"))
 
+    cfg = getattr(args, "gaze_cfg", None)
+
+    gaze_mode = str(
+        gaze_meta.get(
+            "mode",
+            getattr(cfg, "mode", getattr(args, "gaze_mode", "disable")),
+        )
+    ).lower().strip()
+
+    load_gaze = bool(gaze_meta.get("load_gaze", getattr(cfg, "load_gaze", False)))
+    if ("load_gaze" not in gaze_meta) and ("requested" in gaze_meta):
+        load_gaze = bool(gaze_meta.get("requested", False))
+
+    gaze_enabled = bool(load_gaze) and (gaze_mode != "disable")
+
+    gaze_grid = gaze_meta.get("grid_size", getattr(args, "gaze_grid_size", None))
+
+    gaze_output = None
+    gaze_out_size = None
+    if gaze_enabled:
+        gaze_output = gaze_meta.get("gaze_output", getattr(cfg, "gaze_output", eval_meta.get("gaze_output", "align")))
+        gaze_output = str(gaze_output).lower().strip()
+        if gaze_output not in ("align", "guide"):
+            gaze_output = "align"
+        if gaze_output == "guide":
+            gaze_out_size = gaze_meta.get("out_size", eval_meta.get("target_crop", None))
+
     print("\n================ TRANSFORM POLICY ================")
 
     if isinstance(tm, dict):
@@ -482,29 +606,19 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
             print(f"  Eval Crop       : center_crop={eval_meta['target_crop']}")
         if "eval_policy" in eval_meta:
             print(f"  Eval Pipeline   : {eval_meta['eval_policy']}")
+
     print(f"  Eval Tfms Class : {eval_class}")
 
-    gaze_requested = gaze_meta.get("requested", str(getattr(args, "gaze", "off")).lower().strip() != "off")
-    gaze_grid = gaze_meta.get("grid_size", getattr(args, "gaze_grid_size", None))
-    gaze_loss = gaze_meta.get("use_gaze_loss", None)
-
-    gaze_output = gaze_meta.get("gaze_output", eval_meta.get("gaze_output", "align"))
-    gaze_output = str(gaze_output).lower().strip()
-    if gaze_output not in ("align", "guide"):
-        gaze_output = "align"
-
-    out_size = gaze_meta.get("out_size", eval_meta.get("target_crop", None))
-
-    if gaze_grid is not None:
-        print(f"  Gaze Enabled    : {_as_str(gaze_requested)} (grid={tuple(gaze_grid)}, output={gaze_output})")
+    print(f"  Gaze Mode       : {gaze_mode}")
+    if not gaze_enabled:
+        print("  Gaze Enabled    : OFF")
     else:
-        print(f"  Gaze Enabled    : {_as_str(gaze_requested)} (output={gaze_output})")
-
-    if out_size is not None:
-        print(f"  Gaze Out Size   : {int(out_size)}x{int(out_size)} (guide output)")
-    if gaze_loss is not None:
-        print(f"  Gaze Loss       : {_as_str(gaze_loss)}")
-
+        if gaze_grid is not None:
+            print(f"  Gaze Enabled    : ON (grid={tuple(gaze_grid)}, output={gaze_output})")
+        else:
+            print(f"  Gaze Enabled    : ON (output={gaze_output})")
+        if gaze_out_size is not None:
+            print(f"  Gaze Out Size   : {int(gaze_out_size)}x{int(gaze_out_size)}")
 
     print("\n================ AUGMENTATION PLAN ================")
 
@@ -526,15 +640,12 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     print(f"Train Tfms Class  : {train_class}")
 
     is_aug = (train_tfms is not None and train_tfms.__class__.__name__ == "Augmentation")
-    
-    # --------------------------
-    # Deterministic path
-    # --------------------------
+
     if not is_aug:
-        if augment_level != "none" and not gaze_requested:
+        if augment_level != "none":
             print("\n[WARNING]")
             print(f"  args.augment={augment_level} but training transform is not Augmentation (class={train_class}).")
-    
+
         print("\n[Deterministic preprocessing]")
         if eval_meta:
             resize_dim = eval_meta.get("resize_dim", "unknown")
@@ -542,30 +653,28 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
             print(f"  - Resize(short side)->{resize_dim} (aspect preserved)")
             print(f"  - CenterCrop->{target_crop}")
             print("  - ToTensor -> Normalize")
-    
-            if gaze_requested:
-                go = str(gaze_meta.get("gaze_output", eval_meta.get("gaze_output", "align"))).lower().strip()
-                if go == "guide":
-                    tc = eval_meta.get("target_crop", "unknown")
-                    print(f"  - Gaze: resize to match image geometry, center-crop, keep at {tc}x{tc}")
+            if gaze_enabled:
+                if gaze_output == "guide":
+                    print("  - Gaze: mirror geometric ops; keep at out_size")
                 else:
-                    print("  - Gaze: resize to match image geometry, center-crop, then downsample to grid")
+                    print("  - Gaze: mirror geometric ops; then downsample to grid")
         else:
             print("  - Resize(short side) -> CenterCrop -> ToTensor -> Normalize")
-    
+            if gaze_enabled:
+                if gaze_output == "guide":
+                    print("  - Gaze: mirror geometric ops; keep at out_size")
+                else:
+                    print("  - Gaze: mirror geometric ops; then downsample to grid")
+
         print("==================================================\n")
         return
 
-
-    # --------------------------
-    # Augmentation path
-    # --------------------------
     pa = train_tfms
     ties_enabled = bool(getattr(args, "ties", True))
-    
+
     print(f"Data augmentation : ON ({augment_level})")
     print("Augmentation type : Pairwise ranking augmentation (L/R views)")
-    
+
     print("\n[Pairwise structure]")
     print(f"  - Swap left/right        : p={getattr(pa, 'swap_p', 0.0):g} (paired; label adjusted)")
     if ties_enabled:
@@ -573,18 +682,18 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     else:
         print("    • ties disabled        : binary label inverted on swap")
     print(f"  - Horizontal flip        : p={getattr(pa, 'hflip_p', 0.0):g} ({_paired_label(getattr(pa, 'paired_hflip', True))})")
-    
+
     print("\n[Geometric preprocessing + crop]")
     print(f"  - Resize(short side)     : {getattr(pa, 'resize_short', 'unknown')} (always)")
     print(f"  - Ensure min side >=     : {getattr(pa, 'out_size', 'unknown')} (always)")
-    
+
     rot_deg = getattr(pa, "rot_deg", 0.0)
     rot_p = getattr(pa, "rot_p", 0.0)
     if rot_deg > 0.0 and rot_p > 0.0:
         print(f"  - Rotation               : p={rot_p:g}, ±{rot_deg:g}° ({_paired_label(getattr(pa, 'paired_rotation', True))})")
     else:
         print("  - Rotation               : OFF")
-    
+
     cs = getattr(pa, "crop_scale", None)
     cr = getattr(pa, "crop_ratio", None)
     if cs is not None and cr is not None:
@@ -596,30 +705,29 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         print(f"    • resized to out_size  : {getattr(pa, 'out_size', 'unknown')} (always)")
     else:
         print("  - Crop                   : center crop to out_size (one crop per side)")
-    
+
     print("\n[Photometric augmentation]")
     cj = getattr(pa, "color_jitter", None)
     if cj is not None:
         print(f"  - Color jitter           : {cj} ({_paired_label(getattr(pa, 'paired_color_jitter', False))})")
     else:
         print("  - Color jitter           : OFF")
-    
+
     gray_p = getattr(pa, "gray_p", 0.0)
     if gray_p > 0.0:
         print(f"  - Grayscale              : p={gray_p:g} ({_paired_label(getattr(pa, 'paired_gray', False))})")
     else:
         print("  - Grayscale              : OFF")
-    
+
     blur_p = getattr(pa, "blur_p", 0.0)
     if blur_p > 0.0:
         print(
             f"  - Gaussian blur          : p={blur_p:g}, k={getattr(pa, 'blur_kernel', 'unknown')}, "
-            f"sigma={_fmt(getattr(pa, 'blur_sigma', None))} ({_paired_label(getattr(pa, 'paired_color_jitter', False))})"
+            f"sigma={_fmt(getattr(pa, 'blur_sigma', None))} ({_paired_label(getattr(pa, 'paired_blur', getattr(pa, 'paired_color_jitter', False)))})"
         )
-        print("    • pairing note         : blur uses paired_color_jitter flag in the current implementation")
     else:
         print("  - Gaussian blur          : OFF")
-    
+
     print("\n[Tensor augmentation]")
     erase_p = getattr(pa, "erase_p", 0.0)
     if erase_p > 0.0:
@@ -628,19 +736,25 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         print(f"  - Random erasing         : p={erase_p:g} ({_paired_label(getattr(pa, 'paired_erase', True))})")
         print(f"    • area fraction        : {es[0]:.2f}–{es[1]:.2f}")
         print(f"    • aspect ratio         : {er[0]:.2f}–{er[1]:.2f}")
+        if gaze_enabled:
+            if gaze_output == "guide":
+                print("    • gaze handling        : erased regions are zeroed in the out_size gaze map")
+            else:
+                print("    • gaze handling        : erased regions are zeroed in the downsampled gaze grid")
     else:
         print("  - Random erasing         : OFF")
-    
+
     print("\n[Final deterministic steps]")
     print("  - ToTensor -> Normalize (backbone mean/std)")
-    if gaze_requested:
-        go = str(getattr(pa, "gaze_output", gaze_meta.get("gaze_output", "align"))).lower().strip()
-        if go == "guide":
-            print("  - Gaze: geometric ops mirror image; keep at out_size (no final grid resize)")
+    if gaze_enabled:
+        if gaze_output == "guide":
+            print("  - Gaze: geometric ops mirror image; keep at out_size")
         else:
             print("  - Gaze: geometric ops mirror image; then downsample to grid")
-    
+
     print("==================================================\n")
+
+
 
 # =================================================================================================
 # Run plan helpers
@@ -729,9 +843,19 @@ def print_run_plan(
 
     print(f"  ties         : {args.ties}")
     
-    # --- NEW: Attention/Gaze Info ---
-    print(f"  gaze         : {args.gaze}")
-    if args.gaze != "off":
+    # --- Attention / gaze ---
+    gaze_cfg = getattr(args, 'gaze_cfg', None)
+    gaze_mode = str(getattr(gaze_cfg, 'mode', getattr(args, 'gaze_mode', 'disable')))
+    print(f"  gaze_mode    : {gaze_mode}")
+    print(f"  eyetracker   : {getattr(args, 'eyetracker_filter', 'all')}")
+
+    if gaze_cfg is not None:
+        print(f"  load_gaze    : {bool(getattr(gaze_cfg, 'load_gaze', False))}")
+        print(f"  inject_gaze  : {bool(getattr(gaze_cfg, 'inject', False))}")
+        print(f"  compute_kl   : {bool(getattr(gaze_cfg, 'compute_kl', False))}")
+        print(f"  kl_in_loss   : {bool(getattr(gaze_cfg, 'use_kl_in_loss', False))}")
+
+    if bool(getattr(gaze_cfg, 'need_attn_maps', False)):
         print(f"  attn_mode    : {getattr(args, 'attention_mode', 'last')}")
         if getattr(args, 'attention_mode', 'last') == 'topk':
             print(f"  attn_topk    : {getattr(args, 'attn_topk', 'all')}")
@@ -808,12 +932,15 @@ def print_run_plan(
     if args.ties and args.ties_w > 0:
         parts.append(f"{args.ties_w:g}·ties")
 
-    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-    if gaze_mode not in ("off", "align", "guide", "align+guide"):
-        gaze_mode = "off"
+    gaze_cfg = getattr(args, 'gaze_cfg', None)
+    gaze_mode = str(getattr(gaze_cfg, 'mode', getattr(args, 'gaze_mode', 'disable')))
 
-    use_gaze_kl = (gaze_mode in ("align", "align+guide"))
-    if use_gaze_kl and args.attn_w > 0:
+    use_kl_in_loss = bool(getattr(gaze_cfg, 'use_kl_in_loss', False))
+    if gaze_cfg is None:
+        gaze_mode = normalize_gaze_mode(getattr(args, 'gaze_mode', None))
+        use_kl_in_loss = bool(gaze_mode in ('align', 'align+gaze') and float(getattr(args, 'attn_w', 0.0) or 0.0) > 0.0)
+
+    if use_kl_in_loss:
         parts.append(f"{args.attn_w:g}·KL(gaze↔attn)")
 
 
@@ -927,4 +1054,3 @@ def resolve_batch_size(args):
         return 64
     else:
         return 32
-

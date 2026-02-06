@@ -55,7 +55,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: "berlin"
+    value: "berlin" #"berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -73,12 +73,12 @@ parameters:
       #- "vit_small"
       #- "dinov3_vitb16"
       #- "deit3_base_patch16_224"
-      #- "vit_base_patch16_224"
+      - "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
       #- "vgg"
       #- "convnext_base"
-      - "efficientnet_v2_s"
-      - "regnet_y_8gf"
+      #- "efficientnet_v2_s"
+      #- "regnet_y_8gf"
     
 
   pooling:
@@ -102,7 +102,7 @@ parameters:
   # E) Fine-tuning policy
   # ---------------------------------------------------------------------------
   finetune:
-    value: false
+    value: true
     
   num_ft_blocks:
     values: [4]
@@ -205,7 +205,12 @@ parameters:
   # Gaze Configuration
   # ---------------------------------------------------------------------------
   gaze_mode:
-    values: ["off"]
+    values: 
+     #- disable
+     #- diag
+     - guide
+     #- align
+     #- align+gaze
 
   attention_mode:
     values: ["last"]

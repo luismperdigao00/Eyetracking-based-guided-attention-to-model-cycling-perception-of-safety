@@ -10,12 +10,12 @@ VENV_PATH=".venv"
 # ----------------------------------
 # Test configuration
 # ----------------------------------
-RUN_NAME="dj8rhkwg"
-CHECKPOINT="different-sweep-7_best_model_4_0.7806.pt"
+RUN_NAME="0u1ofv67"
+CHECKPOINT="swept-sweep-4_best_model_5_0.7726.pt"
 #TEST_SET="comparisons_df_with_synthetic_berlin.pickle"
 TEST_SET="build_datasets/datasets/comparisons_tests.pkl"
 DATASET_DIR="images/printart/subjectivesafety_images"
-CITIES="berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov" 
+CITIES="berlin"  #,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov" 
 PYTHON_SCRIPT="test.py"
 
 # ----------------------------------
@@ -75,3 +75,19 @@ echo "Test finished: $RUN_NAME ($TEST_SET)"
 
 #RUN_NAME="rwoa07zg"
 #CHECKPOINT="divine-sweep-1_best_model_6_0.8021.pt"
+
+#NO GAZE
+#RUN_NAME="w4ywh5lk"
+#CHECKPOINT="helpful-sweep-1_best_model_4_0.7569.pt"
+
+#Gaze Guide
+#RUN_NAME="c92m19jp"
+#CHECKPOINT="skilled-sweep-2_best_model_4_0.7604.pt"
+
+#Gaze align 
+#RUN_NAME="9z20imwf"
+#CHECKPOINT="colorful-sweep-3_best_model_6_0.7465.pt"
+
+#Gaze align+guide
+#RUN_NAME="0u1ofv67"
+#CHECKPOINT="swept-sweep-4_best_model_5_0.7726.pt"

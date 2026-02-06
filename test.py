@@ -38,7 +38,13 @@ from scripts.test_script import test
 from data import ComparisonsDataset
 from train_main_utils import build_eval_transforms
 
-from train_utils import resolve_backbone, infer_vit_grid_size
+from train_utils import (
+    resolve_backbone,
+    infer_vit_grid_size,
+    normalize_gaze_mode,
+    build_gaze_config,
+)
+
 
 
 warnings.filterwarnings("ignore")
@@ -75,24 +81,22 @@ def _safe_len(x: Any) -> Optional[int]:
     except Exception:
         return None
 
-def _normalize_gaze_mode(args) -> str:
-    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-    if gaze_mode not in ("off", "align", "guide", "align+guide"):
-        gaze_mode = "off"
-    args.gaze_mode = gaze_mode
-    args.gaze = gaze_mode  # unified alias used across modules
-    return gaze_mode
+def _normalize_and_attach_gaze_mode(args) -> str:
+    raw = getattr(args, "gaze_mode", getattr(args, "gaze", None))
+    raw_s = str(raw).lower().strip()
 
+    # Backward-compat for older runs / metadata
+    if raw_s in ("use", "on", "true", "1"):
+        raw_s = "align"
+    if raw_s == "only":
+        raw_s = "align"
+        if getattr(args, "eyetracker_only", None) is None:
+            args.eyetracker_only = True
 
-def _resolve_gaze_flags(args):
-    gaze_mode = _normalize_gaze_mode(args)
-    w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
+    args.gaze_mode = normalize_gaze_mode(raw_s)
+    args.gaze = args.gaze_mode  # legacy alias for older code paths
+    return args.gaze_mode
 
-    use_gaze_any = (gaze_mode != "off")
-    use_gaze_kl = (gaze_mode in ("align", "align+guide")) and (w_kl > 0.0)
-    use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
-
-    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
 
 # -----------------------------
 # W&B run discovery + parsing
@@ -156,7 +160,7 @@ def _apply_wandb_config_to_args(args, cfg: dict):
         "finetune_backbone": "finetune",
         "num_ft_blocks": "num_ft_blocks",
         "ties": "ties",
-        "gaze_mode": "gaze",
+        "gaze_mode": "gaze_mode",
         "rank_dropout": "rank_dropout",
         "cross_dropout": "cross_dropout",
         "attn_w": "attn_w",
@@ -174,10 +178,6 @@ def _apply_wandb_config_to_args(args, cfg: dict):
         v = getattr(args, b, False)
         if isinstance(v, str):
             setattr(args, b, v.lower() in ("1", "true", "yes", "y", "t"))
-
-    if getattr(args, "gaze", None) is None:
-        args.gaze = "use"
-
 
 def _load_metadata_args_list(metadata_path: str) -> List[str]:
     with open(metadata_path, "r", encoding="utf-8") as f:
@@ -236,21 +236,20 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
             continue
         setattr(args, k, v)
 
-    gm = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    raw = getattr(args, "gaze_mode", getattr(args, "gaze", None))
+    raw_s = str(raw).lower().strip()
     
-    # Legacy value mapping for older metadata
-    if gm in ("use", "on", "true", "1"):
-        gm = "align"
-    elif gm == "only":
-        gm = "align"
+    # Backward-compat for older metadata values
+    if raw_s in ("use", "on", "true", "1"):
+        raw_s = "align"
+    if raw_s == "only":
+        raw_s = "align"
         if getattr(args, "eyetracker_only", None) is None:
             args.eyetracker_only = True
     
-    if gm not in ("off", "align", "guide", "align+guide"):
-        gm = "off"
-    
-    args.gaze_mode = gm
-    args.gaze = gm
+    args.gaze_mode = normalize_gaze_mode(raw_s)
+    args.gaze = args.gaze_mode
+
 
 
 def _load_summary_json(path: str) -> Optional[dict]:
@@ -357,14 +356,14 @@ def build_model(args):
         "deit3_base_patch16_224",
         "siglip_base_patch16_224",
         "vit_base_patch16_clip_224",
-    
+
         # --- Modern High-Performance Transformers ---
-        "dinov2_base",        # NEW: DINOv2 (no registers)
-        "dinov2_reg_base",    # DINOv2 + registers
+        "dinov2_base",
+        "dinov2_reg_base",
         "eva02_base",
-    
+
         # --- Legacy / Canonical Transformers ---
-        "vit_base_patch16_224",  # NEW: Original ViT-B/16 (21k -> 1k)
+        "vit_base_patch16_224",
         "vit_base_dino",
         "vit_small",
         "deit_base",
@@ -378,86 +377,62 @@ def build_model(args):
         from nets.transformer import Transformer as Net
 
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
-        use_gaze_loss = (
-            args.model == "rsscnn"
-            and args.gaze != "off"
-            and float(getattr(args, "attn_w", 0.0)) > 0.0
-        )
-        
-        attn_kwargs = {}
+        out_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
 
+        gaze_cfg = getattr(args, "gaze_cfg", None)
+        if gaze_cfg is None:
+            gaze_cfg = build_gaze_config(args, is_cnn_backbone=False, out_size=out_size)
 
-        # -----------------------------
-        # Gaze mode -> injection flag
-        # -----------------------------
-        gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-        if gaze_mode not in ("off", "align", "guide", "align+guide"):
-            gaze_mode = "off"
-        use_gaze_inj = gaze_mode in ("guide", "align+guide")
-        
-        # -----------------------------
-        # Attention maps policy
-        # -----------------------------
-        # losses.py computes KL diagnostics in RSSCNN and expects attn_map keys.
-        need_attn_maps = (str(getattr(args, "model", "")).lower().strip() == "rsscnn")
-        
-        use_attn_hook = bool(need_attn_maps)
-        return_attn = bool(need_attn_maps)
-        
-        ms = int(getattr(args, "gaze_map_size_int", 14))
-        attn_out_hw = tuple(getattr(args, "gaze_grid_size", (ms, ms)))
-        
-        # Transformer expects attention_mode in {"last","rollout","topk"}
+        use_attn_hook = bool(getattr(gaze_cfg, "need_attn_maps", False))
+        return_attn = bool(getattr(gaze_cfg, "need_attn_maps", False))
+
+        grid = getattr(args, "gaze_grid_size", None)
+        if grid is None:
+            ms = int(getattr(args, "gaze_map_size_int", 14))
+            grid = (ms, ms)
+        attn_out_hw = tuple(int(x) for x in grid)
+
         attn_mode = str(getattr(args, "attention_mode", "last")).lower().strip()
         if attn_mode == "cls":
             attn_mode = "last"
-        
+
         attn_topk = getattr(args, "attn_topk", None)
         if attn_topk is not None:
             attn_topk = int(attn_topk)
-        
-        # -----------------------------
-        # Instantiate wrapper (match transformer.py signature)
-        # -----------------------------
+
         net = Net(
             backbone=backbone_model,
             model=str(getattr(args, "model", "rsscnn")).lower().strip(),
-        
             pooling=str(getattr(args, "pooling", "cls")).lower().strip(),
             pool_k=int(getattr(args, "pool_k", 10)),
-        
             num_classes=3 if bool(getattr(args, "ties", False)) else 2,
-        
             finetune=bool(getattr(args, "finetune", False)),
             num_ft_blocks=int(getattr(args, "num_ft_blocks", 1)),
-        
             rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
             cross_dropout=float(getattr(args, "cross_dropout", 0.0) or 0.0),
-        
             use_attn_hook=use_attn_hook,
             return_attn=return_attn,
             attn_out_hw=attn_out_hw,
             attention_mode=attn_mode,
             attn_topk=attn_topk,
-        
-            use_gaze_injection=bool(use_gaze_inj),
+            use_gaze_injection=bool(getattr(gaze_cfg, "inject", False)),
         )
-        
-        net.attn_grad = bool(need_attn_maps)
+
+        net.attn_grad = bool(getattr(gaze_cfg, "need_attn_maps", False))
         return net
 
     if args.backbone in CNN_BACKBONES:
         from nets.cnn import CNN as Net
-    
+
         cnn_backbones = {
             "alex": tv_models.alexnet,
             "vgg": tv_models.vgg19,
             "dense": tv_models.densenet121,
             "resnet": tv_models.resnet50,
         }
-    
+
         flatten_spatial = (getattr(args, "cnn_pool", "gap") == "flatten")
-    
+
         return Net(
             backbone=cnn_backbones[args.backbone],
             model=args.model,
@@ -547,10 +522,10 @@ def parse_args():
     p.add_argument(
         "--gaze_mode",
         type=str,
-        default="off",
-        choices=["off", "align", "guide", "align+guide"],
-        help="off | align (KL) | guide (injection) | align+guide (both)",
+        default="disable",
+        help="disable | diag | guide | align | align+gaze (legacy accepted: off, align+guide, use, only)",
     )
+
     p.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps", help="Folder for .npy gaze maps.")
     p.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool, help="Use *_seg.jpg images.")
 
@@ -674,7 +649,7 @@ def main():
     # Ensure tie margin is always defined
     if args.ranking_margin_ties is None:
         args.ranking_margin_ties = args.ranking_margin
-    _normalize_gaze_mode(args)
+    _normalize_and_attach_gaze_mode(args)
 
     # =============================================================================================== #
     # (STEP 2) REPRODUCIBILITY & DEVICE SETUP
@@ -827,33 +802,46 @@ def main():
         grid_h, grid_w = forced, forced
     
     args.gaze_grid_size = (int(grid_h), int(grid_w))
-    args.gaze_map_size_int = int(grid_h)
     
-    # 2) Build eval transforms (timm-style resize->center-crop->normalize; aligns gaze if enabled)
-    use_gaze = (str(args.gaze).lower().strip() != "off")
+    out_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
+    
+    gaze_cfg = build_gaze_config(args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
+    args.gaze_cfg = gaze_cfg
+
+    # Optional override to match existing gaze folder layout (kept as-is)
+    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
+        forced = int(args.gaze_map_size)
+        args.gaze_grid_size = (forced, forced)
+    
+    # map_size selector used by dataset folder resolution
+    args.gaze_map_size_int = int(out_size) if str(gaze_cfg.gaze_output) == "guide" else int(args.gaze_grid_size[0])
+    
+    enable_gaze = bool(gaze_cfg.load_gaze)
+    gaze_output = str(gaze_cfg.gaze_output)
     
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=use_gaze,
+        enable_gaze=enable_gaze,
+        gaze_output=gaze_output,
     )
     
-    # 3) Dataset (note: map_size selects gaze_root/<map_size>x<map_size>/...)
     dataset = ComparisonsDataset(
         dataframe=df,
         root_dir=args.dataset,
         transform=eval_tfms,
         gaze_root=args.gaze_root,
-        use_gaze=use_gaze,
+        use_gaze=enable_gaze,
         use_seg=args.use_seg,
         logger=None,
     )
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        drop_last=False,
+        pin_memory=(device.type == "cuda"),
     )
 
 

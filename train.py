@@ -69,7 +69,7 @@ def str2bool(v):
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
 
-        
+
 def arg_parse():
     parser = argparse.ArgumentParser(
         description="Training subjective safety",
@@ -95,7 +95,6 @@ def arg_parse():
         help="Augmentation level for training: none | light | heavy. (Applied only when gaze alignment is OFF.)",
     )
     parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
-    parser.add_argument("--class_weights", type=float, nargs="+", default=None, help="Explicit class weight vector. Length must be 3 if --ties True, else 2. Overrides auto-computed weights when --use_class_weights True.",)
     parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
 
 
@@ -156,18 +155,29 @@ def arg_parse():
     # -------------------- GAZE & CITY FILTERS ----------------
     parser.add_argument(
         "--gaze_mode",
+        type=str,
         default="disable",
-        choices=["disable", "diag", "guide", "align", "align+gaze"],
         help=(
-            "disable     : completely disable gaze\n"
-            "diag        : KL diagnostic only\n"
-            "guide       : inject gaze, KL diagnostic only\n"
-            "align       : KL included in loss\n"
-            "align+gaze  : inject + KL in loss\n"
-            "Legacy: off→diag, align+guide→align+gaze\n"
+            "Gaze behavior:\n"
+            "  disable    : no gaze loading, no KL diagnostics, no injection, no attention hooks\n"
+            "  diag       : KL computed for diagnostics only (no gradient contribution)\n"
+            "  guide      : gaze injected; KL computed for diagnostics only\n"
+            "  align      : KL added to total loss (attn_w * KL)\n"
+            "  align+gaze : gaze injected and KL added to total loss (attn_w * KL)\n"
+            "Legacy aliases: off->diag, align+guide->align+gaze\n"
         ),
     )
-    parser.add_argument("--eyetracker_filter", default="all", choices=["all","only"])
+
+    parser.add_argument(
+        "--eyetracker_filter",
+        type=str,
+        default="all",
+        choices=["all", "only"],
+        help=(
+            "Dataset filter on has_eyetracker. "
+            "all keeps all rows; only keeps rows where has_eyetracker==True."
+        ),
+    )
 
     parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
     help=(
@@ -241,11 +251,6 @@ def arg_parse():
             "vgg",
             "dense",
             "resnet",
-
-            "convnext_base",
-            "efficientnet_v2_s",
-            "regnet_y_8gf",
-
         ],
         help="Model backbone to use. Default: dinov3_vitb16",
     )
@@ -334,7 +339,8 @@ def run_training_with_args(args, trial=None):
     # ==============================================================================================
     # 1) REPRODUCIBILITY (SEEDS)
     # ==============================================================================================
-    _seed_everything(args.seed)
+    _seed_everything(args.seed, deterministic=False)
+
 
     # ==============================================================================================
     # 2) LOGGING / WANDB
@@ -360,11 +366,12 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir="ya",
+        splits_dir="splits_yolo3",
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,
         load_if_exists=False,   # loads if files exist, otherwise splits
+        save_splits=True
     )
 
 
@@ -385,7 +392,7 @@ def run_training_with_args(args, trial=None):
     # Returns:
     #  - backbone_model / model_specs: resolved backbone + preprocessing specs
     #  - train_tfms / eval_tfms: training/eval transform pipelines
-    #  - use_gaze_requested: whether gaze mode is enabled (args.gaze != "off")
+    #  - use_gaze_requested: whether gaze mode is enabled (args.gaze_mode != "disable")
     #  - use_gaze_loss: whether attention/gaze supervision is active for the chosen model config
     #  - is_cnn_backbone: whether the backbone family uses torchvision CNN path
     backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone = (
