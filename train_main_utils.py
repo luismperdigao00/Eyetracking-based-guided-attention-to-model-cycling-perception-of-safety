@@ -748,6 +748,15 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
     from nets.transformer import Transformer as Net
     from nets.transformer_utils import GuideGuidanceConfig
 
+    guidance_cfg = GuideGuidanceConfig(
+        enabled=bool(use_gaze_inj),
+        bottleneck_dim=int(getattr(args, "guidance_bottleneck_dim", 128)),
+        gaze_hidden_dim=int(getattr(args, "guidance_gaze_hidden_dim", 64)),
+        conv_hidden_channels=int(getattr(args, "guidance_conv_hidden_channels", 64)),
+        drop_prob=float(getattr(args, "guidance_drop_prob", 0.0)),
+        strength=float(getattr(args, "guidance_strength", 1.0)),
+    )
+
     net = Net(
         backbone=backbone_model,
         model=args.model,
@@ -764,10 +773,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         attn_topk=args.attn_topk,
         attn_out_hw=tuple(getattr(args, "gaze_grid_size", (14, 14))),
         use_gaze_injection=bool(use_gaze_inj),
-        guidance_cfg=GuideGuidanceConfig(
-            enabled=bool(use_gaze_inj),
-            drop_prob=0.0,
-        ),
+        guidance_cfg=guidance_cfg,
     )
 
     net.attn_grad = bool(getattr(gaze_cfg, "use_kl_in_loss", False))

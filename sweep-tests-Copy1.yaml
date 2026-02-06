@@ -21,7 +21,6 @@ parameters:
     value: true
   cuda_id:
     value: 1
-  
   multi_gpu:
     value: false
   gpu_ids:

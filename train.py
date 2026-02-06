@@ -96,6 +96,13 @@ def arg_parse():
     parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
 
+    # -------------------- GAZE GUIDANCE (Guide mode) --------------------
+    parser.add_argument("--guidance_drop_prob", type=float, default=0.0, help="Stochastic gaze disable prob (guide mode).")
+    parser.add_argument("--guidance_strength", type=float, default=1.0, help="Scale applied to injected guidance residual.")
+    parser.add_argument("--guidance_bottleneck_dim", type=int, default=128, help="GII bottleneck dim (d').")
+    parser.add_argument("--guidance_gaze_hidden_dim", type=int, default=64, help="Gaze token embedding dim (dg).")
+    parser.add_argument("--guidance_conv_hidden_channels", type=int, default=64, help="GFF conv hidden channels.")
+
 
     # -------------------- SCHEDULER -------------------------
     parser.add_argument(
