@@ -835,10 +835,10 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                 weight_fn=lambda x: x.get("gaze_count", 0),
                 device=device,
             ).attach(engine, "loss_kl_weighted")
-            RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
+            #RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
 
             # Optional but strongly recommended: confirms whether any gaze samples exist in batches
-            RunningAverage(output_transform=lambda x: float(x.get("gaze_count", 0)), device=device).attach(engine, "gaze_count")
+            #RunningAverage(output_transform=lambda x: float(x.get("gaze_count", 0)), device=device).attach(engine, "gaze_count")
 
             # Optional: track which mode is active in logs (string; keep in output dict but not as metric)
             # gaze_mode, *_ = _resolve_gaze_flags(args)

@@ -21,6 +21,7 @@ parameters:
     value: true
   cuda_id:
     value: 1
+  
   multi_gpu:
     value: false
   gpu_ids:
@@ -68,9 +69,9 @@ parameters:
   backbone:
     values:
       #- "vit_small"
-      #- "dinov3_vitb16"
+      - "dinov3_vitb16"
       #- "deit3_base_patch16_224"
-      - "vit_base_patch16_224"
+      #- "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
       #- "vgg"
       #- "convnext_base"
