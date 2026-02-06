@@ -81,7 +81,6 @@ def arg_parse():
     parser.add_argument("--cuda_id", type=int, default=0)
     parser.add_argument("--multi_gpu", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--gpu_ids", type=str, default="0",help="Comma-separated GPU ids, e.g. '0,1'")
-    parser.add_argument("--amp", nargs="?", const=True, default=False, type=str2bool, help="Enable Automatic Mixed Precision (AMP).")
     parser.add_argument("--resume", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--finetune", "--ft", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--ties", nargs="?", const=True, default=False, type=str2bool)
