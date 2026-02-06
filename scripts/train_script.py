@@ -24,12 +24,11 @@ import optuna
 import torch
 import torch.optim as optim
 import wandb
-from torch.cuda.amp import autocast, GradScaler
 from torch import nn
 
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
-from ignite.metrics import RunningAverage, Average, Accuracy
+from ignite.metrics import Metric, RunningAverage, Average, Accuracy
 
 
 from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
@@ -78,6 +77,30 @@ class EarlyStopper:
         self.bad_epochs += 1
         should_stop = self.bad_epochs >= self.patience
         return should_stop, improved
+
+
+class WeightedAverage(Metric):
+    """Compute a weighted average over engine outputs."""
+
+    def __init__(self, value_fn, weight_fn, device=None):
+        super().__init__(output_transform=lambda x: x, device=device)
+        self.value_fn = value_fn
+        self.weight_fn = weight_fn
+
+    def reset(self) -> None:
+        self._sum = torch.tensor(0.0, device=self._device)
+        self._weight = torch.tensor(0.0, device=self._device)
+
+    def update(self, output) -> None:
+        value = torch.as_tensor(self.value_fn(output), device=self._device, dtype=torch.float32)
+        weight = torch.as_tensor(self.weight_fn(output), device=self._device, dtype=torch.float32)
+        self._sum += value * weight
+        self._weight += weight
+
+    def compute(self):
+        if self._weight.item() == 0:
+            return 0.0
+        return (self._sum / self._weight).item()
 
 class BackboneFreezeController:
     """
@@ -230,6 +253,8 @@ def _build_metrics_output(
             {
                 "logits": forward_dict["logits"]["output"],
                 "label": labels["label_c"].long(),
+                "y_pred": forward_dict["logits"]["output"],
+                "y": labels["label_c"].long(),
             }
         )
         return out
@@ -242,6 +267,8 @@ def _build_metrics_output(
                 "logits": forward_dict["logits"]["output"],
                 "label_r": labels["label_r"],
                 "label_c": labels["label_c"],
+                "y_pred": forward_dict["logits"]["output"],
+                "y": labels["label_c"],
             }
         )
 
@@ -619,7 +646,6 @@ def _make_train_step(
     grad_clip: float,
     logger,
     trial,
-    scaler: GradScaler,
 ):
     """
     Ignite training-step factory.
@@ -651,13 +677,10 @@ def _make_train_step(
         if logger:
             start = timer()
 
-        use_amp = scaler.is_enabled()
-
         inputs, labels = _prepare_batch(data, device, args)
 
-        with autocast(enabled=use_amp):
-            forward_dict = net(*inputs)
-            loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+        forward_dict = net(*inputs)
+        loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
 
         if not torch.isfinite(loss_total.detach()).item():
             label_r = labels["label_r"]
@@ -673,23 +696,13 @@ def _make_train_step(
 
         loss_scaled = loss_total / accum
 
-        if use_amp:
-            scaler.scale(loss_scaled).backward()
-        else:
-            loss_scaled.backward()
+        loss_scaled.backward()
 
         if engine.state.iteration % accum == 0:
-            if use_amp:
-                scaler.unscale_(optimizer)
-
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
 
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -718,20 +731,16 @@ def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
 
     Behavior:
       - Runs under torch.no_grad()
-      - Uses AMP autocast on CUDA when enabled
       - Calls compute_loss and reports loss_total (KL included only in align modes via w_kl_eff)
       - If gaze_mode includes guide, gaze tensors are passed into the transformer for injection
         (handled by _prepare_batch input packing)
     """
     def inference_step(engine, data):
-        use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
-
         with torch.no_grad():
             inputs, labels = _prepare_batch(data, device, args)
 
-            with autocast(enabled=use_amp):
-                forward_dict = net(*inputs)
-                loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+            forward_dict = net(*inputs)
+            loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
 
             out = _build_metrics_output(
                 args=args,
@@ -820,8 +829,16 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
 
             # 2) Gaze/KL diagnostics (always attach; KL is always computed in compute_loss)
             #    In guide/off modes, loss_kl_weighted stays 0 because w_kl_eff=0.
-            RunningAverage(output_transform=lambda x: x.get("loss_kl", 0.0), device=device).attach(engine, "loss_kl")
-            RunningAverage(output_transform=lambda x: x.get("loss_kl_weighted", 0.0), device=device).attach(engine, "loss_kl_weighted")
+            WeightedAverage(
+                value_fn=lambda x: x.get("loss_kl", 0.0),
+                weight_fn=lambda x: x.get("gaze_count", 0),
+                device=device,
+            ).attach(engine, "loss_kl")
+            WeightedAverage(
+                value_fn=lambda x: x.get("loss_kl_weighted", 0.0),
+                weight_fn=lambda x: x.get("gaze_count", 0),
+                device=device,
+            ).attach(engine, "loss_kl_weighted")
             RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
 
             # Optional but strongly recommended: confirms whether any gaze samples exist in batches
@@ -954,7 +971,7 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 # Validation / logging handlers
 # --------------------------------------------------------------------------------------------------------------------
 
-def _attach_epoch_end_step(trainer: Engine, optimizer, accum_steps: int, scaler: GradScaler):
+def _attach_epoch_end_step(trainer: Engine, optimizer, accum_steps: int):
     """
     Flush a partially accumulated gradient at epoch end.
 
@@ -965,11 +982,7 @@ def _attach_epoch_end_step(trainer: Engine, optimizer, accum_steps: int, scaler:
     @trainer.on(Events.EPOCH_COMPLETED)
     def step_on_epoch_end(engine):
         if engine.state.iteration % accum_steps != 0:
-            if scaler is not None and scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -1309,12 +1322,6 @@ def train(
     )
 
     # -----------------------------
-    # AMP (Automatic Mixed Precision)
-    # -----------------------------
-    use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
-    scaler = GradScaler(enabled=use_amp)  # enabled=False turns scaler into a no-op
-
-    # -----------------------------
     # Ignite engines
     # -----------------------------
     trainer = Engine(
@@ -1329,7 +1336,6 @@ def train(
             grad_clip=grad_clip,
             logger=logger,
             trial=trial,
-            scaler=scaler,
         )
     )
 
@@ -1339,7 +1345,7 @@ def train(
     trainer.state.trial = trial  # makes trial available to handlers
 
     _attach_metrics([trainer, evaluator, evaluator_test], args, device)          # fills engine.state.metrics
-    _attach_epoch_end_step(trainer, optimizer, accum_steps, scaler=scaler)       # handles accumulation bookkeeping
+    _attach_epoch_end_step(trainer, optimizer, accum_steps)                      # handles accumulation bookkeeping
 
     # -----------------------------
     # Epoch-end evaluation handler
