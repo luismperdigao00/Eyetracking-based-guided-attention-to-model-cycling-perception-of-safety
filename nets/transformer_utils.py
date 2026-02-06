@@ -548,16 +548,17 @@ class GazeTokenEmbedder(nn.Module):
 @dataclass(frozen=True)
 class GuideGuidanceConfig:
     """
-    bottleneck_dim: d' in the paper
-    gaze_hidden_dim: dg (gaze token embedding dim)
-    drop_prob: stochastic gaze disabling during training (p in {0,1})
+    bottleneck_dim: d' in the paper (optimal = 20 for ViT-B/16)
+    gaze_hidden_dim: dg in the paper (optimal = 30 for ViT-B/16)
+    drop_prob: stochastic gaze disabling during training
+               (paper: ~50% samples without gaze)
     strength: scale applied to injected residual
     """
     enabled: bool = False
-    bottleneck_dim: int = 128
-    gaze_hidden_dim: int = 64
+    bottleneck_dim: int = 20
+    gaze_hidden_dim: int = 30
     conv_hidden_channels: int = 64
-    drop_prob: float = 0.0
+    drop_prob: float = 0
     strength: float = 1.0
 
 
