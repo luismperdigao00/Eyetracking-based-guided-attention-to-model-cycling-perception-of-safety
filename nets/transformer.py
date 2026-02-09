@@ -10,6 +10,7 @@ import torch.nn as nn
 from .transformer_utils import (
     AttentionConfig,
     AttentionRecorder,
+    EGViTConfig,
     GuideGuidanceConfig,
     GazeTokenEmbedder,
     GIIInjectorLayer,
@@ -60,6 +61,7 @@ class TransformerConfig:
         out_hw=(14, 14),
     )
 
+    egvit: EGViTConfig = EGViTConfig(enabled=False)
     guidance: GuideGuidanceConfig = GuideGuidanceConfig(enabled=False)
 
 
@@ -79,9 +81,9 @@ class Transformer(nn.Module):
       }
 
     Gaze support:
-      - Guide (based on 10.1016/j.bspc.2025.108298): gaze injection occurs inside each ViT block using explicit MHSA/FFN steps
-        when GII modules are available and gaze maps are provided.
+      - Guide: gaze injection occurs inside each ViT block using GII modules.
       - Align: attention maps are produced when attention recorder is enabled.
+      - EG-ViT: gaze-guided patch masking at input + merge before last block.
     """
 
     def __init__(
@@ -104,6 +106,8 @@ class Transformer(nn.Module):
         attn_out_hw: Optional[Tuple[int, int]] = None,
         use_gaze_injection: bool = False,
         guidance_cfg: Optional[GuideGuidanceConfig] = None,
+        use_egvit_masking: bool = False,
+        egvit_cfg: Optional[EGViTConfig] = None,
     ) -> None:
         super().__init__()
 
@@ -133,6 +137,11 @@ class Transformer(nn.Module):
                 mode=str(attention_mode).lower().strip(),
                 topk=None if attn_topk is None else int(attn_topk),
                 out_hw=tuple(attn_out_hw) if attn_out_hw is not None else (14, 14),
+            ),
+            egvit=(
+                egvit_cfg
+                if egvit_cfg is not None
+                else EGViTConfig(enabled=bool(use_egvit_masking))
             ),
             guidance=(
                 guidance_cfg
@@ -233,9 +242,10 @@ class Transformer(nn.Module):
             self.attn_recorder.attach(self.backbone)
 
         # ----------------------------------------------------------------------------------
-        # Step 9) Paper-faithful guidance wiring (guide path)
+        # Step 9) Guidance + EG-ViT config wiring
         # ----------------------------------------------------------------------------------
         self.guidance_cfg = self.cfg.guidance
+        self.egvit_cfg = self.cfg.egvit
 
         self.gaze_embedder: Optional[GazeTokenEmbedder] = None
         self.gii_layers: Optional[nn.ModuleList] = None
@@ -390,7 +400,7 @@ class Transformer(nn.Module):
             self.attn_recorder.set_keep_grad(bool(self.gaze_requires_grad and self.gaze_backprop_enabled))
             self.attn_recorder.begin_capture()
 
-        # Step B) Backbone forward (guided path is enabled only when gii_layers + gaze_map exist)
+        # Step B) Backbone forward (Guide and/or EG-ViT apply only when configured and gaze is provided)
         try:
             feats = forward_backbone_tokens(
                 backbone=self.backbone,
@@ -402,6 +412,7 @@ class Transformer(nn.Module):
                 has_eye_mask=has_eye_mask,
                 num_prefix_tokens=int(self.num_prefix_tokens),
                 guidance_drop_prob=float(self.guidance_cfg.drop_prob),
+                egvit_cfg=self.egvit_cfg,
             )
         finally:
             if self.attn_recorder is not None:

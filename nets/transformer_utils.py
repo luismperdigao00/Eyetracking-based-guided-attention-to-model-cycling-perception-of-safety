@@ -542,6 +542,189 @@ class GazeTokenEmbedder(nn.Module):
 
 
 # ================================================================================================
+# EG-ViT mask-guided patch embedding (Eye-Gaze-Guided Vision Transformer, TMI 2023)
+# ================================================================================================
+
+@dataclass(frozen=True)
+class EGViTConfig:
+    """
+    Implements the EG-ViT strategy:
+      1) Apply a binary gaze-guided mask to patch tokens at the input (Eq. 2)
+      2) Add a residual-style merge before the last encoder layer to preserve global information (Eq. 5)
+      3) Optionally disable the behavior during inference (paper uses gaze only for training)
+
+    mask_type:
+      - "separated": keep top-K patches by gaze intensity
+      - "focused"  : keep a rectangular window centered at the gaze maximum
+
+    keep_ratio:
+      Fraction of patches to keep (e.g., 0.25 keeps top 25% patches, masks 75%).
+
+    focus_hw:
+      Window size (h,w) in PATCH units for "focused" masks.
+    """
+    enabled: bool = False
+    mask_type: str = "separated"          # {"separated","focused"}
+    keep_ratio: float = 0.25              # keep top 25% by default (mask 75%)
+    focus_hw: Tuple[int, int] = (3, 3)    # patch-space window size for focused mask
+    drop_prob: float = 0.0                # stochastic disabling (per-sample) during training
+    train_only: bool = True               # disable EG-ViT behavior in eval() by default
+
+
+def _resize_or_pad_mask_vec(mask_vec: torch.Tensor, new_len: int) -> torch.Tensor:
+    """
+    Resizes a (B,N) mask vector to (B,new_len) when token counts mismatch.
+
+    Uses bilinear interpolation when both source and target lengths are perfect squares.
+    Otherwise falls back to truncate/pad with ones (no-masking) for safety.
+    """
+    if mask_vec.ndim != 2:
+        raise ValueError(f"mask_vec must be (B,N), got {tuple(mask_vec.shape)}")
+
+    b, n = mask_vec.shape
+    new_len = int(new_len)
+
+    if n == new_len:
+        return mask_vec
+
+    g0 = int(math.isqrt(n))
+    g1 = int(math.isqrt(new_len))
+    if (g0 * g0 == n) and (g1 * g1 == new_len):
+        m = mask_vec.view(b, 1, g0, g0)
+        m = F.interpolate(m, size=(g1, g1), mode="bilinear", align_corners=False)
+        return m.view(b, new_len)
+
+    if n > new_len:
+        return mask_vec[:, :new_len]
+
+    pad = mask_vec.new_ones((b, new_len - n))
+    return torch.cat([mask_vec, pad], dim=1)
+
+
+def build_egvit_patch_mask(
+    gaze_map: torch.Tensor,
+    *,
+    grid_hw: Tuple[int, int],
+    mask_type: str = "separated",
+    keep_ratio: float = 0.25,
+    focus_hw: Tuple[int, int] = (3, 3),
+) -> torch.Tensor:
+    """
+    Build a binary patch-level mask from a gaze heatmap.
+
+    Returns:
+      mask_vec: (B, N) with values in {0,1}, where N = Gh*Gw
+    """
+    gh, gw = int(grid_hw[0]), int(grid_hw[1])
+    g = _ensure_gaze_4d(gaze_map).float()                  # (B,1,H,W)
+    g = F.interpolate(g, size=(gh, gw), mode="bilinear", align_corners=False)
+    g = g.clamp_min(0.0)
+
+    b = int(g.shape[0])
+    n = gh * gw
+    flat = g.flatten(2).squeeze(1)                         # (B,N)
+
+    mtype = str(mask_type).lower().strip()
+    if mtype not in ("separated", "focused"):
+        mtype = "separated"
+
+    if mtype == "separated":
+        kr = float(keep_ratio)
+        kr = max(0.0, min(1.0, kr))
+        k = int(max(1, round(kr * n)))
+
+        idx = flat.topk(k=k, dim=1, largest=True, sorted=False).indices  # (B,k)
+        mask = flat.new_zeros((b, n))
+        mask.scatter_(1, idx, 1.0)
+        return mask
+
+    fh, fw = int(focus_hw[0]), int(focus_hw[1])
+    fh = max(1, fh)
+    fw = max(1, fw)
+
+    center = flat.argmax(dim=1)                            # (B,)
+    cy = (center // gw).view(b, 1, 1)
+    cx = (center % gw).view(b, 1, 1)
+
+    yy = torch.arange(gh, device=flat.device).view(1, gh, 1)
+    xx = torch.arange(gw, device=flat.device).view(1, 1, gw)
+
+    hy = fh // 2
+    hx = fw // 2
+
+    in_y = (yy >= (cy - hy)) & (yy <= (cy + (fh - hy - 1)))
+    in_x = (xx >= (cx - hx)) & (xx <= (cx + (fw - hx - 1)))
+    mask_grid = (in_y & in_x).float()                      # (B,gh,gw)
+
+    return mask_grid.view(b, n)
+
+
+def _apply_egvit_input_mask(
+    tokens: torch.Tensor,
+    mask_vec: torch.Tensor,
+    num_prefix_tokens: int,
+) -> torch.Tensor:
+    """
+    Eq. (2): z_tilde0 = [prefix; z0_patches ⊙ mask]
+    """
+    if tokens.ndim != 3:
+        return tokens
+
+    _, n, _ = tokens.shape
+    t = int(num_prefix_tokens)
+    if n <= t:
+        return tokens
+
+    patches = tokens[:, t:, :]
+    m = _resize_or_pad_mask_vec(mask_vec, patches.shape[1]).to(device=tokens.device, dtype=tokens.dtype)
+    patches = patches * m.unsqueeze(-1)
+    return torch.cat([tokens[:, :t, :], patches], dim=1)
+
+
+def _apply_egvit_last_layer_merge(
+    tokens_pre_last: torch.Tensor,
+    z0_unmasked: torch.Tensor,
+    mask_vec: torch.Tensor,
+    num_prefix_tokens: int,
+) -> torch.Tensor:
+    """
+    Eq. (5): prepare input to the last encoder layer.
+
+    For patch tokens:
+      - mask_i == 0: use z0_i
+      - mask_i == 1: use z0_i + z_tilde_{l-1,i}
+
+    Vector form:
+      patch_hat = z0_patch + z_tilde_patch * mask
+    """
+    if (tokens_pre_last.ndim != 3) or (z0_unmasked.ndim != 3):
+        return tokens_pre_last
+
+    b, n, _ = tokens_pre_last.shape
+    t = int(num_prefix_tokens)
+    if n <= t:
+        return tokens_pre_last
+
+    if z0_unmasked.shape[0] != b:
+        return tokens_pre_last
+
+    if z0_unmasked.shape[1] != n:
+        min_n = min(int(z0_unmasked.shape[1]), int(n))
+        tokens_pre_last = tokens_pre_last[:, :min_n, :]
+        z0_unmasked = z0_unmasked[:, :min_n, :]
+        n = min_n
+        if n <= t:
+            return tokens_pre_last
+
+    patches_pre = tokens_pre_last[:, t:, :]
+    patches0 = z0_unmasked[:, t:, :]
+
+    m = _resize_or_pad_mask_vec(mask_vec, patches_pre.shape[1]).to(device=tokens_pre_last.device, dtype=tokens_pre_last.dtype)
+    patches_hat = patches0 + (patches_pre * m.unsqueeze(-1))
+
+    return torch.cat([tokens_pre_last[:, :t, :], patches_hat], dim=1)
+
+# ================================================================================================
 # GII injector with per-layer parameters
 # ================================================================================================
 
@@ -700,17 +883,19 @@ def forward_backbone_tokens(
     has_eye_mask: Optional[torch.Tensor] = None,
     num_prefix_tokens: int = 1,
     guidance_drop_prob: float = 0.0,
+    egvit_cfg: Optional[EGViTConfig] = None,
 ) -> torch.Tensor:
     """
-    Guidance implementation that preserves the backbone's native forward_features behavior.
+    Unifies two gaze-conditioning strategies:
 
-    - If guidance is disabled or no gaze is present in the batch: uses backbone.forward_features/backbone(x)
-    - If guidance is enabled and gaze exists: registers per-block forward hooks that add GII residuals
-      to the block outputs, then runs backbone.forward_features/backbone(x) normally.
+      A) "Guide": inject GII residuals inside each ViT block (per-block forward hooks)
+      B) "EG-ViT": mask patch tokens at the input and merge an unmasked residual before the last block
+                  (forward pre-hooks on first/last encoder blocks)
+
+    When neither strategy is active, falls back to the backbone's native forward_features.
     """
     blocks = getattr(backbone, "blocks", None)
 
-    # Determine whether any sample in the batch has gaze available
     has_any_gaze = True
     if has_eye_mask is not None:
         has_any_gaze = bool(has_eye_mask.to(torch.bool).any().item())
@@ -724,53 +909,112 @@ def forward_backbone_tokens(
         and has_any_gaze
     )
 
-    # Fallback: native backbone forward
-    if not guidance_enabled:
+    egvit_enabled = (
+        (egvit_cfg is not None)
+        and bool(getattr(egvit_cfg, "enabled", False))
+        and (gaze_map is not None)
+        and (blocks is not None)
+        and (len(blocks) > 0)
+        and has_any_gaze
+    )
+    if egvit_enabled and bool(getattr(egvit_cfg, "train_only", True)) and (not bool(backbone.training)):
+        egvit_enabled = False
+
+    if not (guidance_enabled or egvit_enabled):
         feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
         return _normalize_backbone_output(feats)
 
     b = int(x.shape[0])
-
-    # Patch grid inferred from backbone config; works with DINOv3 and other timm ViTs
     grid_hw = infer_patch_grid(backbone, num_patches=None)
-
-    # Per-sample mask p in {0,1} with optional stochastic dropping during training
-    p_mask = _gaze_presence_mask(
-        b=b,
-        has_eye_mask=has_eye_mask,
-        drop_prob=float(guidance_drop_prob),
-        training=bool(backbone.training),
-        device=x.device,
-    )
-
-    # Embed gaze once for the whole forward
-    gaze_tokens = gaze_embedder(gaze_map, grid_hw=grid_hw)  # (B,P,dg)
 
     hooks: List[Any] = []
 
-    def _make_block_hook(layer_idx: int):
-        def _hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: Any):
-            # Some implementations may return tuples; only tensor outputs are supported for injection.
-            if not torch.is_tensor(output):
-                return output
+    # ------------------------------------------------------------
+    # EG-ViT pre-hooks (mask at input + merge before last block)
+    # ------------------------------------------------------------
+    if egvit_enabled:
+        patch_mask = build_egvit_patch_mask(
+            gaze_map,
+            grid_hw=grid_hw,
+            mask_type=str(getattr(egvit_cfg, "mask_type", "separated")),
+            keep_ratio=float(getattr(egvit_cfg, "keep_ratio", 0.25)),
+            focus_hw=tuple(getattr(egvit_cfg, "focus_hw", (3, 3))),
+        ).to(device=x.device)
 
-            # GII expects tokens shaped (B,N,D). Use block output as z_tilde surrogate.
-            z_tilde = output
+        ones_mask = patch_mask.new_ones(patch_mask.shape)
 
-            z_bar = gii_layers[layer_idx](
-                z_tilde=z_tilde,
-                gaze_tokens=gaze_tokens,
-                p_mask=p_mask,
+        if has_eye_mask is not None:
+            has_eye = has_eye_mask.to(device=x.device, dtype=torch.bool).view(b)
+            patch_mask = torch.where(has_eye[:, None], patch_mask, ones_mask)
+
+        if bool(backbone.training) and (float(getattr(egvit_cfg, "drop_prob", 0.0)) > 0.0):
+            drop = (torch.rand((b,), device=x.device) < float(getattr(egvit_cfg, "drop_prob", 0.0)))
+            patch_mask = torch.where(drop[:, None], ones_mask, patch_mask)
+
+        cache: Dict[str, torch.Tensor] = {}
+
+        def _egvit_first_pre_hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...]):
+            if len(inputs) < 1 or (not torch.is_tensor(inputs[0])):
+                return None
+            z0 = inputs[0]
+            cache["z0_unmasked"] = z0
+            z_masked = _apply_egvit_input_mask(
+                tokens=z0,
+                mask_vec=patch_mask,
                 num_prefix_tokens=int(num_prefix_tokens),
-                grid_hw=grid_hw,
             )
-            return output + z_bar
-        return _hook
+            return (z_masked,)
 
-    # Attach hooks for the layers that have injectors
-    n_hook = min(len(blocks), len(gii_layers))
-    for i in range(n_hook):
-        hooks.append(blocks[i].register_forward_hook(_make_block_hook(i)))
+        def _egvit_last_pre_hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...]):
+            if len(inputs) < 1 or (not torch.is_tensor(inputs[0])):
+                return None
+            z_pre_last = inputs[0]
+            z0 = cache.get("z0_unmasked", None)
+            if z0 is None:
+                return None
+            z_merge = _apply_egvit_last_layer_merge(
+                tokens_pre_last=z_pre_last,
+                z0_unmasked=z0,
+                mask_vec=patch_mask,
+                num_prefix_tokens=int(num_prefix_tokens),
+            )
+            return (z_merge,)
+
+        hooks.append(blocks[0].register_forward_pre_hook(_egvit_first_pre_hook))
+        hooks.append(blocks[-1].register_forward_pre_hook(_egvit_last_pre_hook))
+
+    # ------------------------------------------------------------
+    # Guide/GII forward hooks (per-block injection)
+    # ------------------------------------------------------------
+    if guidance_enabled:
+        p_mask = _gaze_presence_mask(
+            b=b,
+            has_eye_mask=has_eye_mask,
+            drop_prob=float(guidance_drop_prob),
+            training=bool(backbone.training),
+            device=x.device,
+        )
+
+        gaze_tokens = gaze_embedder(gaze_map, grid_hw=grid_hw)  # (B,P,dg)
+
+        def _make_block_hook(layer_idx: int):
+            def _hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: Any):
+                if not torch.is_tensor(output):
+                    return output
+                z_tilde = output
+                z_bar = gii_layers[layer_idx](
+                    z_tilde=z_tilde,
+                    gaze_tokens=gaze_tokens,
+                    p_mask=p_mask,
+                    num_prefix_tokens=int(num_prefix_tokens),
+                    grid_hw=grid_hw,
+                )
+                return output + z_bar
+            return _hook
+
+        n_hook = min(len(blocks), len(gii_layers))
+        for i in range(n_hook):
+            hooks.append(blocks[i].register_forward_hook(_make_block_hook(i)))
 
     try:
         feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)

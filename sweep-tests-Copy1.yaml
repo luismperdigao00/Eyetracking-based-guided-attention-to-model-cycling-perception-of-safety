@@ -52,7 +52,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: "berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
+    value: "berlin" #"berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -67,11 +67,11 @@ parameters:
   # ---------------------------------------------------------------------------
   backbone:
     values:
-      - "vit_small"
+      #- "vit_small"
       - "dinov3_vitb16"
-      - "deit3_base_patch16_224"
-      - "vit_base_patch16_224"
-      - "vit_base_patch16_clip_224"
+      #- "deit3_base_patch16_224"
+      #- "vit_base_patch16_224"
+      #- "vit_base_patch16_clip_224"
       #- "vgg"
       #- "convnext_base"
       #- "efficientnet_v2_s"
@@ -173,7 +173,7 @@ parameters:
   # J) Augmentation
   # ---------------------------------------------------------------------------
   augment:
-    values: ["heavy"]
+    values: ["none"]
   use_seg:
     value: false
 
@@ -205,10 +205,11 @@ parameters:
   gaze_mode:
     values: 
      #- disable
-     #- diag
+     - egvit
      #- guide
-     - align
+     #- diag
+     #- align
      #- align+gaze
 
   attention_mode:
-    values: ["last", "rollout"]
+    values: ["last"]

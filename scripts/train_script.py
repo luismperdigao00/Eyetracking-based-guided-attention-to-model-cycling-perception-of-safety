@@ -217,25 +217,41 @@ def _set_gaze_bp(model: torch.nn.Module, enabled: bool) -> None:
         model.module.set_gaze_backprop(bool(enabled))
         return
 
-def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
+def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool, bool]:
     gaze_cfg = getattr(args, "gaze_cfg", None)
 
     if gaze_cfg is not None:
-        gaze_mode = str(getattr(gaze_cfg, "mode", "disable"))
-        use_gaze_any = bool(getattr(gaze_cfg, "load_gaze", False))
-        use_gaze_kl = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+        gaze_mode = str(getattr(gaze_cfg, "mode", "disable")).lower().strip()
+
         use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
-        return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+        use_gaze_kl = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+
+        pass_to_model = bool(getattr(gaze_cfg, "pass_to_model", False)) or (gaze_mode == "egvit")
+
+        compute_kl = bool(getattr(gaze_cfg, "compute_kl", False))
+        load_gaze = bool(getattr(gaze_cfg, "load_gaze", False))
+
+        use_gaze_any = bool(load_gaze or pass_to_model or compute_kl or use_gaze_kl)
+
+        return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
 
     gaze_mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
+    gaze_mode_norm = str(gaze_mode).lower().strip()
+
     w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
 
-    use_gaze_inj = gaze_mode in ("guide", "align+gaze")
-    kl_requested = gaze_mode in ("diag", "guide", "align", "align+gaze")
-    use_gaze_kl = bool(gaze_mode in ("align", "align+gaze") and (w_kl > 0.0))
-    use_gaze_any = bool(gaze_mode != "disable") and bool(use_gaze_inj or kl_requested)
+    egvit = gaze_mode_norm == "egvit"
+    use_gaze_inj = gaze_mode_norm in ("guide", "align+gaze")
 
-    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+    kl_requested = gaze_mode_norm in ("diag", "guide", "align", "align+gaze")
+    use_gaze_kl = bool(gaze_mode_norm in ("align", "align+gaze") and (w_kl > 0.0))
+
+    pass_to_model = bool(use_gaze_inj or egvit)
+
+    use_gaze_any = bool(gaze_mode_norm != "disable") and bool(use_gaze_inj or kl_requested or egvit)
+
+    return gaze_mode_norm, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
+
 
 
 def _prepare_batch(
@@ -249,16 +265,18 @@ def _prepare_batch(
     label_r = data["score_r"].to(device).float()
     label_c = data["score_c"].to(device).long()
 
-    _gaze_mode, use_gaze_any, _use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+    _gaze_mode, use_gaze_any, _use_gaze_kl, _use_gaze_inj, pass_to_model = _resolve_gaze_flags(args)
 
     labels: Dict[str, torch.Tensor] = {"label_r": label_r, "label_c": label_c}
 
     gaze_l = gaze_r = has_eye_mask = None
-    if use_gaze_any:
+
+    need_gaze_tensors = bool(use_gaze_any or pass_to_model)
+    if need_gaze_tensors:
         if ("gaze_l" not in data) or ("gaze_r" not in data):
-            raise KeyError("Batch missing gaze_l/gaze_r while gaze is enabled.")
+            raise KeyError("Batch missing gaze_l/gaze_r while gaze tensors are required.")
         if "has_eyetracker" not in data:
-            raise KeyError("Batch missing has_eyetracker while gaze is enabled.")
+            raise KeyError("Batch missing has_eyetracker while gaze tensors are required.")
 
         gaze_l = data["gaze_l"].to(device)
         gaze_r = data["gaze_r"].to(device)
@@ -268,9 +286,9 @@ def _prepare_batch(
         labels["gaze_r"] = gaze_r
         labels["has_eye_mask"] = has_eye_mask
 
-    if use_gaze_inj:
+    if pass_to_model:
         if gaze_l is None or gaze_r is None or has_eye_mask is None:
-            raise ValueError("Gaze injection enabled but gaze tensors are missing from batch.")
+            raise ValueError("Gaze-aware forward enabled but gaze tensors are missing from batch.")
         inputs: Tuple[torch.Tensor, ...] = (input_left, input_right, gaze_l, gaze_r, has_eye_mask)
     else:
         inputs = (input_left, input_right)
@@ -937,7 +955,6 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 
     If print_output=False → do NOT print anything (useful for test set).
     """
-
     if args.model not in ["sscnn", "rsscnn"]:
         return None
 
@@ -950,8 +967,7 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
 
-    # Resolve gaze flags once (mode does not change within a run)
-    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model = _resolve_gaze_flags(args)
 
     net.eval()
     with torch.no_grad():
@@ -960,16 +976,11 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
             input_right = batch["image_r"].to(device)
             label_c = batch["score_c"].to(device).long()
 
-            # ---------------------------------------------------------------------------------
-            # Forward pass:
-            #   - off / align      : image-only model execution
-            #   - guide / align+guide : pass gaze + mask for injection
-            # ---------------------------------------------------------------------------------
-            if use_gaze_inj:
+            if pass_to_model:
                 if ("gaze_l" not in batch) or ("gaze_r" not in batch):
-                    raise KeyError("Batch missing gaze tensors while gaze injection is enabled.")
+                    raise KeyError("Batch missing gaze tensors while gaze-aware forward is enabled.")
                 if "has_eyetracker" not in batch:
-                    raise KeyError("Batch missing 'has_eyetracker' while gaze injection is enabled.")
+                    raise KeyError("Batch missing 'has_eyetracker' while gaze-aware forward is enabled.")
 
                 gaze_l = batch["gaze_l"].to(device)
                 gaze_r = batch["gaze_r"].to(device)
@@ -1341,7 +1352,8 @@ def train(
     net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
     is_transformer = hasattr(net_cfg, "transformer")
 
-    gaze_mode, _use_gaze_any, use_gaze_kl, _use_gaze_inj = _resolve_gaze_flags(args)
+    gaze_mode, _use_gaze_any, use_gaze_kl, _use_gaze_inj, _pass_to_model = _resolve_gaze_flags(args)
+
     
     attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
     

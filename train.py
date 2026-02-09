@@ -168,6 +168,7 @@ def arg_parse():
             "  disable    : no gaze loading, no KL diagnostics, no injection, no attention hooks\n"
             "  diag       : KL computed for diagnostics only (no gradient contribution)\n"
             "  guide      : gaze injected; KL computed for diagnostics only\n"
+            "  egvit     : EG-ViT masking (mask patch tokens by gaze during training; no KL)\n"
             "  align      : KL added to total loss (attn_w * KL)\n"
             "  align+gaze : gaze injected and KL added to total loss (attn_w * KL)\n"
             "Legacy aliases: off->diag, align+guide->align+gaze\n"
@@ -201,6 +202,44 @@ def arg_parse():
     )
 
     parser.add_argument("--cities", type=str, default="all")
+
+    # -------------------- EG-ViT (GAZE MASKING) ----------------
+    egvit_group = parser.add_argument_group("EG-ViT gaze masking options")
+    egvit_group.add_argument(
+        "--egvit_mask_type",
+        type=str,
+        default="separated",
+        choices=["separated", "focused"],
+        help="Mask construction strategy for --gaze_mode=egvit.",
+    )
+    egvit_group.add_argument(
+        "--egvit_keep_ratio",
+        type=float,
+        default=0.75,
+        help="Fraction of patch tokens to keep for separated masks (e.g., 0.25 keeps top 25% patches).",
+    )
+    egvit_group.add_argument(
+        "--egvit_focus_hw",
+        type=int,
+        nargs=2,
+        default=(3, 3),
+        help="Focused mask window size in patch units: H W (used only when --egvit_mask_type=focused).",
+    )
+    egvit_group.add_argument(
+        "--egvit_drop_prob",
+        type=float,
+        default=0.0,
+        help="Probability to disable EG-ViT masking per-sample during training (stochastic robustness).",
+    )
+    egvit_group.add_argument(
+        "--egvit_train_only",
+        nargs="?",
+        const=True,
+        default=True,
+        type=str2bool,
+        help="If True, apply EG-ViT masking only during training; eval() becomes a vanilla ViT forward.",
+    )
+
 
     # -------------------- LR & OPTIMIZATION ------------------
     parser.add_argument("--base_lr", type=float, default=5e-6)

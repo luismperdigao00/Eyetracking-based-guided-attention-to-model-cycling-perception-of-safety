@@ -718,8 +718,17 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known}")
 
     gaze_cfg = getattr(args, "gaze_cfg", None)
-    need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False))
-    use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
+
+    need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False)) if gaze_cfg is not None else False
+    use_gaze_inj = bool(getattr(gaze_cfg, "inject", False)) if gaze_cfg is not None else False
+    use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) if gaze_cfg is not None else bool(use_gaze_loss)
+
+    gaze_grid = getattr(args, "gaze_grid_size", (14, 14))
+    if isinstance(gaze_grid, (list, tuple)) and len(gaze_grid) == 2:
+        gaze_grid_hw = (int(gaze_grid[0]), int(gaze_grid[1]))
+    else:
+        g = int(gaze_grid)
+        gaze_grid_hw = (g, g)
 
     if is_cnn_backbone:
         from nets.cnn import CNN as Net
@@ -741,12 +750,12 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
             num_classes=3 if args.ties else 2,
             flatten_spatial=flatten_spatial,
             flat_dim_override=None,
-            gaze_grid_size=int(getattr(args, "gaze_grid_size", (14, 14))[0]),
+            gaze_grid_size=int(gaze_grid_hw[0]),
         )
         return net
 
     from nets.transformer import Transformer as Net
-    from nets.transformer_utils import GuideGuidanceConfig
+    from nets.transformer_utils import GuideGuidanceConfig, EGViTConfig
 
     guidance_cfg = GuideGuidanceConfig(
         enabled=bool(use_gaze_inj),
@@ -756,7 +765,28 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         drop_prob=0.0,
         strength=4,
     )
-    
+
+    use_egvit = False
+    if gaze_cfg is not None:
+        use_egvit = bool(getattr(gaze_cfg, "egvit", False)) or (str(getattr(gaze_cfg, "mode", "")).lower().strip() == "egvit")
+    else:
+        use_egvit = (str(getattr(args, "gaze_mode", "disable")).lower().strip() == "egvit")
+
+    focus_hw = getattr(args, "egvit_focus_hw", (3, 3))
+    if isinstance(focus_hw, (list, tuple)) and len(focus_hw) == 2:
+        focus_hw = (int(focus_hw[0]), int(focus_hw[1]))
+    else:
+        focus_hw = (3, 3)
+
+    egvit_cfg = EGViTConfig(
+        enabled=bool(use_egvit),
+        mask_type=str(getattr(args, "egvit_mask_type", "separated")),
+        keep_ratio=float(getattr(args, "egvit_keep_ratio", 0.25)),
+        focus_hw=tuple(focus_hw),
+        drop_prob=float(getattr(args, "egvit_drop_prob", 0.0)),
+        train_only=bool(getattr(args, "egvit_train_only", True)),
+    )
+
     net = Net(
         backbone=backbone_model,
         model=args.model,
@@ -771,20 +801,22 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         return_attn=bool(need_attn_maps),
         attention_mode=args.attention_mode,
         attn_topk=args.attn_topk,
-        attn_out_hw=tuple(getattr(args, "gaze_grid_size", (14, 14))),
+        attn_out_hw=tuple(gaze_grid_hw),
         use_gaze_injection=bool(use_gaze_inj),
         guidance_cfg=guidance_cfg,
+        use_egvit_masking=bool(use_egvit),
+        egvit_cfg=egvit_cfg,
     )
 
-    net.attn_grad = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+    net.attn_grad = bool(use_kl_in_loss)
 
     if need_attn_maps:
         try:
             from dataclasses import replace
             if hasattr(net, "attn_cfg"):
-                net.attn_cfg = replace(net.attn_cfg, out_hw=tuple(args.gaze_grid_size))
+                net.attn_cfg = replace(net.attn_cfg, out_hw=tuple(gaze_grid_hw))
         except Exception as e:
-            raise RuntimeError(f"Failed to set attention output size to gaze_grid_size={args.gaze_grid_size}: {e}")
+            raise RuntimeError(f"Failed to set attention output size to gaze_grid_size={gaze_grid_hw}: {e}")
 
     return net
 
