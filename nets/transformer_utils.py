@@ -507,25 +507,16 @@ class AttentionRecorder:
 # ================================================================================================
 # Gaze token embedding 
 # ================================================================================================
-
 class GazeTokenEmbedder(nn.Module):
     """
     Converts a gaze map M_g into patch-aligned gaze tokens G.
 
-    Input:
-      gaze_map: (B,H,W) or (B,1,H,W)
-      grid_hw: (Gh,Gw)
-
-    Output:
-      gaze_tokens: (B, P, dg), where P = Gh*Gw
+    Output matches the paper: G in R^{P x D}, where D is the ViT token dim.
     """
-    def __init__(self, gaze_token_dim: int) -> None:
+    def __init__(self, token_dim: int) -> None:
         super().__init__()
-        self.gaze_token_dim = int(gaze_token_dim)
-        self.proj = nn.Sequential(
-            nn.Linear(1, self.gaze_token_dim),
-            nn.GELU(),
-        )
+        self.token_dim = int(token_dim)
+        self.proj = nn.Linear(1, self.token_dim)
 
     def forward(self, gaze_map: torch.Tensor, grid_hw: Tuple[int, int]) -> torch.Tensor:
         gh, gw = int(grid_hw[0]), int(grid_hw[1])
@@ -536,9 +527,9 @@ class GazeTokenEmbedder(nn.Module):
         g_flat = g.flatten(2).transpose(1, 2).contiguous()  # (B,P,1)
 
         g_max = g_flat.amax(dim=1, keepdim=True).clamp_min(1e-12)  # (B,1,1)
-        g_flat = g_flat / g_max
+        g_flat = g_flat / g_max                                    # normalized to [0,1]
 
-        return self.proj(g_flat)  # (B,P,dg)
+        return self.proj(g_flat)                                    # (B,P,D)
 
 
 # ================================================================================================
@@ -742,22 +733,22 @@ class GuideGuidanceConfig:
     gaze_hidden_dim: int = 30
     conv_hidden_channels: int = 64
     drop_prob: float = 0
-    strength: float = 10.0
+    strength: float = 1.0
 
 
 class GIIInjectorLayer(nn.Module):
     """
     Computes bar_Z_l from tilde_Z_l and gaze tokens, matching the paper layout:
-      - down-projection (d -> d')
-      - gaze projection into d'
-      - GFF spatial attention via concat(avg,max) -> conv -> sigmoid
-      - reweight visual tokens and up-projection (d' -> d)
+      - MLP_down: d -> d' for visual tokens (Eq. 4)
+      - gaze compression: d -> d_g -> d' (Eq. 6)
+      - spatial attention from concat(avg,max) -> conv -> sigmoid (Eq. 7-9 style)
+      - up-projection: d' -> d
     """
-    def __init__(self, token_dim: int, gaze_token_dim: int, cfg: GuideGuidanceConfig) -> None:
+    def __init__(self, token_dim: int, cfg: GuideGuidanceConfig) -> None:
         super().__init__()
         self.cfg = cfg
         d = int(token_dim)
-        dg = int(gaze_token_dim)
+        dg = int(cfg.gaze_hidden_dim)
         db = int(cfg.bottleneck_dim)
         ch = int(cfg.conv_hidden_channels)
 
@@ -766,12 +757,15 @@ class GIIInjectorLayer(nn.Module):
             nn.GELU(),
         )
 
-        self.gaze_proj = nn.Sequential(
+        self.gaze_down = nn.Sequential(
+            nn.Linear(d, dg),
+            nn.GELU(),
+        )
+        self.gaze_tr = nn.Sequential(
             nn.Linear(dg, db),
             nn.GELU(),
         )
 
-        # GFF input is concat(avg_pool, max_pool) -> 2 channels
         self.gff = nn.Sequential(
             nn.Conv2d(2, ch, kernel_size=3, padding=1),
             nn.GELU(),
@@ -811,7 +805,7 @@ class GIIInjectorLayer(nn.Module):
         z_hat_c = z_hat[:, :t, :]           # (B,T,db)
         z_hat_v = z_hat[:, t:, :]           # (B,P,db)
 
-        g_hat = self.gaze_proj(gaze_tokens) # (B,P,db)
+        g_hat = self.gaze_tr(self.gaze_down(gaze_tokens))  # (B,P,d')
 
         # p_mask is (B,1,1) and broadcasts over (B,P,db)
         z_vg = z_hat_v + (p_mask * g_hat)   # (B,P,db)
@@ -828,12 +822,13 @@ class GIIInjectorLayer(nn.Module):
         z_hat_v_prime = z_hat_v * a                       # (B,P,db)
 
         z_hat_prime = torch.cat([z_hat_c, z_hat_v_prime], dim=1)  # (B,N,db)
-        z_bar = self.up(z_hat_prime)                              # (B,N,D)
+        z_bar = self.up(z_hat_prime)  # (B,N,D)
         
         p_mask_ = p_mask.to(device=z_bar.device, dtype=z_bar.dtype)  # (B,1,1)
-        z_bar = z_bar * p_mask_                                       # (B,N,D)
+        z_bar = z_bar * p_mask_                                      # (B,N,D)
         
         return float(self.cfg.strength) * z_bar
+
 
 
 # ================================================================================================
@@ -987,22 +982,62 @@ def forward_backbone_tokens(
     # Guide/GII forward hooks (per-block injection)
     # ------------------------------------------------------------
     if guidance_enabled:
+    
+        effective_drop_prob = float(guidance_drop_prob) if bool(backbone.training) else 0.0
         p_mask = _gaze_presence_mask(
             b=b,
             has_eye_mask=has_eye_mask,
-            drop_prob=float(guidance_drop_prob),
+            drop_prob=effective_drop_prob,
             training=bool(backbone.training),
             device=x.device,
         )
-
-        gaze_tokens = gaze_embedder(gaze_map, grid_hw=grid_hw)  # (B,P,dg)
-
-        def _make_block_hook(layer_idx: int):
-            def _hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: Any):
+    
+        gaze_tokens = gaze_embedder(gaze_map, grid_hw=grid_hw)  # (B,P,D)
+    
+        n_hook = min(len(blocks), len(gii_layers))
+    
+        def _make_guide_hooks(layer_idx: int, blk: nn.Module):
+            state: Dict[str, Any] = {"x_in": None, "dp_calls": 0, "res1": None}
+            dp1 = _resolve_drop_path(blk, which=1)
+    
+            def _blk_pre_hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], _state=state):
+                x0 = inputs[0] if (len(inputs) > 0 and torch.is_tensor(inputs[0])) else None
+                _state["x_in"] = x0
+                _state["dp_calls"] = 0
+                _state["res1"] = None
+                return None
+    
+            def _dp1_hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: Any, _state=state):
+                _state["dp_calls"] = int(_state.get("dp_calls", 0)) + 1
+                if _state["dp_calls"] == 1 and torch.is_tensor(output):
+                    _state["res1"] = output
+                return output
+    
+            def _blk_post_hook(
+                module: nn.Module,
+                inputs: Tuple[torch.Tensor, ...],
+                output: Any,
+                _state=state,
+                _layer_idx=layer_idx,
+            ):
                 if not torch.is_tensor(output):
                     return output
-                z_tilde = output
-                z_bar = gii_layers[layer_idx](
+    
+                x0 = _state.get("x_in", None)
+                if x0 is None:
+                    return output
+    
+                res1 = _state.get("res1", None)
+                if torch.is_tensor(res1):
+                    z_tilde = x0 + res1
+                else:
+                    if not (hasattr(module, "norm1") and hasattr(module, "attn")):
+                        return output
+                    attn_out = module.attn(module.norm1(x0))
+                    attn_out = _maybe_layer_scale(module, which=1, x=attn_out)
+                    z_tilde = x0 + attn_out
+    
+                z_bar = gii_layers[_layer_idx](
                     z_tilde=z_tilde,
                     gaze_tokens=gaze_tokens,
                     p_mask=p_mask,
@@ -1010,11 +1045,18 @@ def forward_backbone_tokens(
                     grid_hw=grid_hw,
                 )
                 return output + z_bar
-            return _hook
+    
+            return dp1, _blk_pre_hook, _dp1_hook, _blk_post_hook
+    
+        for layer_idx in range(n_hook):
+            blk = blocks[layer_idx]
+            dp1, pre_hook, dp_hook, post_hook = _make_guide_hooks(layer_idx, blk)
+    
+            hooks.append(blk.register_forward_pre_hook(pre_hook))
+            if isinstance(dp1, nn.Module):
+                hooks.append(dp1.register_forward_hook(dp_hook))
+            hooks.append(blk.register_forward_hook(post_hook))
 
-        n_hook = min(len(blocks), len(gii_layers))
-        for i in range(n_hook):
-            hooks.append(blocks[i].register_forward_hook(_make_block_hook(i)))
 
     try:
         feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)

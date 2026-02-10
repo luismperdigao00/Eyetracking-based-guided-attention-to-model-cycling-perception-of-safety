@@ -208,21 +208,21 @@ def arg_parse():
     egvit_group.add_argument(
         "--egvit_mask_type",
         type=str,
-        default="separated",
+        default="focused",
         choices=["separated", "focused"],
         help="Mask construction strategy for --gaze_mode=egvit.",
     )
     egvit_group.add_argument(
         "--egvit_keep_ratio",
         type=float,
-        default=0.75,
+        default=0.25,
         help="Fraction of patch tokens to keep for separated masks (e.g., 0.25 keeps top 25% patches).",
     )
     egvit_group.add_argument(
         "--egvit_focus_hw",
         type=int,
         nargs=2,
-        default=(3, 3),
+        default=(7, 7),
         help="Focused mask window size in patch units: H W (used only when --egvit_mask_type=focused).",
     )
     egvit_group.add_argument(
@@ -411,11 +411,11 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir="splits_yolo3",
+        splits_dir = "splits_eye",
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,
-        load_if_exists=False,   # loads if files exist, otherwise splits
+        load_if_exists=True,   # loads if files exist, otherwise splits
         save_splits=False,
     )
 

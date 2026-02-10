@@ -46,7 +46,6 @@ class GazeConfig:
     use_kl_in_loss: bool       # include KL term in the training loss (requires compute_kl=True)
     need_attn_maps: bool       # downstream code expects attention maps in outputs (diagnostics/kl)
     gaze_output: str           # which maps to use for gaze-related output routing ("align"|"guide")
-
     pass_to_model: bool = False  # forward signature needs gaze tensors: net(img_l,img_r,gaze_l,gaze_r,mask)
     egvit: bool = False          # enable EG-ViT patch masking + last-layer merge strategy in transformer
 

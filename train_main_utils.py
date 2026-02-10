@@ -759,12 +759,13 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
 
     guidance_cfg = GuideGuidanceConfig(
         enabled=bool(use_gaze_inj),
-        bottleneck_dim=128,
-        gaze_hidden_dim=64,
+        bottleneck_dim=20,        # d' (paper best)
+        gaze_hidden_dim=30,       # d_g (paper best)
         conv_hidden_channels=64,
-        drop_prob=0.0,
-        strength=4,
-    )
+        drop_prob=0.0,            # only ~17% have gaze
+        strength=1.0,             # paper adds residual without extra scaling
+)
+
 
     use_egvit = False
     if gaze_cfg is not None:
@@ -790,7 +791,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
     net = Net(
         backbone=backbone_model,
         model=args.model,
-        pooling=getattr(args, "pooling", "cls"),
+        pooling=getattr(args, "pooling", "patch_mean"),
         pool_k=getattr(args, "pool_k", 10),
         num_classes=3 if args.ties else 2,
         finetune=args.finetune,

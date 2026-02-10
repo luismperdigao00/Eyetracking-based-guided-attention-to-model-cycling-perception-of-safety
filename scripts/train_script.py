@@ -24,6 +24,7 @@ import optuna
 import torch
 import torch.optim as optim
 import wandb
+import json
 from torch import nn
 
 from ignite.engine import Engine, Events
@@ -1449,7 +1450,12 @@ def train(
     # -----------------------------
     # Checkpointing
     # -----------------------------
-    run_name = getattr(getattr(wandb, "run", None), "name", "no_wandb")
+    run = getattr(wandb, "run", None)
+    run_id = getattr(run, "id", "no_wandb_id")
+    run_name = getattr(run, "name", "no_wandb_name")
+
+    ckpt_dir = os.path.join(args.model_dir, str(run_id))
+    os.makedirs(ckpt_dir, exist_ok=True)
     """
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED,
@@ -1468,8 +1474,8 @@ def train(
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED,
         ModelCheckpoint(
-            args.model_dir,
-            f"{run_name}_best",
+            ckpt_dir,
+            "best",
             n_saved=1,
             create_dir=True,
             require_empty=False,
@@ -1478,12 +1484,12 @@ def train(
         ),
         {"model": net},
     )
-
+    
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED,
         ModelCheckpoint(
-            args.model_dir,
-            f"{run_name}_last",
+            ckpt_dir,
+            "last",
             n_saved=1,
             create_dir=True,
             require_empty=False,
@@ -1492,6 +1498,10 @@ def train(
         {"model": net},
     )
 
+    info_path = os.path.join(ckpt_dir, "run_info.json")
+    if not os.path.exists(info_path):
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": run_id, "run_name": run_name}, f, indent=2)
     # -----------------------------
     # Resume support
     # -----------------------------

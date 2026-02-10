@@ -253,16 +253,12 @@ class Transformer(nn.Module):
         if self.guidance_cfg.enabled:
             blocks = getattr(self.backbone, "blocks", None)
             if blocks is not None and len(blocks) > 0:
-                gaze_token_dim = int(self.guidance_cfg.gaze_hidden_dim)
-
-                self.gaze_embedder = GazeTokenEmbedder(gaze_token_dim=gaze_token_dim)
-
-                # One injector per block (layer-indexed parameters)
+                self.gaze_embedder = GazeTokenEmbedder(token_dim=int(self.embed_dim))
+        
                 self.gii_layers = nn.ModuleList(
                     [
                         GIIInjectorLayer(
                             token_dim=int(self.embed_dim),
-                            gaze_token_dim=gaze_token_dim,
                             cfg=self.guidance_cfg,
                         )
                         for _ in range(len(blocks))
@@ -411,7 +407,7 @@ class Transformer(nn.Module):
                 gaze_map=gaze_map,
                 has_eye_mask=has_eye_mask,
                 num_prefix_tokens=int(self.num_prefix_tokens),
-                guidance_drop_prob=float(self.guidance_cfg.drop_prob),
+                guidance_drop_prob=float(self.guidance_cfg.drop_prob) if bool(self.training) else 0.0,
                 egvit_cfg=self.egvit_cfg,
             )
         finally:

@@ -27,7 +27,7 @@ parameters:
     value: "0,1"
 
   seed:
-    values: [30]
+    values: [43]
   log_wandb:
     value: true
   log_console:
@@ -72,6 +72,7 @@ parameters:
       #- "deit3_base_patch16_224"
       #- "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
+      - "dinov2_base"
       #- "vgg"
       #- "convnext_base"
       #- "efficientnet_v2_s"
@@ -121,7 +122,7 @@ parameters:
   # G) Optimizer
   # ---------------------------------------------------------------------------
   base_lr:
-    value: 2e-5
+    value: 3.5e-5
   backbone_lr_scale:
     value: 1
   weight_decay:
@@ -173,7 +174,7 @@ parameters:
   # J) Augmentation
   # ---------------------------------------------------------------------------
   augment:
-    values: ["none"]
+    values: ["heavy"]
   use_seg:
     value: false
 
@@ -206,9 +207,9 @@ parameters:
     values: 
      #- disable
      - egvit
-     #- guide
-     #- diag
-     #- align
+     - guide
+     - diag
+     - align
      #- align+gaze
 
   attention_mode:
