@@ -357,19 +357,22 @@ DEFAULT_SPECS = {
 BACKBONE_ALIAS_TO_TIMM_ID = {
     # --- The "Power 5"  ---
     "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",
+    # Optional alias if you want to explicitly test the qkvb variant
+    #"dinov3_vitb16": "vit_base_patch16_dinov3_qkvb",
+
     "beitv2_base_patch16_224": "beitv2_base_patch16_224.in1k_ft_in22k",
     "deit3_base_patch16_224": "deit3_base_patch16_224.fb_in22k_ft_in1k",
     "siglip_base_patch16_224": "vit_base_patch16_siglip_224",
     "vit_base_patch16_clip_224": "vit_base_patch16_clip_224.openai",
 
     # --- Modern High-Performance Alternates ---
-    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",         
+    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",
     "dinov2_reg_base": "vit_base_patch14_reg4_dinov2.lvd142m",
     "eva02_base": "eva02_base_patch14_448.mim_in22k_ft_in1k",
     "convnext_base": "convnext_base.fb_in22k_ft_in1k",
 
     # --- Original / Canonical ViT ---
-    "vit_base_patch16_224": "vit_base_patch16_224.augreg_in21k_ft_in1k",  
+    "vit_base_patch16_224": "vit_base_patch16_224.augreg_in21k_ft_in1k",
 
     # --- Legacy / Standard Transformers ---
     "vit_base_dino": "vit_base_patch16_224.dino",
@@ -380,13 +383,12 @@ BACKBONE_ALIAS_TO_TIMM_ID = {
     "deit_base_distilled": "deit_base_distilled_patch16_224.fb_in1k",
 
     # --- CNNs (Mapped for Preprocessing Specs) ---
-    # Note: train.py loads these via torchvision, but data.py needs these
-    # to fetch mean/std/crop info from timm.
     "alex": "alexnet",
     "vgg": "vgg19",
     "dense": "densenet121",
     "resnet": "resnet50",
 }
+
 
 
 DEFAULT_SPECS = {

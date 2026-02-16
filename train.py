@@ -268,7 +268,7 @@ def arg_parse():
             "dense",
             "resnet",
         ],
-        help="Model backbone to use. Default: dinov3_vitb16",
+        help="Model backbone to use.",
     )
 
     # === POOLING ARGUMENTS ===
@@ -328,7 +328,14 @@ def arg_parse():
              "'flatten' uses flattened spatial grid (VGG-style, huge heads).",
     )
     parser.add_argument("--backbone_freeze_epochs", type=int, default=4, help="Freeze backbone for first N epochs (requires --finetune).")
-    
+    parser.add_argument(
+        "--train_gaze_frac",
+        type=float,
+        default="0.7",
+        help="Fraction of all has_eyetracker=True rows forced into the TRAIN split (range: 0.70..1.0). "
+             "1.0 means ALL gaze rows go to train. Applied after the initial random split via swaps.",
+    )
+
     return parser
 
 
@@ -382,12 +389,13 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        #splits_dir = "splits_eye",
+        splits_dir = "splits_eye",
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,
-        load_if_exists=False,   # loads if files exist, otherwise splits
-        save_splits=True,
+        load_if_exists=True,   # loads if files exist, otherwise splits
+        save_splits=False,
+        train_gaze_frac=args.train_gaze_frac,
     )
 
 

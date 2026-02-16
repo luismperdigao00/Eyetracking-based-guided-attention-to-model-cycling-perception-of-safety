@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 import logging
 from datetime import date
 import random
+import math
 
 
 try:
@@ -272,16 +273,18 @@ def _load_or_split(
     test_pct: float = 0.20,
     load_if_exists: bool = True,
     save_splits: bool = True,
+    train_gaze_frac: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    _ensure_dir(splits_dir)
-    train_path, val_path, test_path = _split_paths(comparisons_path, splits_dir)
+    """
+    Standard random split + optional post-split gaze rebalancing.
 
-    if load_if_exists and all(os.path.exists(p) for p in (train_path, val_path, test_path)):
-        return (
-            pd.read_pickle(train_path),
-            pd.read_pickle(val_path),
-            pd.read_pickle(test_path),
-        )
+    train_gaze_frac:
+      - None: no gaze rebalancing (default behavior)
+      - float in [0, 1]: target fraction of all has_eyetracker=True rows that should be in TRAIN.
+        Typical range: [train_pct, 1.0]. 1.0 forces all gaze rows into train (when possible).
+    """
+
+    _ensure_dir(splits_dir)
 
     total = float(train_pct + val_pct + test_pct)
     if abs(total - 1.0) > 1e-9:
@@ -293,6 +296,31 @@ def _load_or_split(
     if val_pct < 0.0 or train_pct < 0.0:
         raise ValueError("train_pct and val_pct must be >= 0")
 
+    # ----------------------------
+    # Resolve split cache filenames
+    # ----------------------------
+    split_prefix = os.path.splitext(os.path.basename(comparisons_path))[0]
+
+    gaze_tag = ""
+    if train_gaze_frac is not None:
+        g = float(train_gaze_frac)
+        g = max(0.0, min(1.0, g))
+        gaze_tag = f"_trainGaze{int(round(100.0 * g)):03d}"
+
+    train_path = os.path.join(splits_dir, f"{split_prefix}{gaze_tag}_train.pkl")
+    val_path = os.path.join(splits_dir, f"{split_prefix}{gaze_tag}_val.pkl")
+    test_path = os.path.join(splits_dir, f"{split_prefix}{gaze_tag}_test.pkl")
+
+    if load_if_exists and all(os.path.exists(p) for p in (train_path, val_path, test_path)):
+        return (
+            pd.read_pickle(train_path),
+            pd.read_pickle(val_path),
+            pd.read_pickle(test_path),
+        )
+
+    # ----------------------------
+    # 1) Baseline random split
+    # ----------------------------
     X_train, X_test = train_test_split(
         df,
         test_size=test_pct,
@@ -313,12 +341,88 @@ def _load_or_split(
         random_state=int(seed),
     )
 
+    # ----------------------------
+    # 2) Optional gaze rebalancing
+    # ----------------------------
+    if train_gaze_frac is not None:
+        if "has_eyetracker" in X_train.columns and "has_eyetracker" in X_val.columns and "has_eyetracker" in X_test.columns:
+            frac = float(train_gaze_frac)
+            frac = max(0.0, min(1.0, frac))
+
+            X_train = X_train.copy()
+            X_val = X_val.copy()
+            X_test = X_test.copy()
+
+            tr_g = _boolish_series_to_bool_mask(X_train["has_eyetracker"])
+            va_g = _boolish_series_to_bool_mask(X_val["has_eyetracker"])
+            te_g = _boolish_series_to_bool_mask(X_test["has_eyetracker"])
+
+            total_gaze = int(tr_g.sum() + va_g.sum() + te_g.sum())
+            if total_gaze > 0:
+                desired_train_gaze = int(math.ceil(frac * float(total_gaze)))
+                current_train_gaze = int(tr_g.sum())
+                need = desired_train_gaze - current_train_gaze
+
+                if need > 0:
+                    # Candidate gaze rows to pull into train
+                    val_gaze_idx = X_val.index[va_g].to_list()
+                    test_gaze_idx = X_test.index[te_g].to_list()
+
+                    if len(val_gaze_idx) > 0:
+                        val_gaze_idx = X_val.loc[val_gaze_idx].sample(frac=1.0, random_state=int(seed) + 101).index.to_list()
+                    if len(test_gaze_idx) > 0:
+                        test_gaze_idx = X_test.loc[test_gaze_idx].sample(frac=1.0, random_state=int(seed) + 202).index.to_list()
+
+                    def _swap_from_source(
+                        X_src: pd.DataFrame,
+                        src_gaze_idx: list,
+                        n_take: int,
+                        X_train_local: pd.DataFrame,
+                        rng_seed: int,
+                    ) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+                        if n_take <= 0 or len(src_gaze_idx) == 0:
+                            return X_train_local, X_src, 0
+
+                        take_idx = src_gaze_idx[:n_take]
+                        take_rows = X_src.loc[take_idx]
+                        X_src = X_src.drop(index=take_idx)
+
+                        tr_mask = _boolish_series_to_bool_mask(X_train_local["has_eyetracker"])
+                        train_no_gaze_idx = X_train_local.index[~tr_mask].to_list()
+
+                        if len(train_no_gaze_idx) >= n_take:
+                            swap_idx = (
+                                X_train_local.loc[train_no_gaze_idx]
+                                .sample(n=n_take, random_state=int(rng_seed))
+                                .index.to_list()
+                            )
+                            swap_rows = X_train_local.loc[swap_idx]
+                            X_train_local = X_train_local.drop(index=swap_idx)
+                            X_src = pd.concat([X_src, swap_rows], axis=0)
+
+                        X_train_local = pd.concat([X_train_local, take_rows], axis=0)
+                        return X_train_local, X_src, len(take_idx)
+
+                    # Pull from val first, then test
+                    take_val = min(need, len(val_gaze_idx))
+                    X_train, X_val, got_val = _swap_from_source(X_val, val_gaze_idx, take_val, X_train, int(seed) + 303)
+                    need -= got_val
+
+                    if need > 0:
+                        take_test = min(need, len(test_gaze_idx))
+                        X_train, X_test, got_test = _swap_from_source(X_test, test_gaze_idx, take_test, X_train, int(seed) + 404)
+                        need -= got_test
+
+    # ----------------------------
+    # 3) Save splits
+    # ----------------------------
     if save_splits:
         X_train.to_pickle(train_path)
         X_val.to_pickle(val_path)
         X_test.to_pickle(test_path)
 
     return X_train, X_val, X_test
+
 
 def _print_filtered_dataset_summary(args, df: pd.DataFrame) -> None:
     print("\n=== Effective Dataset (after all filters, before split) ===")
@@ -886,104 +990,3 @@ def scale_lr_and_eta_min_by_unfrozen_blocks(
 
     return new_lr, new_eta
 
-# -----------------------------
-# Optional: head-only initialization from checkpoint
-# -----------------------------
-from typing import Dict, Tuple
-
-def _unwrap_checkpoint_state(state: dict) -> dict:
-    # Common checkpoint formats:
-    #  - raw state_dict
-    #  - {"state_dict": ...}
-    #  - {"model": ...}
-    if not isinstance(state, dict):
-        raise TypeError("Checkpoint must be a dict loaded by torch.load().")
-
-    if "state_dict" in state and isinstance(state["state_dict"], dict):
-        return state["state_dict"]
-    if "model" in state and isinstance(state["model"], dict):
-        return state["model"]
-
-    # Heuristic: if values look like tensors, treat as raw state_dict
-    tensorish = 0
-    for v in state.values():
-        if hasattr(v, "shape") and hasattr(v, "dtype"):
-            tensorish += 1
-            if tensorish >= 3:
-                return state
-
-    return state
-
-
-def _normalize_state_keys_for_model(model: torch.nn.Module, sd: dict) -> dict:
-    is_dp = isinstance(model, torch.nn.DataParallel)
-
-    has_module_prefix = any(k.startswith("module.") for k in sd.keys())
-    if (not is_dp) and has_module_prefix:
-        sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
-    if is_dp and (not has_module_prefix):
-        sd = {f"module.{k}": v for k, v in sd.items()}
-    return sd
-
-
-def _load_head_from_checkpoint(
-    model: torch.nn.Module,
-    ckpt_path: str,
-    *,
-    verbose: bool = True,
-) -> Tuple[int, int, Dict[str, str]]:
-    """
-    Loads only the Transformer "head" parameters (ranking + cross heads + norms),
-    filtering by both name and shape.
-
-    Returns:
-        (loaded_count, skipped_count, skip_reasons)
-    """
-    if (ckpt_path is None) or (str(ckpt_path).strip() == ""):
-        return 0, 0, {}
-
-    raw = torch.load(str(ckpt_path), map_location="cpu")
-    sd = _unwrap_checkpoint_state(raw)
-    sd = _normalize_state_keys_for_model(model, sd)
-
-    model_sd = model.state_dict()
-
-    head_prefixes = (
-        "rank_fc_",
-        "cross_fc_",
-        "feat_norm",
-        "pair_norm",
-    )
-
-    to_load = {}
-    skipped = {}
-    for k, v in sd.items():
-        if not k.startswith(head_prefixes):
-            continue
-        if k not in model_sd:
-            skipped[k] = "missing_in_target"
-            continue
-        if tuple(v.shape) != tuple(model_sd[k].shape):
-            skipped[k] = f"shape_mismatch src={tuple(v.shape)} dst={tuple(model_sd[k].shape)}"
-            continue
-        to_load[k] = v
-
-    missing_keys, unexpected_keys = model.load_state_dict(to_load, strict=False)
-
-    if verbose:
-        print("\n[init_head] checkpoint:", ckpt_path)
-        print(f"[init_head] matched head tensors: {len(to_load)}")
-        print(f"[init_head] skipped head tensors: {len(skipped)}")
-        if len(skipped) > 0:
-            show = list(skipped.items())[:20]
-            print("[init_head] first skips:")
-            for kk, reason in show:
-                print("  -", kk, "=>", reason)
-        if len(unexpected_keys) > 0:
-            print("[init_head] unexpected_keys from partial load:", unexpected_keys[:20])
-        if len(missing_keys) > 0:
-            # missing_keys is expected because strict=False and only partial dict is loaded
-            pass
-        print()
-
-    return len(to_load), len(skipped), skipped
