@@ -215,7 +215,7 @@ parameters:
      #- align+gaze
 
   attention_mode:
-    values: ["last"]
+    values: ["raw"]
     
   gaze_map_size:
     value: auto

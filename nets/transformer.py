@@ -56,7 +56,7 @@ class TransformerConfig:
     attention: AttentionConfig = AttentionConfig(
         enabled=False,
         return_attn=True,
-        mode="last",
+        mode="raw",
         topk=None,
         out_hw=(14, 14),
     )
@@ -99,7 +99,7 @@ class Transformer(nn.Module):
         cross_dropout: float = 0.3,
         use_attn_hook: bool = False,
         return_attn: bool = True,
-        attention_mode: str = "last",
+        attention_mode: str = "raw",
         attn_topk: Optional[int] = None,
         force_num_prefix_tokens: Optional[int] = None,
         apply_token_norm: bool = False,
@@ -170,8 +170,8 @@ class Transformer(nn.Module):
         if self.cfg.pooling not in allowed_poolings:
             raise ValueError(f"Unknown pooling='{self.cfg.pooling}'. Expected one of: {sorted(allowed_poolings)}.")
 
-        if self.cfg.attention.mode not in ("last", "rollout", "topk"):
-            raise ValueError(f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: last/rollout/topk.")
+        if self.cfg.attention.mode not in ("raw", "rollout", "topk"):
+            raise ValueError(f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: raw/rollout/topk.")
 
         # ----------------------------------------------------------------------------------
         # Step 3) Runtime flags (controlled externally)

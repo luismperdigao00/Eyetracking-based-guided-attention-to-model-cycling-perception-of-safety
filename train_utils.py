@@ -875,8 +875,8 @@ def print_run_plan(
         print(f"  kl_in_loss   : {bool(getattr(gaze_cfg, 'use_kl_in_loss', False))}")
 
     if bool(getattr(gaze_cfg, 'need_attn_maps', False)):
-        print(f"  attn_mode    : {getattr(args, 'attention_mode', 'last')}")
-        if getattr(args, 'attention_mode', 'last') == 'topk':
+        print(f"  attn_mode    : {getattr(args, 'attention_mode', 'raw')}")
+        if getattr(args, 'attention_mode', 'raw') == 'topk':
             print(f"  attn_topk    : {getattr(args, 'attn_topk', 'all')}")
 
     print(f"  augment      : {args.augment}")

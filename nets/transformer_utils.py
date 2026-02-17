@@ -5,6 +5,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
 
 import torch
 import torch.nn as nn
@@ -166,7 +167,7 @@ def infer_patch_grid(backbone: nn.Module, num_patches: Optional[int] = None) -> 
 class AttentionConfig:
     """
     mode:
-      - "last":    last block CLS->patch attention (head-averaged)
+      - "raw":    last block CLS->patch attention (head-averaged)
       - "rollout": rollout across blocks (identity-augmented, row-normalized)
       - "topk":    "last" attention sparsified to top-k patches
 
@@ -175,7 +176,7 @@ class AttentionConfig:
     """
     enabled: bool = False
     return_attn: bool = True
-    mode: str = "last"                  # {"last","rollout","topk"}
+    mode: str = "raw"                  # {"last","rollout","topk"}
     topk: Optional[int] = None
     out_hw: Tuple[int, int] = (14, 14)
 
@@ -443,7 +444,7 @@ class AttentionRecorder:
         patch_scores = attn[:, 0, int(num_prefix_tokens):]  # (B,P)
         patch_scores = patch_scores / patch_scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-        mode = "topk" if (self.cfg.mode == "topk") else "last"
+        mode = "topk" if (self.cfg.mode == "topk") else "raw"
         return self._patch_vector_to_map(
             patch_scores,
             out_hw=out_hw,

@@ -178,12 +178,12 @@ def arg_parse():
         ),
     )
 
-    parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
+    parser.add_argument("--attention_mode", type=str, default="raw", choices=["raw", "rollout", "topk"],
     help=(
         "How to extract transformer attention maps:\n"
-        "  last    : use CLS→patch attention from the last transformer block\n"
+        "  raw    : use CLS→patch attention from the a certain transformer block\n"
         "  rollout : rollout attention across all blocks (identity-augmented)\n"
-        "  topk    : last-block CLS→patch attention, sparsified to top-k tokens"
+        "  topk    : raw-block CLS→patch attention, sparsified to top-k tokens"
         ),
     )
     parser.add_argument("--attn_topk", type=int,default=None,
