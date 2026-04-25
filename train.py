@@ -409,7 +409,7 @@ def run_training_with_args(args, trial=None):
         test_pct=0.2,
         load_if_exists=False,   # loads if files exist, otherwise splits
         save_splits=True,
-        #train_gaze_frac=args.train_gaze_frac,
+        train_gaze_frac=args.train_gaze_frac,
     )
 
 
