@@ -175,12 +175,20 @@ class AttentionConfig:
       -1 selects the last captured attention (default).
       >=0 selects the 0-based block index in forward order.
       <=-2 selects relative to the end (e.g., -2 is penultimate).
+
+    capture_mode:
+      - "approx_qk": preserve the original attention-analysis behavior. If the
+        timm attention forward receives args/kwargs, run the original forward
+        and store softmax(qk^T * scale) recomputed from the same input tokens.
+      - "graph": compute attention manually and use the stored attention tensor
+        in the forward graph. This is needed for Grad-CAM w.r.t. attention.
     """
     enabled: bool = False
     return_attn: bool = True
     mode: str = "raw"                  # {"raw","rollout"}
     layer: int = -1
     out_hw: Tuple[int, int] = (14, 14)
+    capture_mode: str = "approx_qk"    # {"approx_qk","graph"}
 
 
 
@@ -317,6 +325,28 @@ class AttentionRecorder:
     
             self._active_call_idx += 1
     
+        def _extract_attn_mask(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Optional[torch.Tensor]:
+            if "attn_mask" in kwargs:
+                return kwargs["attn_mask"]
+            if "attn_bias" in kwargs:
+                return kwargs["attn_bias"]
+            if len(args) >= 1 and torch.is_tensor(args[0]):
+                return args[0]
+            return None
+
+        def _apply_optional_qk_norm(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            _mod=mod,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            q_norm = getattr(_mod, "q_norm", None)
+            k_norm = getattr(_mod, "k_norm", None)
+            if q_norm is not None:
+                q = q_norm(q)
+            if k_norm is not None:
+                k = k_norm(k)
+            return q, k
+
         def _compute_attn_pre_from_x(x_in: torch.Tensor, _mod=mod) -> Optional[torch.Tensor]:
             if x_in.ndim != 3:
                 return None
@@ -334,6 +364,42 @@ class AttentionRecorder:
             scale = getattr(_mod, "scale", head_dim ** -0.5)
             attn_logits = (q @ k.transpose(-2, -1)) * scale
             return attn_logits.softmax(dim=-1)
+
+        def _manual_attention_forward(
+            x_in: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None,
+            _mod=mod,
+        ) -> Optional[torch.Tensor]:
+            if x_in.ndim != 3:
+                return None
+
+            b, n, c = x_in.shape
+            num_heads = int(getattr(_mod, "num_heads", 0))
+            if num_heads <= 0 or (c % num_heads) != 0:
+                return None
+
+            head_dim = int(getattr(_mod, "head_dim", c // num_heads))
+            attn_dim = int(getattr(_mod, "attn_dim", num_heads * head_dim))
+            qkv = _mod.qkv(x_in)
+            qkv = qkv.reshape(b, n, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            q, k = _apply_optional_qk_norm(q, k, _mod=_mod)
+
+            scale = getattr(_mod, "scale", head_dim ** -0.5)
+            attn_logits = (q * scale) @ k.transpose(-2, -1)
+            if attn_mask is not None:
+                attn_logits = attn_logits + attn_mask
+            attn_pre = attn_logits.softmax(dim=-1)
+
+            attn_fwd = _mod.attn_drop(attn_pre) if hasattr(_mod, "attn_drop") else attn_pre
+            _store_attn(attn_pre)
+
+            out = (attn_fwd @ v).transpose(1, 2).reshape(b, n, attn_dim)
+            if hasattr(_mod, "norm"):
+                out = _mod.norm(out)
+            out = _mod.proj(out) if hasattr(_mod, "proj") else out
+            out = _mod.proj_drop(out) if hasattr(_mod, "proj_drop") else out
+            return out
     
         def wrapped_forward(
             x: torch.Tensor,
@@ -347,6 +413,13 @@ class AttentionRecorder:
                 return _orig(x, *args, **kwargs)
     
             if args or kwargs:
+                capture_mode = str(getattr(self.cfg, "capture_mode", "approx_qk")).lower().strip()
+                if capture_mode == "graph":
+                    attn_mask = _extract_attn_mask(args, kwargs)
+                    out = _manual_attention_forward(x, attn_mask=attn_mask, _mod=_mod)
+                    if out is not None:
+                        return out
+
                 out = _orig(x, *args, **kwargs)
     
                 self._fallback_calls += 1

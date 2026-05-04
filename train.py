@@ -338,7 +338,7 @@ def arg_parse():
     parser.add_argument(
         "--train_gaze_frac",
         type=float,
-        default="0.7",
+        default=0.7,
         help="Fraction of all has_eyetracker=True rows forced into the TRAIN split (range: 0.70..1.0). "
              "1.0 means ALL gaze rows go to train. Applied after the initial random split via swaps.",
     )
@@ -409,7 +409,7 @@ def run_training_with_args(args, trial=None):
         test_pct=0.2,
         load_if_exists=False,   # loads if files exist, otherwise splits
         save_splits=True,
-        train_gaze_frac=args.train_gaze_frac,
+        #train_gaze_frac=args.train_gaze_frac,
     )
 
 

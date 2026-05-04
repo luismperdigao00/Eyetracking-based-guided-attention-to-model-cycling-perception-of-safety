@@ -29,11 +29,10 @@ from torch import nn
 
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
-from ignite.metrics import Metric, RunningAverage, Average, Accuracy
-from collections.abc import Mapping
+from ignite.metrics import Metric, RunningAverage, Accuracy
 
 
-from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
+from utils.accuracy import RankAccuracy, RankAccuracy_withMargin, ClassificationAUC, RankAUC
 from utils.losses import compute_loss
 from utils.log import log
 
@@ -81,76 +80,6 @@ class EarlyStopper:
         return should_stop, improved
 
 
-class WeightedAverage(Metric):
-    """Compute a weighted average over engine outputs."""
-
-    def __init__(self, value_fn, weight_fn, device=None, strict: bool = True, debug_first_n: int = 0):
-        super().__init__(output_transform=lambda x: x, device=device)
-        self.value_fn = value_fn
-        self.weight_fn = weight_fn
-        self.strict = bool(strict)
-        self._dbg_left = int(max(0, debug_first_n))
-
-    def reset(self) -> None:
-        self._sum = torch.tensor(0.0, device=self._device)
-        self._weight = torch.tensor(0.0, device=self._device)
-
-    @staticmethod
-    def _extract_mapping(obj):
-        if isinstance(obj, Mapping):
-            return obj
-        if isinstance(obj, (tuple, list)):
-            for v in obj:
-                m = WeightedAverage._extract_mapping(v)
-                if m is not None:
-                    return m
-        return None
-
-    @staticmethod
-    def _to_scalar(x, device):
-        t = torch.as_tensor(x, device=device, dtype=torch.float32).reshape(-1)
-        if t.numel() != 1:
-            raise TypeError(f"Expected scalar, got shape {tuple(t.shape)}")
-        return t[0]
-
-    def iteration_completed(self, engine) -> None:
-        output = engine.state.output
-
-        if self._dbg_left > 0:
-            self._dbg_left -= 1
-            print("[DEBUG WeightedAverage] engine.state.output type:", type(output).__name__)
-            if isinstance(output, Mapping):
-                print("[DEBUG WeightedAverage] keys:", list(output.keys())[:30])
-            elif isinstance(output, (tuple, list)):
-                print("[DEBUG WeightedAverage] tuple/list len:", len(output))
-                print("[DEBUG WeightedAverage] elem types:", [type(x).__name__ for x in output[:10]])
-
-        self.update(output)
-
-    def update(self, output) -> None:
-        out = self._extract_mapping(output)
-
-        if out is None:
-            if self.strict:
-                raise TypeError(
-                    f"WeightedAverage expected engine output containing a Mapping, got {type(output).__name__}."
-                )
-            return
-
-        value = self._to_scalar(self.value_fn(out), self._device)
-        weight = self._to_scalar(self.weight_fn(out), self._device)
-
-        if weight.item() <= 0.0:
-            return
-
-        self._sum += value * weight
-        self._weight += weight
-
-    def compute(self):
-        if self._weight.item() <= 0.0:
-            return 0.0
-        return (self._sum / self._weight).item()
-        
 class SumMetric(Metric):
     """Accumulate a sum over engine outputs."""
 
@@ -165,6 +94,7 @@ class SumMetric(Metric):
 
     def compute(self):
         return float(self._sum.item())
+
 
 class BackboneFreezeController:
     """
@@ -881,6 +811,10 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                     output_transform=lambda x: (x["rank_left"], x["rank_right"], x["label"]),
                     device=device,
                 ).attach(engine, "acc")
+            RankAUC(
+                output_transform=lambda x: (x["rank_left"], x["rank_right"], x["label"]),
+                device=device,
+            ).attach(engine, "auc")
 
         # ---------------------------------------------------------------------
         # SSCNN: classification-only training/evaluation (no ranking metric).
@@ -891,6 +825,7 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             # Standard multiclass accuracy using predicted logits vs ground-truth label.
             # Assumes logits shape [B, num_classes] and label shape [B].
             Accuracy(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "acc")
+            ClassificationAUC(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "auc")
 
         # ---------------------------------------------------------------------
         # RSSCNN: ranking + classification + gaze
@@ -899,23 +834,13 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             # 1) Loss (rolling average)
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
 
-            # 2) Gaze/KL diagnostics (always attach; KL is always computed in compute_loss)
-            #    In guide/off modes, loss_kl_weighted stays 0 because w_kl_eff=0.
-            WeightedAverage(
-                value_fn=lambda x: x.get("loss_kl", 0.0),
-                weight_fn=lambda x: x.get("gaze_count", 0),
-                device=device,
-                strict=True,
-                debug_first_n=0,
-            ).attach(engine, "loss_kl")
-            
-            WeightedAverage(
-                value_fn=lambda x: x.get("loss_kl_weighted", 0.0),
-                weight_fn=lambda x: x.get("gaze_count", 0),
-                device=device,
-                strict=True,
-                debug_first_n=0,
-            ).attach(engine, "loss_kl_weighted")
+            # 2) Gaze/KL diagnostics from the per-batch values computed in compute_loss.
+            #    RunningAverage keeps this report aligned with the main loss metric.
+            RunningAverage(output_transform=lambda x: x.get("loss_kl", 0.0), device=device).attach(engine, "loss_kl")
+            RunningAverage(output_transform=lambda x: x.get("loss_kl_weighted", 0.0), device=device).attach(
+                engine,
+                "loss_kl_weighted",
+            )
 
             #RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
 
@@ -937,9 +862,14 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                     output_transform=lambda x: (x["rank_left"], x["rank_right"], x["label_r"]),
                     device=device,
                 ).attach(engine, "acc")
+            RankAUC(
+                output_transform=lambda x: (x["rank_left"], x["rank_right"], x["label_r"]),
+                device=device,
+            ).attach(engine, "rank_auc")
 
             # 4) Classification accuracy
             Accuracy(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_acc")
+            ClassificationAUC(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_auc")
 
         # ---------------------------------------------------------------------
         # Defensive programming: reject unknown model identifiers early.
@@ -1205,6 +1135,15 @@ def _make_validation_handler(
             "max_accuracy_test": training_state["test_acc_at_best_val"],
             "epoch_best_val": training_state["epoch_best_val"],
         }
+
+        if args.model in ["rcnn", "sscnn"]:
+            metrics.update(
+                {
+                    "auc_train": engine.state.metrics.get("auc"),
+                    "auc_validation": evaluator.state.metrics.get("auc"),
+                    "auc_test": evaluator_test.state.metrics.get("auc"),
+                }
+            )
         
         if args.model == "rsscnn":
             metrics.update(
@@ -1213,13 +1152,21 @@ def _make_validation_handler(
                     "loss_kl_validation": evaluator.state.metrics.get("loss_kl") or 0.0,
                     "loss_kl_test": evaluator_test.state.metrics.get("loss_kl") or 0.0,
                     
-                    #"gaze_count_train": engine.state.metrics.get("gaze_count") or 0.0,
-                    #"gaze_count_validation": evaluator.state.metrics.get("gaze_count") or 0.0,
-                    #"gaze_count_test": evaluator_test.state.metrics.get("gaze_count") or 0.0,
+                    "gaze_count_train": engine.state.metrics.get("gaze_count") or 0.0,
+                    "gaze_count_validation": evaluator.state.metrics.get("gaze_count") or 0.0,
+                    "gaze_count_test": evaluator_test.state.metrics.get("gaze_count") or 0.0,
         
                     "c_accuracy_train": engine.state.metrics.get("c_acc"),
                     "c_accuracy_validation": evaluator.state.metrics.get("c_acc"),
                     "c_accuracy_test": evaluator_test.state.metrics.get("c_acc"),
+
+                    "rank_auc_train": engine.state.metrics.get("rank_auc"),
+                    "rank_auc_validation": evaluator.state.metrics.get("rank_auc"),
+                    "rank_auc_test": evaluator_test.state.metrics.get("rank_auc"),
+
+                    "c_auc_train": engine.state.metrics.get("c_auc"),
+                    "c_auc_validation": evaluator.state.metrics.get("c_auc"),
+                    "c_auc_test": evaluator_test.state.metrics.get("c_auc"),
                 }
             )
         
@@ -1236,8 +1183,14 @@ def _make_validation_handler(
                 "accuracy_validation": float(evaluator.state.metrics.get("acc", 0.0)),
                 "loss_validation": float(evaluator.state.metrics.get("loss", 0.0)),
             }
+            if args.model == "sscnn":
+                available["auc_validation"] = float(evaluator.state.metrics.get("auc", 0.0))
+            if args.model == "rcnn":
+                available["auc_validation"] = float(evaluator.state.metrics.get("auc", 0.0))
             if args.model == "rsscnn":
                 available["c_accuracy_validation"] = float(evaluator.state.metrics.get("c_acc", 0.0))
+                available["rank_auc_validation"] = float(evaluator.state.metrics.get("rank_auc", 0.0))
+                available["c_auc_validation"] = float(evaluator.state.metrics.get("c_auc", 0.0))
 
             if monitor_name not in available:
                 monitor_name = "accuracy_validation"

@@ -183,6 +183,12 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     if getattr(args, "max_epochs", 1) < 1:
         _err(errors, f"--max_epochs must be >= 1 (got {getattr(args, 'max_epochs', None)})")
 
+    if hasattr(args, "train_gaze_frac"):
+        train_gaze_frac = float(getattr(args, "train_gaze_frac"))
+        args.train_gaze_frac = train_gaze_frac
+        if train_gaze_frac < 0.0 or train_gaze_frac > 1.0:
+            _err(errors, f"--train_gaze_frac must be in [0,1] (got {train_gaze_frac}).")
+
     # ------------------------------------------------------------------
     # Ties margin default 
     # ------------------------------------------------------------------
@@ -1043,4 +1049,3 @@ def print_run_plan(
             print(f"  warmup     : {warmup_steps} steps ({args.warmup_frac:g})")
 
     print("=" * 100 + "\n")
-
