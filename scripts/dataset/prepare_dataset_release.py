@@ -242,16 +242,24 @@ def main() -> None:
         print(f"[WARN] Parquet export skipped: {exc}")
     shutil.copy2(args.comparisons, output_dir / "comparisons" / "comparisons_df.pickle")
 
-    for support_file in ("data_dictionary.csv", "CITATION.cff", "DATASET_CARD.md", "DATA_LICENSE.txt"):
-        src = Path(support_file)
+    support_files = {
+        Path("docs/dataset/data_dictionary.csv"): "data_dictionary.csv",
+        Path("CITATION.cff"): "CITATION.cff",
+        Path("docs/dataset/dataset_card.md"): "DATASET_CARD.md",
+        Path("docs/dataset/DATA_LICENSE.txt"): "DATA_LICENSE.txt",
+    }
+    for src, release_name in support_files.items():
         if src.exists():
-            shutil.copy2(src, output_dir / support_file)
+            shutil.copy2(src, output_dir / release_name)
     scripts_out = output_dir / "scripts"
     scripts_out.mkdir(exist_ok=True)
-    for script_name in ("load_dataset.py", "validate_dataset_release.py"):
-        src = Path("scripts") / script_name
+    release_scripts = {
+        Path("scripts/dataset/load_dataset.py"): "load_dataset.py",
+        Path("scripts/dataset/validate_release.py"): "validate_dataset_release.py",
+    }
+    for src, release_name in release_scripts.items():
         if src.exists():
-            shutil.copy2(src, scripts_out / script_name)
+            shutil.copy2(src, scripts_out / release_name)
     write_release_readme(output_dir)
     if args.include_splits:
         export_splits(args.splits_dir, output_dir, args.gaze_subdir, args.gaze_root)

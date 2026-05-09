@@ -36,6 +36,7 @@ images/
 Eyetracker_attention_maps/
 **/Eyetracker_attention_maps/
 EG-PCS-Dataset-v*/
+.dataset_releases/
 *.npy
 *.npz
 *.pkl

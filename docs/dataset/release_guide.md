@@ -161,11 +161,11 @@ states which license applies to each component.
 Use the release preparation script:
 
 ```bash
-python scripts/prepare_dataset_release.py \
+python scripts/dataset/prepare_dataset_release.py \
   --comparisons comparisons_df.pickle \
   --images-root images/printart/subjectivesafety_images \
   --gaze-root survey_eye_tracker/Eyetracker_attention_maps/864x508 \
-  --output-dir EG-PCS-Dataset-v1.0.0 \
+  --output-dir .dataset_releases/EG-PCS-Dataset-v1.0.0 \
   --copy-assets \
   --hardlink-assets \
   --write-checksums
@@ -174,7 +174,7 @@ python scripts/prepare_dataset_release.py \
 Then validate it:
 
 ```bash
-python scripts/validate_dataset_release.py EG-PCS-Dataset-v1.0.0
+python scripts/dataset/validate_release.py .dataset_releases/EG-PCS-Dataset-v1.0.0
 ```
 
 After validation, compress the folder and upload it to the chosen data
@@ -185,9 +185,9 @@ For a Zenodo API upload, first create a Zenodo access token with deposit
 permissions and export it as `ZENODO_TOKEN`. Then run:
 
 ```bash
-python scripts/upload_dataset_to_zenodo.py \
-  EG-PCS-Dataset-v1.0.0.tar.gz \
-  --metadata zenodo_metadata.json
+python scripts/dataset/upload_to_zenodo.py \
+  .dataset_releases/EG-PCS-Dataset-v1.0.0.tar.gz \
+  --metadata docs/dataset/zenodo_metadata.json
 ```
 
 The script creates a draft upload and stops before publishing. Review the draft

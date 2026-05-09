@@ -73,8 +73,8 @@ def publish(api_url: str, token: str, deposition_id: int) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("archive", type=Path, help="Dataset archive to upload, e.g. EG-PCS-Dataset-v1.0.0.tar.gz")
-    parser.add_argument("--metadata", type=Path, default=Path("zenodo_metadata.json"))
+    parser.add_argument("archive", type=Path, help="Dataset archive to upload, e.g. .dataset_releases/EG-PCS-Dataset-v1.0.0.tar.gz")
+    parser.add_argument("--metadata", type=Path, default=Path("docs/dataset/zenodo_metadata.json"))
     parser.add_argument("--sandbox", action="store_true", help="Use sandbox.zenodo.org for a test upload.")
     parser.add_argument("--publish", action="store_true", help="Publish immediately after upload. Use carefully.")
     parser.add_argument("--token-env", default="ZENODO_TOKEN", help="Environment variable containing the Zenodo token.")
@@ -118,4 +118,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
