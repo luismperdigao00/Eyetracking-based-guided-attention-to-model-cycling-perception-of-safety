@@ -262,124 +262,6 @@ class ComparisonsDataset(Dataset):
         return sample
 
 
-class ResizeCenterCropAlignGaze:
-    """
-    Deterministic preprocessing:
-      - Resize images by short side (aspect ratio preserved)
-      - Center crop images to a fixed square
-      - If enable_gaze=True:
-          - if has_eyetracker=True: resize + crop gaze to match image geometry
-            - gaze_output="align": downsample to gaze_grid_size
-            - gaze_output="guide": keep at target_crop x target_crop
-          - else: create a fixed-shape dummy gaze tensor for collation safety
-      - If enable_gaze=False: do not create, modify, or delete any gaze keys
-    """
-
-    def __init__(
-        self,
-        resize_dim: int,
-        target_crop: int,
-        img_interp,
-        gaze_grid_size,
-        enable_gaze: bool = True,
-        gaze_output: str = "align",  # "align" or "guide"
-    ):
-        self.resize_dim = int(resize_dim)
-        self.target_crop = int(target_crop)
-        self.img_interp = img_interp
-        self.gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
-        self.enable_gaze = bool(enable_gaze)
-
-        gaze_output = str(gaze_output).strip().lower()
-        if gaze_output not in ("align", "guide"):
-            raise ValueError(f"gaze_output must be 'align' or 'guide', got: {gaze_output}")
-        self.gaze_output = gaze_output
-
-    @staticmethod
-    def _as_bool(x) -> bool:
-        if torch.is_tensor(x):
-            return bool(x.item())
-        return bool(x)
-
-    @staticmethod
-    def _to_1ch_float(g) -> torch.Tensor:
-        # Accept [H,W], [1,H,W], [C,H,W]; return contiguous [1,H,W] float32
-        if not torch.is_tensor(g):
-            g = torch.as_tensor(g)
-        g = g.float()
-
-        if g.ndim == 2:
-            g = g.unsqueeze(0)  # [1,H,W]
-        elif g.ndim == 3:
-            if g.shape[0] != 1:
-                g = g.mean(dim=0, keepdim=True)  # [1,H,W]
-        else:
-            raise ValueError(f"Unexpected gaze shape: {tuple(g.shape)}")
-
-        return g.contiguous()
-
-    @staticmethod
-    def _resize_gaze(g_1chw: torch.Tensor, size_hw) -> torch.Tensor:
-        # g_1chw: [1,H,W] -> [1,H2,W2] using bilinear interpolation
-        if g_1chw.ndim != 3 or g_1chw.shape[0] != 1:
-            raise ValueError(f"Expected gaze [1,H,W], got {tuple(g_1chw.shape)}")
-
-        x = g_1chw.unsqueeze(0)  # [1,1,H,W]
-        x = nnF.interpolate(x, size=tuple(size_hw), mode="bilinear", align_corners=False)
-        return x.squeeze(0).contiguous()  # [1,H2,W2]
-
-    def _gaze_out_hw(self) -> Tuple[int, int]:
-        if self.gaze_output == "align":
-            return self.gaze_grid_size
-        return (self.target_crop, self.target_crop)
-
-    def _process_side(self, sample: dict, side: str) -> None:
-        img_key = f"image_{side}"
-        gaze_key = f"gaze_{side}"
-
-        # 1) Resize image by short-side policy
-        img = TF.resize(sample[img_key], self.resize_dim, interpolation=self.img_interp)
-
-        # Ensure center-crop is feasible
-        w, h = img.size  # PIL: (W,H)
-        if min(w, h) < self.target_crop:
-            img = TF.resize(img, self.target_crop, interpolation=self.img_interp)
-            w, h = img.size
-
-        # 2) Center-crop image deterministically
-        img = TF.center_crop(img, [self.target_crop, self.target_crop])
-        sample[img_key] = img
-
-        # 3) If gaze is disabled, leave gaze keys untouched
-        if not self.enable_gaze:
-            return
-        
-        out_hw = self._gaze_out_hw()
-
-        has_real_gaze = self._as_bool(sample.get("has_eyetracker", False))
-        if not has_real_gaze:
-            sample[gaze_key] = torch.zeros((1, out_hw[0], out_hw[1]), dtype=torch.float32)
-            return
-
-        # 4) Align gaze to resized image geometry, then crop; optional final resize depends on mode
-        g = self._to_1ch_float(sample[gaze_key])
-        g = self._resize_gaze(g, size_hw=(h, w))  # match resized image H,W
-        g = TF.center_crop(g, [self.target_crop, self.target_crop])
-
-
-        if self.gaze_output == "align":
-            g = self._resize_gaze(g, size_hw=out_hw)  # supervision grid
-    
-        sample[gaze_key] = g
-        
-    
-    def __call__(self, sample: dict) -> dict:
-        self._process_side(sample, "l")
-        self._process_side(sample, "r")
-        return sample
-
-
-
 def _get_interp_mode(mode_str):
     if mode_str is None:
         raise ValueError("Interpolation mode is None; backbone config may be incomplete.")
@@ -397,77 +279,179 @@ def _get_interp_mode(mode_str):
 
     return mapping[mode_str]
 
-def build_eval_transforms(
-    specs: dict,
-    gaze_grid_size=(14, 14),
-    enable_gaze: bool = True,
-    gaze_output: str = "align",  # "align" or "guide"
-):
 
-    """
-    Build deterministic validation/test preprocessing.
+def _resolve_preprocessing_specs(specs: dict) -> dict:
+    input_size = specs.get("input_size")
+    if not isinstance(input_size, (tuple, list)) or len(input_size) != 3:
+        raise ValueError(f"specs['input_size'] must be a (C,H,W) tuple, got {input_size!r}")
 
-    Steps:
-      - Resize by short side (preserve aspect ratio), then center-crop to the model input size
-      - If enabled and eyetracker data is present, apply the same geometric ops to gaze and downsample it
-      - Convert left/right images to tensors and normalize with backbone stats
-    """
-    target_crop = int(specs["input_size"][-1])
+    _, input_h, input_w = input_size
+    input_h, input_w = int(input_h), int(input_w)
+    if input_h <= 0 or input_w <= 0:
+        raise ValueError(f"Input spatial size must be positive, got {(input_h, input_w)}")
+    if input_h != input_w:
+        raise ValueError(
+            "PairwisePreprocessing currently produces square crops only; "
+            f"got non-square input_size={(input_h, input_w)}."
+        )
+
+    target_crop = input_h
     crop_pct = float(specs["crop_pct"])
-
-    # timm-style eval resize: input_size / crop_pct, clamped to >= input_size
+    if not (0.0 < crop_pct <= 1.0):
+        raise ValueError(f"specs['crop_pct'] must be in (0, 1], got {crop_pct}")
     resize_dim = max(target_crop, int(round(target_crop / crop_pct)))
 
-    img_interp = _get_interp_mode(specs["interpolation"])
-    mean = tuple(specs["mean"])
-    std = tuple(specs["std"])
-
-    def _to_tensor_and_normalize_pair(sample: dict) -> dict:
-        # Apply the same deterministic post-processing to both image views
-        for k in ("image_l", "image_r"):
-            if k in sample:
-                x = TF.to_tensor(sample[k])
-                sample[k] = TF.normalize(x, mean=mean, std=std)
-        return sample
-
-    eval_tfms = transforms.Compose(
-        [
-            ResizeCenterCropAlignGaze(
-                resize_dim=resize_dim,
-                target_crop=target_crop,
-                img_interp=img_interp,
-                gaze_grid_size=gaze_grid_size,
-                enable_gaze=bool(enable_gaze),
-                gaze_output=str(gaze_output),
-            ),
-            transforms.Lambda(_to_tensor_and_normalize_pair),
-        ]
-    )
-
-    gaze_output_norm = str(gaze_output).lower().strip()
-    
-    gaze_policy = "if enable_gaze: Resize(match,gaze)->CenterCrop(gaze)"
-    if gaze_output_norm == "align":
-        gaze_policy += "->ResizeDown(gaze)"
-    
-    meta = {
+    return {
         "target_crop": target_crop,
         "resize_dim": resize_dim,
         "crop_pct": crop_pct,
         "interpolation": str(specs.get("interpolation", "bilinear")),
-        "mean": mean,
-        "std": std,
-        "gaze_grid_size": tuple(gaze_grid_size),
+        "mean": tuple(specs["mean"]),
+        "std": tuple(specs["std"]),
+    }
+
+
+def build_preprocessing_transforms(
+    specs: dict,
+    phase: str = "eval",
+    augment: str = "none",
+    ties: bool = True,
+    gaze_grid_size=(14, 14),
+    enable_gaze: bool = True,
+    gaze_output: str = "align",  # "align" or "guide"
+):
+    """
+    Build the single pairwise preprocessing pipeline used by train/val/test.
+
+    phase="eval" is deterministic resize + center crop.
+    phase="train" adds the selected AUG_PRESETS policy when augment is "light" or "heavy".
+    """
+    resolved = _resolve_preprocessing_specs(specs)
+    if not isinstance(gaze_grid_size, (tuple, list)) or len(gaze_grid_size) != 2:
+        raise ValueError(f"gaze_grid_size must be a (H,W) tuple, got {gaze_grid_size!r}")
+    gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
+    if gaze_grid_size[0] <= 0 or gaze_grid_size[1] <= 0:
+        raise ValueError(f"gaze_grid_size values must be positive, got {gaze_grid_size}")
+
+    phase = str(phase).lower().strip()
+    if phase not in ("train", "eval"):
+        raise ValueError(f"phase must be 'train' or 'eval', got: {phase}")
+
+    augment_level = str(augment).lower().strip()
+    if augment_level not in ("none", "light", "heavy"):
+        augment_level = "none"
+    use_augmentation = bool(phase == "train" and augment_level != "none")
+    preset = AUG_PRESETS[augment_level] if use_augmentation else {}
+
+    tfms = PairwisePreprocessing(
+        phase=phase,
+        augment_level=augment_level,
+        augment=use_augmentation,
+        ties=bool(ties),
+        resize_short=int(resolved["resize_dim"]),
+        out_size=int(resolved["target_crop"]),
+        interpolation=_get_interp_mode(resolved["interpolation"]),
+        mean=tuple(resolved["mean"]),
+        std=tuple(resolved["std"]),
+        enable_gaze=bool(enable_gaze),
+        gaze_grid_size=gaze_grid_size,
+        gaze_output=str(gaze_output),
+        **preset,
+    )
+
+    gaze_output_norm = str(gaze_output).lower().strip()
+    gaze_policy = "if enable_gaze: Resize(match,gaze)->Crop(gaze)"
+    if gaze_output_norm == "align":
+        gaze_policy += "->ResizeDown(gaze)"
+    
+    meta = {
+        **resolved,
+        "gaze_grid_size": gaze_grid_size,
         "enable_gaze": bool(enable_gaze),
         "gaze_output": str(gaze_output),
-        "eval_policy": (
-            "Resize(short,img) -> CenterCrop(img); "
+        "phase": phase,
+        "augment": augment_level if use_augmentation else "none",
+        "policy": (
+            "Resize(short,img) -> Crop(img); "
             f"{gaze_policy}; "
             "ToTensor/Norm(img)"
         ),
     }
+    if use_augmentation:
+        meta["policy"] = (
+            "Resize(short,img) -> optional Swap/HFlip/Rotate -> RandomResizedCrop(img); "
+            f"{gaze_policy}; "
+            "optional ColorJitter/Gray/Blur/Erase -> ToTensor/Norm(img)"
+        )
+    if phase == "eval":
+        meta["eval_policy"] = meta["policy"]
+    else:
+        meta["train_policy"] = meta["policy"]
 
-    return eval_tfms, meta
+    return tfms, meta
+
+
+def build_eval_transforms(
+    specs: dict,
+    gaze_grid_size=(14, 14),
+    enable_gaze: bool = True,
+    gaze_output: str = "align",
+):
+    """Compatibility wrapper around the unified deterministic eval preprocessing."""
+    return build_preprocessing_transforms(
+        specs,
+        phase="eval",
+        augment="none",
+        ties=True,
+        gaze_grid_size=gaze_grid_size,
+        enable_gaze=enable_gaze,
+        gaze_output=gaze_output,
+    )
+
+
+def build_train_eval_preprocessing(
+    specs: dict,
+    augment: str = "none",
+    ties: bool = True,
+    gaze_grid_size=(14, 14),
+    enable_gaze: bool = True,
+    gaze_output: str = "align",
+):
+    """
+    Build the complete preprocessing bundle for one training run.
+
+    Validation/test are always deterministic eval preprocessing. Training uses the
+    requested augmentation level only when augment is "light" or "heavy".
+    """
+    augment_level = str(augment).lower().strip()
+    if augment_level not in ("none", "light", "heavy"):
+        augment_level = "none"
+
+    common_kwargs = {
+        "specs": specs,
+        "ties": bool(ties),
+        "gaze_grid_size": tuple(gaze_grid_size),
+        "enable_gaze": bool(enable_gaze),
+        "gaze_output": str(gaze_output),
+    }
+
+    eval_tfms, eval_meta = build_preprocessing_transforms(
+        phase="eval",
+        augment="none",
+        **common_kwargs,
+    )
+    train_tfms, train_meta = build_preprocessing_transforms(
+        phase="train",
+        augment=augment_level,
+        **common_kwargs,
+    )
+
+    return {
+        "train": train_tfms,
+        "eval": eval_tfms,
+        "train_meta": train_meta,
+        "eval_meta": eval_meta,
+    }
 
 # =============================================================================================== #
 # Augmentation presets (per-op paired toggles)
@@ -539,12 +523,12 @@ AUG_PRESETS = {
 }
 
 # ==============================================================================
-# Augmentation Class
+# Unified preprocessing class
 # ==============================================================================
 
-class Augmentation:
+class PairwisePreprocessing:
     """
-    Paired image augmentation for pairwise ranking.
+    Unified pairwise preprocessing for training, validation, and test.
     
     Input:
       - sample["image_l"], sample["image_r"]: PIL.Image
@@ -557,12 +541,13 @@ class Augmentation:
       - sample["score_r"]: possibly sign-flipped if the pair is swapped
       - sample["score_c"]: derived classification label
       - When enable_gaze=True:
-          • sample["gaze_l"], sample["gaze_r"]: torch.FloatTensor [1, grid_h, grid_w]
+          • sample["gaze_l"], sample["gaze_r"]: torch.FloatTensor [1, grid_h, grid_w] for align
+            or [1, out_size, out_size] for guide
     
     Policy:
       - Geometry: resize(short side -> resize_short) -> ensure min side >= out_size
-                -> optional paired/unpaired hflip and rotation
-                -> one RandomResizedCrop-style crop per side, resized to (out_size, out_size)
+                -> optional paired/unpaired hflip and rotation during training
+                -> center crop for eval/no augmentation, RandomResizedCrop-style crop for augmentation
       - Pairing flags control whether random decisions are shared across left/right:
           • paired_hflip / paired_rotation: share flip decision / rotation angle
           • paired_scale: share crop scale fraction and aspect ratio (size/shape)
@@ -573,11 +558,14 @@ class Augmentation:
       - Tensor: to_tensor -> optional random erasing (tensor domain) -> normalize
       - Gaze (if enabled and available): geometric ops and crop mirror the corresponding image,
               then downsample to gaze_grid_size; erased regions are zeroed on the gaze grid
+      - self.last_trace records sampled decisions for visualization/debugging notebooks.
     """
 
 
     def __init__(
         self,
+        phase: str = "train",
+        augment_level: str = "none",
         augment: bool = True,
         ties: bool = True,
         resize_short: int = 256,
@@ -634,6 +622,12 @@ class Augmentation:
         if "erase" in kwargs and kwargs["erase"] is not None:
             erase_p = kwargs["erase"]
 
+        phase = str(phase).lower().strip()
+        if phase not in ("train", "eval"):
+            raise ValueError(f"phase must be 'train' or 'eval', got: {phase}")
+
+        self.phase = phase
+        self.augment_level = str(augment_level).lower().strip()
         self.augment = bool(augment)
         self.ties = bool(ties)
 
@@ -644,7 +638,11 @@ class Augmentation:
         self.std = tuple(std)
 
         self.enable_gaze = bool(enable_gaze)
+        if not isinstance(gaze_grid_size, (tuple, list)) or len(gaze_grid_size) != 2:
+            raise ValueError(f"gaze_grid_size must be a (H,W) tuple, got {gaze_grid_size!r}")
         self.gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
+        if self.gaze_grid_size[0] <= 0 or self.gaze_grid_size[1] <= 0:
+            raise ValueError(f"gaze_grid_size values must be positive, got {self.gaze_grid_size}")
 
         gaze_output = str(gaze_output).lower().strip()
         
@@ -684,6 +682,7 @@ class Augmentation:
         self.erase_p = float(erase_p)
         self.erase_scale = tuple(erase_scale)
         self.erase_ratio = tuple(erase_ratio)
+        self.last_trace = {}
 
     # -------------------------
     # Small utilities
@@ -842,10 +841,12 @@ class Augmentation:
 
     def _maybe_swap_pair(self, sample: dict, img_l, img_r, score_r: int):
         if not (self.augment and (random.random() < self.swap_p)):
+            self.last_trace["swap"] = False
             return img_l, img_r, score_r
 
         img_l, img_r = img_r, img_l
         score_r = -score_r
+        self.last_trace["swap"] = True
 
         swap_pairs = [
             ("image_l_name", "image_r_name"),
@@ -962,6 +963,15 @@ class Augmentation:
     # Main entry point
     # -------------------------
     def __call__(self, sample: dict) -> dict:
+        self.last_trace = {
+            "phase": self.phase,
+            "augment_level": self.augment_level if self.augment else "none",
+            "enable_gaze": self.enable_gaze,
+            "gaze_output": self.gaze_output,
+            "resize_short": self.resize_short,
+            "out_size": self.out_size,
+        }
+
         img_l = sample["image_l"]
         img_r = sample["image_r"]
 
@@ -976,6 +986,8 @@ class Augmentation:
         img_r = TF.resize(img_r, self.resize_short, interpolation=self.interpolation)
         img_l = self._ensure_min_side_pil(img_l, self.out_size, self.interpolation)
         img_r = self._ensure_min_side_pil(img_r, self.out_size, self.interpolation)
+        self.last_trace["resized_size_l"] = tuple(img_l.size)
+        self.last_trace["resized_size_r"] = tuple(img_r.size)
 
         if self.enable_gaze and has_eye:
             g_l = self._to_1ch_float(sample.get("gaze_l", None))
@@ -993,6 +1005,7 @@ class Augmentation:
         if self.augment and self.hflip_p > 0.0:
             if self.paired_hflip:
                 do_flip = (random.random() < self.hflip_p)
+                self.last_trace["hflip"] = {"paired": True, "left": bool(do_flip), "right": bool(do_flip)}
                 if do_flip:
                     img_l = TF.hflip(img_l)
                     img_r = TF.hflip(img_r)
@@ -1002,6 +1015,7 @@ class Augmentation:
             else:
                 do_flip_l = (random.random() < self.hflip_p)
                 do_flip_r = (random.random() < self.hflip_p)
+                self.last_trace["hflip"] = {"paired": False, "left": bool(do_flip_l), "right": bool(do_flip_r)}
                 if do_flip_l:
                     img_l = TF.hflip(img_l)
                     if self.enable_gaze and has_eye:
@@ -1010,13 +1024,17 @@ class Augmentation:
                     img_r = TF.hflip(img_r)
                     if self.enable_gaze and has_eye:
                         g_r = self._hflip_gaze(g_r)
+        else:
+            self.last_trace["hflip"] = {"paired": self.paired_hflip, "left": False, "right": False}
 
         # Rotation
         if self.augment and self.rot_deg > 0.0 and self.rot_p > 0.0:
             if self.paired_rotation:
                 do_rot = (random.random() < self.rot_p)
+                self.last_trace["rotation"] = {"paired": True, "left_deg": 0.0, "right_deg": 0.0}
                 if do_rot:
                     ang = random.uniform(-self.rot_deg, self.rot_deg)
+                    self.last_trace["rotation"] = {"paired": True, "left_deg": float(ang), "right_deg": float(ang)}
                     img_l = TF.rotate(img_l, ang, interpolation=self.interpolation, expand=False, fill=0)
                     img_r = TF.rotate(img_r, ang, interpolation=self.interpolation, expand=False, fill=0)
                     if self.enable_gaze and has_eye:
@@ -1025,19 +1043,26 @@ class Augmentation:
             else:
                 do_rot_l = (random.random() < self.rot_p)
                 do_rot_r = (random.random() < self.rot_p)
+                self.last_trace["rotation"] = {"paired": False, "left_deg": 0.0, "right_deg": 0.0}
                 if do_rot_l:
                     ang_l = random.uniform(-self.rot_deg, self.rot_deg)
+                    self.last_trace["rotation"]["left_deg"] = float(ang_l)
                     img_l = TF.rotate(img_l, ang_l, interpolation=self.interpolation, expand=False, fill=0)
                     if self.enable_gaze and has_eye:
                         g_l = self._rotate_gaze(g_l, ang_l)
                 if do_rot_r:
                     ang_r = random.uniform(-self.rot_deg, self.rot_deg)
+                    self.last_trace["rotation"]["right_deg"] = float(ang_r)
                     img_r = TF.rotate(img_r, ang_r, interpolation=self.interpolation, expand=False, fill=0)
                     if self.enable_gaze and has_eye:
                         g_r = self._rotate_gaze(g_r, ang_r)
+        else:
+            self.last_trace["rotation"] = {"paired": self.paired_rotation, "left_deg": 0.0, "right_deg": 0.0}
 
         # Single crop per side (RandomResizedCrop-style), then resize to out_size
         (il, jl, hl, wl), (ir, jr, hr, wr) = self._sample_crop_pair(img_l, img_r)
+        self.last_trace["crop_l"] = {"top": int(il), "left": int(jl), "height": int(hl), "width": int(wl)}
+        self.last_trace["crop_r"] = {"top": int(ir), "left": int(jr), "height": int(hr), "width": int(wr)}
 
         img_l = TF.resized_crop(img_l, il, jl, hl, wl, [self.out_size, self.out_size], interpolation=self.interpolation)
         img_r = TF.resized_crop(img_r, ir, jr, hr, wr, [self.out_size, self.out_size], interpolation=self.interpolation)
@@ -1058,44 +1083,69 @@ class Augmentation:
                 if (b is not None) or (c is not None) or (s is not None) or (h is not None):
                     if self.paired_color_jitter:
                         params = self._sample_color_jitter_params(b, c, s, h)
+                        self.last_trace["color_jitter_l"] = list(params)
+                        self.last_trace["color_jitter_r"] = list(params)
                         img_l = self._apply_color_jitter(img_l, params)
                         img_r = self._apply_color_jitter(img_r, params)
                     else:
                         params_l = self._sample_color_jitter_params(b, c, s, h)
                         params_r = self._sample_color_jitter_params(b, c, s, h)
+                        self.last_trace["color_jitter_l"] = list(params_l)
+                        self.last_trace["color_jitter_r"] = list(params_r)
                         img_l = self._apply_color_jitter(img_l, params_l)
                         img_r = self._apply_color_jitter(img_r, params_r)
+            else:
+                self.last_trace["color_jitter_l"] = []
+                self.last_trace["color_jitter_r"] = []
 
 
             if self.gray_p > 0.0:
                 if self.paired_gray:
                     do_gray = (random.random() < self.gray_p)
+                    self.last_trace["grayscale"] = {"paired": True, "left": bool(do_gray), "right": bool(do_gray)}
                     if do_gray:
                         img_l = TF.rgb_to_grayscale(img_l, num_output_channels=3)
                         img_r = TF.rgb_to_grayscale(img_r, num_output_channels=3)
                 else:
-                    if random.random() < self.gray_p:
+                    do_gray_l = random.random() < self.gray_p
+                    do_gray_r = random.random() < self.gray_p
+                    self.last_trace["grayscale"] = {"paired": False, "left": bool(do_gray_l), "right": bool(do_gray_r)}
+                    if do_gray_l:
                         img_l = TF.rgb_to_grayscale(img_l, num_output_channels=3)
-                    if random.random() < self.gray_p:
+                    if do_gray_r:
                         img_r = TF.rgb_to_grayscale(img_r, num_output_channels=3)
+            else:
+                self.last_trace["grayscale"] = {"paired": self.paired_gray, "left": False, "right": False}
 
             if self.blur_p > 0.0:
                 if self.paired_color_jitter:
                     do_blur = (random.random() < self.blur_p)
+                    self.last_trace["blur"] = {"paired": True, "left_sigma": None, "right_sigma": None}
                     if do_blur:
                         sigma = random.uniform(self.blur_sigma[0], self.blur_sigma[1])
+                        self.last_trace["blur"] = {"paired": True, "left_sigma": float(sigma), "right_sigma": float(sigma)}
                         blur = transforms.GaussianBlur(kernel_size=self.blur_kernel, sigma=(sigma, sigma))
                         img_l = blur(img_l)
                         img_r = blur(img_r)
                 else:
+                    self.last_trace["blur"] = {"paired": False, "left_sigma": None, "right_sigma": None}
                     if random.random() < self.blur_p:
                         sigma_l = random.uniform(self.blur_sigma[0], self.blur_sigma[1])
+                        self.last_trace["blur"]["left_sigma"] = float(sigma_l)
                         blur_l = transforms.GaussianBlur(kernel_size=self.blur_kernel, sigma=(sigma_l, sigma_l))
                         img_l = blur_l(img_l)
                     if random.random() < self.blur_p:
                         sigma_r = random.uniform(self.blur_sigma[0], self.blur_sigma[1])
+                        self.last_trace["blur"]["right_sigma"] = float(sigma_r)
                         blur_r = transforms.GaussianBlur(kernel_size=self.blur_kernel, sigma=(sigma_r, sigma_r))
                         img_r = blur_r(img_r)
+            else:
+                self.last_trace["blur"] = {"paired": self.paired_color_jitter, "left_sigma": None, "right_sigma": None}
+        else:
+            self.last_trace["color_jitter_l"] = []
+            self.last_trace["color_jitter_r"] = []
+            self.last_trace["grayscale"] = {"paired": self.paired_gray, "left": False, "right": False}
+            self.last_trace["blur"] = {"paired": self.paired_color_jitter, "left_sigma": None, "right_sigma": None}
 
         # ToTensor
         x_l = TF.to_tensor(img_l)
@@ -1112,6 +1162,8 @@ class Augmentation:
             else:
                 erase_rect_l = self._sample_erase_rect(self.out_size, self.out_size, self.erase_p, self.erase_scale, self.erase_ratio)
                 erase_rect_r = self._sample_erase_rect(self.out_size, self.out_size, self.erase_p, self.erase_scale, self.erase_ratio)
+        self.last_trace["erase_l"] = tuple(erase_rect_l) if erase_rect_l is not None else None
+        self.last_trace["erase_r"] = tuple(erase_rect_r) if erase_rect_r is not None else None
 
         if erase_rect_l is not None:
             top, left, eh, ew = erase_rect_l

@@ -12,10 +12,8 @@ import pandas as pd
 import numpy as np
 import wandb
 
-from train_utils import (
-    validate_and_normalize_args,
-    resolve_backbone,
-    )
+from backbone_registry import resolve_backbone
+from train_utils import validate_and_normalize_args
 
 from train_main_utils import (
     _seed_everything,
@@ -92,7 +90,7 @@ def arg_parse():
     # -------------------- AUGMENTATION --------------------
     parser.add_argument(
         "--augment",type=str,default="none",choices=["none", "light", "heavy"],
-        help="Augmentation level for training: none | light | heavy. (Applied only when gaze alignment is OFF.)",
+        help="Training preprocessing augmentation level: none | light | heavy.",
     )
     parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
@@ -179,12 +177,11 @@ def arg_parse():
         ),
     )
 
-    parser.add_argument("--attention_mode", type=str, default="raw", choices=["raw", "rollout", "topk"],
+    parser.add_argument("--attention_mode", type=str, default="raw", choices=["raw", "rollout"],
     help=(
         "How to extract transformer attention maps:\n"
-        "  raw    : use CLS→patch attention from the a certain transformer block\n"
+        "  raw    : use CLS→patch attention from a selected transformer block\n"
         "  rollout : rollout attention across all blocks (identity-augmented)\n"
-        "  topk    : raw-block CLS→patch attention, sparsified to top-k tokens"
         ),
     )
     parser.add_argument(
@@ -409,7 +406,7 @@ def run_training_with_args(args, trial=None):
         test_pct=0.2,
         load_if_exists=False,   # loads if files exist, otherwise splits
         save_splits=True,
-        #train_gaze_frac=args.train_gaze_frac,
+        train_gaze_frac=args.train_gaze_frac,
     )
 
 
@@ -428,12 +425,10 @@ def run_training_with_args(args, trial=None):
     # 6) BACKBONE RESOLUTION + TRANSFORMS
     # ==============================================================================================
     # Returns:
-    #  - backbone_model / model_specs: resolved backbone + preprocessing specs
+    #  - backbone_model: resolved transformer backbone (None for CNN backbones)
     #  - train_tfms / eval_tfms: training/eval transform pipelines
-    #  - use_gaze_requested: whether gaze mode is enabled (args.gaze_mode != "disable")
-    #  - use_gaze_loss: whether attention/gaze supervision is active for the chosen model config
     #  - is_cnn_backbone: whether the backbone family uses torchvision CNN path
-    backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone = (
+    backbone_model, train_tfms, eval_tfms, is_cnn_backbone = (
         _build_transforms_and_specs(args)
     )
 
@@ -467,7 +462,6 @@ def run_training_with_args(args, trial=None):
     net = _build_model(
         args=args,
         backbone_model=backbone_model,
-        use_gaze_loss=use_gaze_loss,
         is_cnn_backbone=is_cnn_backbone,
     )
 

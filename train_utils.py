@@ -4,9 +4,7 @@ Utility helpers for train.py.
 This file intentionally contains:
 - reporting / summarization logic
 - lightweight helpers shared by train.py
-- NO training loops
-- NO dataset loading
-- NO imports from train.py (to avoid circular deps)
+
 
 train.py may import from here, never the opposite.
 """
@@ -14,20 +12,15 @@ train.py may import from here, never the opposite.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, List
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
-import timm
 
-import torch
-import torchvision.transforms as transforms
-from torchvision.transforms import InterpolationMode
-import timm
-
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from backbone_registry import BACKBONE_ALIAS_TO_TIMM_ID, DEFAULT_SPECS, infer_vit_grid_size, resolve_backbone
+from gaze_policy import GazeConfig, build_gaze_config, normalize_gaze_mode
 
 
 @dataclass
@@ -35,100 +28,6 @@ class ArgsCheckReport:
     """Report returned by validate_and_normalize_args()."""
     warnings: List[str]
     errors: List[str]
-
-
-@dataclass(frozen=True)
-class GazeConfig:
-    mode: str                  # "disable" | "diag" | "align" | "guide" | "align+gaze" | "egvit"
-    load_gaze: bool            # dataset must provide gaze_l/gaze_r/has_eyetracker in the batch
-    inject: bool               # enable GII gaze injection inside the transformer forward
-    compute_kl: bool           # enable attention recording so KL / diagnostics can be computed
-    use_kl_in_loss: bool       # include KL term in the training loss (requires compute_kl=True)
-    need_attn_maps: bool       # downstream code expects attention maps in outputs (diagnostics/kl)
-    gaze_output: str           # which maps to use for gaze-related output routing ("align"|"guide")
-    pass_to_model: bool = False  # forward signature needs gaze tensors: net(img_l,img_r,gaze_l,gaze_r,mask)
-    egvit: bool = False          # enable EG-ViT patch masking + last-layer merge strategy in transformer
-
-
-def normalize_gaze_mode(raw_mode: str | None) -> str:
-    m = str(raw_mode or "disable").lower().strip()
-
-    aliases = {
-        "off": "diag",           # legacy: "off" meant diagnostic-only
-        "disable": "disable",
-        "none": "disable",
-        "no": "disable",
-        "false": "disable",
-        "0": "disable",
-        "diag": "diag",
-        "diagnostic": "diag",
-        "diagnostics": "diag",
-        "guide": "guide",
-        "align": "align",
-        "align+gaze": "align+gaze",
-        "align+guide": "align+gaze",  # legacy name
-        "gaze": "align+gaze",
-        "egvit": "egvit",
-        "eg-vit": "egvit",
-        "gaze_mask": "egvit",
-        "mask": "egvit",
-
-    }
-
-    m = aliases.get(m, m)
-    if m not in ("disable", "diag", "guide", "align", "align+gaze", "egvit"):
-        m = "disable"
-
-    return m
-
-
-def build_gaze_config(
-    args,
-    *,
-    is_cnn_backbone: bool,
-    out_size: int | None = None,
-) -> GazeConfig:
-    mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
-
-    if bool(is_cnn_backbone):
-        mode = "disable"
-
-    egvit = mode == "egvit"
-    inject = mode in ("guide", "align+gaze")
-
-    pass_to_model = bool(inject or egvit)
-
-    kl_requested = mode in ("diag", "guide", "align", "align+gaze", "egvit")
-    supports_kl = (str(getattr(args, "model", "")).lower().strip() == "rsscnn") and (not bool(is_cnn_backbone))
-    compute_kl = bool(kl_requested and supports_kl)
-
-    w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
-
-    use_kl_in_loss_requested = mode in ("align", "align+gaze")
-    use_kl_in_loss = bool(compute_kl and use_kl_in_loss_requested and (w_kl > 0.0))
-
-    load_gaze = bool(mode != "disable") and bool(pass_to_model or compute_kl)
-    need_attn_maps = bool(compute_kl)
-
-    gaze_output = "guide" if mode == "guide" else "align"
-
-    cfg = GazeConfig(
-        mode=str(mode),
-        load_gaze=bool(load_gaze),
-        inject=bool(inject),
-        compute_kl=bool(compute_kl),
-        use_kl_in_loss=bool(use_kl_in_loss),
-        need_attn_maps=bool(need_attn_maps),
-        gaze_output=str(gaze_output),
-        pass_to_model=bool(pass_to_model),
-        egvit=bool(egvit),
-    )
-
-    args.gaze_mode = str(mode)
-    args.gaze_cfg = cfg
-
-    return cfg
-
 
 
 def _warn(warnings: List[str], msg: str) -> None:
@@ -343,159 +242,8 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     return ArgsCheckReport(warnings=warnings, errors=errors)
     
 
-# ========================================================================= #
-# CONFIGURATION & PRESETS for Transformations
-# ========================================================================= #
-
-# Default ImageNet-style fallback (used only if timm config cannot be resolved)
-DEFAULT_SPECS = {
-    "input_size": (3, 224, 224),
-    "crop_pct": 0.9,
-    "interpolation": "bicubic",
-    "mean": (0.485, 0.456, 0.406),
-    "std": (0.229, 0.224, 0.225),
-}
-
-
-# -----------------------------------------------------------------------------------------------
-# Backbone alias → timm model id mapping
-# -----------------------------------------------------------------------------------------------
-BACKBONE_ALIAS_TO_TIMM_ID = {
-    # --- The "Power 5"  ---
-    "dinov3_vitb16": "vit_base_patch16_dinov3.lvd1689m",
-    # Optional alias if you want to explicitly test the qkvb variant
-    #"dinov3_vitb16": "vit_base_patch16_dinov3_qkvb",
-
-    "beitv2_base_patch16_224": "beitv2_base_patch16_224.in1k_ft_in22k",
-    "deit3_base_patch16_224": "deit3_base_patch16_224.fb_in22k_ft_in1k",
-    "siglip_base_patch16_224": "vit_base_patch16_siglip_224",
-    "vit_base_patch16_clip_224": "vit_base_patch16_clip_224.openai",
-
-    # --- Modern High-Performance Alternates ---
-    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",
-    "dinov2_reg_base": "vit_base_patch14_reg4_dinov2.lvd142m",
-    "eva02_base": "eva02_base_patch14_448.mim_in22k_ft_in1k",
-    "convnext_base": "convnext_base.fb_in22k_ft_in1k",
-
-    # --- Original / Canonical ViT ---
-    "vit_base_patch16_224": "vit_base_patch16_224.augreg_in21k_ft_in1k",
-
-    # --- Legacy / Standard Transformers ---
-    "vit_base_dino": "vit_base_patch16_224.dino",
-    "vit_small": "vit_small_patch16_224.augreg_in21k_ft_in1k",
-    "deit_base": "deit_base_patch16_224.fb_in1k",
-    "deit_small": "deit_small_patch16_224.fb_in1k",
-    "deit_tiny": "deit_tiny_patch16_224.fb_in1k",
-    "deit_base_distilled": "deit_base_distilled_patch16_224.fb_in1k",
-
-    # --- CNNs (Mapped for Preprocessing Specs) ---
-    "alex": "alexnet",
-    "vgg": "vgg19",
-    "dense": "densenet121",
-    "resnet": "resnet50",
-}
-
-
-
-DEFAULT_SPECS = {
-    "input_size": (3, 224, 224),
-    "crop_pct": 0.875,
-    "interpolation": "bilinear",
-    "mean": (0.485, 0.456, 0.406),
-    "std": (0.229, 0.224, 0.225),
-}
-
-def resolve_backbone(
-    backbone_alias: str,
-    *,
-    pretrained: bool = True,
-    strict: bool = True,
-):
-    """
-    Resolves timm id + preprocessing specs.
-    If the resolved pretrained size is > 300, forces DEFAULT_SPECS (224 pipeline).
-    Returns: model, specs
-    """
-    timm_id = BACKBONE_ALIAS_TO_TIMM_ID.get(backbone_alias, backbone_alias)
-
-    try:
-        dummy = timm.create_model(timm_id, pretrained=False)
-        cfg = timm.data.resolve_data_config({}, model=dummy)
-    except Exception as e:
-        if strict:
-            raise RuntimeError(f"Failed to resolve preprocessing for '{backbone_alias}' (timm_id='{timm_id}'): {e}")
-        cfg = {}
-
-    specs = {
-        "alias": backbone_alias,
-        "timm_id": timm_id,
-        "input_size": cfg.get("input_size", DEFAULT_SPECS["input_size"]),
-        "crop_pct": cfg.get("crop_pct", DEFAULT_SPECS["crop_pct"]),
-        "interpolation": cfg.get("interpolation", DEFAULT_SPECS["interpolation"]),
-        "mean": cfg.get("mean", DEFAULT_SPECS["mean"]),
-        "std": cfg.get("std", DEFAULT_SPECS["std"]),
-    }
-    specs["img_size"] = int(specs["input_size"][-1])
-
-    if specs["img_size"] > 300:
-        specs["input_size"] = DEFAULT_SPECS["input_size"]
-        specs["crop_pct"] = DEFAULT_SPECS["crop_pct"]
-        specs["interpolation"] = DEFAULT_SPECS["interpolation"]
-        specs["mean"] = DEFAULT_SPECS["mean"]
-        specs["std"] = DEFAULT_SPECS["std"]
-        specs["img_size"] = int(DEFAULT_SPECS["input_size"][-1])
-
-    kwargs = dict(
-        pretrained=pretrained,
-        num_classes=0,
-        img_size=int(specs["img_size"]),
-        exportable=True,
-    )
-
-    try:
-        model = timm.create_model(timm_id, **kwargs)
-    except TypeError:
-        kwargs.pop("img_size", None)
-        try:
-            model = timm.create_model(timm_id, **kwargs)
-        except TypeError:
-            kwargs.pop("exportable", None)
-            model = timm.create_model(timm_id, **kwargs)
-
-    return model, specs
-    
-def infer_vit_grid_size(backbone_model, model_specs: dict) -> tuple[int, int]:
-    """
-    Infers the ViT patch-token grid size (H, W) from a timm-style ViT/DeiT backbone.
-
-    Uses:
-      - img_size from model_specs (fallback: input_size[-1])
-      - patch_size from backbone_model.patch_embed.patch_size or backbone_model.patch_size
-
-    Returns:
-      (grid_h, grid_w) where grid_h = grid_w = img_size // patch_size
-    """
-    img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
-
-    patch = None
-
-    pe = getattr(backbone_model, "patch_embed", None)
-    if pe is not None and hasattr(pe, "patch_size"):
-        p = pe.patch_size
-        patch = int(p[0] if isinstance(p, (tuple, list)) else p)
-
-    if patch is None and hasattr(backbone_model, "patch_size"):
-        p = backbone_model.patch_size
-        patch = int(p[0] if isinstance(p, (tuple, list)) else p)
-
-    if patch is None:
-        raise RuntimeError("Patch size not found on backbone; add patch_size to specs during resolve_backbone.")
-
-    if img_size % patch != 0:
-        raise RuntimeError(f"img_size={img_size} not divisible by patch_size={patch}.")
-
-    g = img_size // patch
-    return (g, g)
+# Backbone and gaze policy live in backbone_registry.py and gaze_policy.py.
+# They are re-exported here to keep old scripts and notebooks compatible.
 
 
 # =================================================================================================
@@ -541,9 +289,9 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     """
     Print a concise, behavior-accurate summary of the current transform policy.
 
-    Transform families:
-      - Deterministic eval: build_eval_transforms() / ResizeCenterCropAlignGaze
-      - Training aug: Augmentation (pairwise swap/hflip/rotation + crop + photometric + erase)
+    Transform family:
+      - PairwisePreprocessing handles deterministic eval preprocessing and optional
+        training augmentation (swap/hflip/rotation + crop + photometric + erase).
 
     Gaze printing rules (centralized):
       - Gaze mode and dependencies come from args.gaze_cfg when present
@@ -664,12 +412,12 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
 
     print(f"Train Tfms Class  : {train_class}")
 
-    is_aug = (train_tfms is not None and train_tfms.__class__.__name__ == "Augmentation")
+    is_aug = bool(train_tfms is not None and getattr(train_tfms, "augment", False))
 
     if not is_aug:
         if augment_level != "none":
             print("\n[WARNING]")
-            print(f"  args.augment={augment_level} but training transform is not Augmentation (class={train_class}).")
+            print(f"  args.augment={augment_level} but training transform has augmentation disabled (class={train_class}).")
 
         print("\n[Deterministic preprocessing]")
         if eval_meta:
@@ -882,8 +630,6 @@ def print_run_plan(
 
     if bool(getattr(gaze_cfg, 'need_attn_maps', False)):
         print(f"  attn_mode    : {getattr(args, 'attention_mode', 'raw')}")
-        if getattr(args, 'attention_mode', 'raw') == 'topk':
-            print(f"  attn_topk    : {getattr(args, 'attn_topk', 'all')}")
 
     print(f"  augment      : {args.augment}")
     finetune_on = bool(getattr(args, "finetune", False)) and int(getattr(args, "num_ft_blocks", 0)) > 0

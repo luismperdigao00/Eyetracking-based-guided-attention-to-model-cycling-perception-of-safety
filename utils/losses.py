@@ -7,7 +7,7 @@ This module centralizes:
   - Pairwise ranking losses (non-ties) where a preferred side must score higher
   - Tie losses where the model is encouraged to predict similar scores
   - Classification loss (CrossEntropy) for discrete label prediction
-  - Optional gaze/attention alignment loss via symmetric KL divergence
+  - Optional gaze/attention alignment loss via gaze-to-attention KL divergence
 
 It is designed to be called from the training loop with:
     total_loss = compute_loss(args, network_output_dict, labels)
@@ -42,7 +42,7 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
-from train_utils import normalize_gaze_mode
+from gaze_policy import normalize_gaze_mode
 
 
 __all__ = [
@@ -351,7 +351,7 @@ def attention_kl_loss(
     eps: float = 1e-8,
 ) -> Tensor:
     """
-    Symmetric KL divergence between predicted attention maps and gaze maps.
+    One-way KL divergence KL(gaze || attention), averaged over left/right images.
 
     All maps are normalized to per-sample probability distributions before KL.
     Gaze is resized to match attention map resolution when shapes differ.
@@ -537,7 +537,7 @@ def compute_loss(
 
         if gaze_cfg is None:
             mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
-            compute_kl = bool(mode in ("diag", "guide", "align", "align+gaze"))
+            compute_kl = bool(mode in ("diag", "guide", "align", "align+gaze", "egvit"))
             use_kl_in_loss = bool(mode in ("align", "align+gaze") and (w_kl > 0.0))
 
         if not compute_kl:

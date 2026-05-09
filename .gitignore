@@ -39,6 +39,8 @@ Eyetracker_attention_maps/
 *.npz
 *.pkl
 *.pickle
+# Ignore the entire eye_tracker_data folder
+survey_eye_tracker/eye_tracker_data/
 
 # ============================================================================
 # 🐍 PYTHON / VIRTUAL ENVIRONMENTS

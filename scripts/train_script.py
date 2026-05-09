@@ -37,7 +37,8 @@ from utils.losses import compute_loss
 from utils.log import log
 
 from ignite.exceptions import NotComputableError
-from train_utils import print_run_plan, normalize_gaze_mode
+from gaze_policy import normalize_gaze_mode
+from train_utils import print_run_plan
 
         
 class EarlyStopper:
@@ -174,7 +175,7 @@ def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool, bool]:
     egvit = gaze_mode_norm == "egvit"
     use_gaze_inj = gaze_mode_norm in ("guide", "align+gaze")
 
-    kl_requested = gaze_mode_norm in ("diag", "guide", "align", "align+gaze")
+    kl_requested = gaze_mode_norm in ("diag", "guide", "align", "align+gaze", "egvit")
     use_gaze_kl = bool(gaze_mode_norm in ("align", "align+gaze") and (w_kl > 0.0))
 
     pass_to_model = bool(use_gaze_inj or egvit)

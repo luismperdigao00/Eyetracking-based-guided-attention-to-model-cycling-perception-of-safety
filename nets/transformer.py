@@ -7,19 +7,11 @@ from typing import Any, Dict, Optional, Tuple, List
 import torch
 import torch.nn as nn
 
-from .transformer_utils import (
-    AttentionConfig,
-    AttentionRecorder,
-    EGViTConfig,
-    GuideGuidanceConfig,
-    GazeTokenEmbedder,
-    GIIInjectorLayer,
-    forward_backbone_tokens,
-    infer_embed_dim,
-    infer_num_prefix_tokens,
-    pool_tokens,
-    uniform_attention_map,
-)
+from nets.attention_alignment import AttentionConfig, AttentionRecorder, uniform_attention_map
+from nets.egvit import EGViTConfig
+from nets.gaze_guidance import GIIInjectorLayer, GazeTokenEmbedder, GuideGuidanceConfig
+from nets.transformer_forward import forward_backbone_tokens
+from nets.transformer_tokens import infer_embed_dim, infer_num_prefix_tokens, pool_tokens
 
 
 # -------------------------------------------------------------------------------------------------
@@ -459,6 +451,7 @@ class Transformer(nn.Module):
                 num_prefix_tokens=int(self.num_prefix_tokens),
                 guidance_drop_prob=float(self.guidance_cfg.drop_prob) if bool(self.training) else 0.0,
                 egvit_cfg=self.egvit_cfg,
+                model_training=bool(self.training),
             )
         finally:
             if self.attn_recorder is not None:

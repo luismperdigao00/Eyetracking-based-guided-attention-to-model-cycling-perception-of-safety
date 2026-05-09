@@ -12,7 +12,17 @@ from ignite.engine import Engine, Events
 from ignite.metrics import RunningAverage, Accuracy
 
 from utils.log import log
-from utils.accuracy import RankAccuracy, RankAccuracy_withMargin, RankAccuracy_ties
+from utils.accuracy import (
+    ClassificationAUC,
+    ClassificationF1,
+    ClassificationSensitivity,
+    RankAccuracy,
+    RankAccuracy_ties,
+    RankAccuracy_withMargin,
+    RankAUC,
+    RankF1,
+    RankSensitivity,
+)
 from utils.losses import compute_loss
 
 
@@ -296,8 +306,27 @@ def test(device, net, dataloader, args, logger=None):
         if args.full_accuracy and args.ties and args.model != "sscnn":
             metrics["accuracy_validation_ties"] = evaluator.state.metrics["acc_ties"]
 
+        if args.model in ["rcnn", "sscnn"]:
+            metrics.update(
+                {
+                    "auc_validation": evaluator.state.metrics.get("auc"),
+                    "sensitivity_validation": evaluator.state.metrics.get("sensitivity"),
+                    "f1_validation": evaluator.state.metrics.get("f1"),
+                }
+            )
+
         if args.model == "rsscnn":
-            metrics["c_accuracy_validation"] = evaluator.state.metrics["c_acc"]
+            metrics.update(
+                {
+                    "c_accuracy_validation": evaluator.state.metrics["c_acc"],
+                    "rank_auc_validation": evaluator.state.metrics.get("rank_auc"),
+                    "rank_sensitivity_validation": evaluator.state.metrics.get("rank_sensitivity"),
+                    "rank_f1_validation": evaluator.state.metrics.get("rank_f1"),
+                    "c_auc_validation": evaluator.state.metrics.get("c_auc"),
+                    "c_sensitivity_validation": evaluator.state.metrics.get("c_sensitivity"),
+                    "c_f1_validation": evaluator.state.metrics.get("c_f1"),
+                }
+            )
 
         log(args, metrics)
 
@@ -360,10 +389,40 @@ def test(device, net, dataloader, args, logger=None):
                     ),
                     device=device,
                 ).attach(engine, "acc")
+            RankAUC(
+                output_transform=lambda x: (
+                    x["rank_left"],
+                    x["rank_right"],
+                    x["label"],
+                ),
+                device=device,
+            ).attach(engine, "auc")
+            RankSensitivity(
+                output_transform=lambda x: (
+                    x["rank_left"],
+                    x["rank_right"],
+                    x["label"],
+                ),
+                device=device,
+            ).attach(engine, "sensitivity")
+            RankF1(
+                output_transform=lambda x: (
+                    x["rank_left"],
+                    x["rank_right"],
+                    x["label"],
+                ),
+                device=device,
+            ).attach(engine, "f1")
 
         # SSCNN (classification only)
         elif args.model == "sscnn":
             Accuracy(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "acc")
+            ClassificationAUC(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "auc")
+            ClassificationSensitivity(output_transform=lambda x: (x["logits"], x["label"])).attach(
+                engine,
+                "sensitivity",
+            )
+            ClassificationF1(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "f1")
 
         # RSSCNN (ranking + classification)
         elif args.model == "rsscnn":
@@ -396,8 +455,38 @@ def test(device, net, dataloader, args, logger=None):
                     ),
                     device=device,
                 ).attach(engine, "acc")
+            RankAUC(
+                output_transform=lambda x: (
+                    x["rank_left"],
+                    x["rank_right"],
+                    x["label_r"],
+                ),
+                device=device,
+            ).attach(engine, "rank_auc")
+            RankSensitivity(
+                output_transform=lambda x: (
+                    x["rank_left"],
+                    x["rank_right"],
+                    x["label_r"],
+                ),
+                device=device,
+            ).attach(engine, "rank_sensitivity")
+            RankF1(
+                output_transform=lambda x: (
+                    x["rank_left"],
+                    x["rank_right"],
+                    x["label_r"],
+                ),
+                device=device,
+            ).attach(engine, "rank_f1")
 
             Accuracy(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_acc")
+            ClassificationAUC(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_auc")
+            ClassificationSensitivity(output_transform=lambda x: (x["logits"], x["label_c"])).attach(
+                engine,
+                "c_sensitivity",
+            )
+            ClassificationF1(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_f1")
 
         else:
             raise Exception(f"Model type unknown: {args.model}")

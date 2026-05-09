@@ -17,20 +17,14 @@ try:
 except Exception:
     wandb = None
     
-from train_utils import (
-    resolve_backbone,
-    infer_vit_grid_size,
-    compute_class_weights_from_df,
-    print_run_plan,
-    build_gaze_config,
-)
+from backbone_registry import infer_vit_grid_size, resolve_backbone
+from gaze_policy import build_gaze_config
+from train_utils import compute_class_weights_from_df, print_run_plan
 
 from data import (
     ComparisonsDataset,
-    _get_interp_mode,
     build_eval_transforms,
-    AUG_PRESETS,
-    Augmentation,
+    build_train_eval_preprocessing,
 )
 # -------------------------------------------------------------------------------------------------
 # Utilities
@@ -266,11 +260,11 @@ def apply_backbone_hparam_overrides(args) -> None:
     Only modifies attributes when the backbone is explicitly listed here.
     Also keeps ranking_margin_ties aligned when it was not explicitly set.
     Attention mode aliases:
-      - "last", "cls", "topk" are treated as "raw" for attn_w override.
+      - "last" and "cls" are treated as "raw" for attn_w override.
     """
     backbone = str(getattr(args, "backbone", "")).strip().lower()
     attn_mode = str(getattr(args, "attention_mode", "raw")).strip().lower()
-    if attn_mode in ("last", "cls", "topk"):
+    if attn_mode in ("last", "cls"):
         attn_mode = "raw"
     if attn_mode not in ("raw", "rollout"):
         attn_mode = "raw"
@@ -697,19 +691,6 @@ CNN_SPECS = {
 }
 
 
-def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs: dict) -> tuple[int, int]:
-    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
-        forced = int(getattr(args, "gaze_map_size"))
-        return forced, forced
-
-    if is_cnn_backbone:
-        return 14, 14
-
-    grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
-    return int(grid_h), int(grid_w)
-
-import inspect
-
 # -------------------------------------------------------------------------------------------------
 # Gaze grid resolver
 # -------------------------------------------------------------------------------------------------
@@ -768,6 +749,15 @@ def _build_transforms_and_specs(args):
     # Attention/KL grid size (used by align-style KL and align-style gaze maps)
     grid_h, grid_w = _resolve_gaze_grid(args, is_cnn_backbone, backbone_model, model_specs)
     args.gaze_grid_size = (int(grid_h), int(grid_w))
+    model_specs["patch_grid_size"] = tuple(args.gaze_grid_size)
+    if (not is_cnn_backbone) and backbone_model is not None:
+        patch_embed = getattr(backbone_model, "patch_embed", None)
+        patch_size = getattr(patch_embed, "patch_size", getattr(backbone_model, "patch_size", None))
+        num_patches = getattr(patch_embed, "num_patches", None)
+        if patch_size is not None:
+            model_specs["patch_size"] = tuple(patch_size) if isinstance(patch_size, (tuple, list)) else (int(patch_size), int(patch_size))
+        if num_patches is not None:
+            model_specs["num_patches"] = int(num_patches)
 
     # Central gaze policy object (single source of truth)
     gaze_cfg = build_gaze_config(args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
@@ -778,47 +768,30 @@ def _build_transforms_and_specs(args):
         gaze_output = "align"
 
     # Select gaze folder size only when gaze maps are loaded
+    if bool(getattr(gaze_cfg, "load_gaze", False)) and gaze_output == "align" and int(grid_h) != int(grid_w):
+        raise RuntimeError(
+            "The current gaze-map folder convention is square, but the resolved ViT patch grid is "
+            f"{(int(grid_h), int(grid_w))}. Use a square input/patch grid or extend the gaze loader "
+            "to address rectangular map folders explicitly."
+        )
+
     if bool(getattr(gaze_cfg, "load_gaze", False)) and (gaze_output == "guide"):
         args.gaze_map_size_int = int(out_size)
     else:
         args.gaze_map_size_int = int(grid_h)
 
-    # Eval transforms
-    eval_tfms, eval_meta = build_eval_transforms(
-        model_specs,
+    preprocessing = build_train_eval_preprocessing(
+        specs=model_specs,
+        augment=getattr(args, "augment", "none"),
+        ties=bool(getattr(args, "ties", True)),
         gaze_grid_size=args.gaze_grid_size,
         enable_gaze=bool(getattr(gaze_cfg, "load_gaze", False)),
         gaze_output=gaze_output,
     )
-
-    augment_level = str(getattr(args, "augment", "none")).lower().strip()
-    if augment_level not in ("none", "light", "heavy"):
-        augment_level = "none"
-
-    # Train transforms
-    if augment_level == "none":
-        train_tfms = eval_tfms
-        train_meta = {"train_policy": "deterministic (same as eval)", "augment": "none"}
-    else:
-        preset = AUG_PRESETS[augment_level]
-        train_tfms = Augmentation(
-            augment=True,
-            ties=bool(getattr(args, "ties", True)),
-            resize_short=int(eval_meta["resize_dim"]),
-            out_size=int(eval_meta["target_crop"]),
-            interpolation=_get_interp_mode(eval_meta["interpolation"]),
-            mean=tuple(eval_meta["mean"]),
-            std=tuple(eval_meta["std"]),
-            enable_gaze=bool(getattr(gaze_cfg, "load_gaze", False)),
-            gaze_grid_size=tuple(args.gaze_grid_size),
-            gaze_output=gaze_output,
-            **preset,
-        )
-        train_meta = {
-            "train_policy": "deterministic (same as eval)",
-            "augment": augment_level,
-            "gaze_output": gaze_output,
-        }
+    train_tfms = preprocessing["train"]
+    eval_tfms = preprocessing["eval"]
+    train_meta = preprocessing["train_meta"]
+    eval_meta = preprocessing["eval_meta"]
 
     # Metadata for logging/printing
     args.expected_img_size = int(out_size)
@@ -846,10 +819,7 @@ def _build_transforms_and_specs(args):
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
 
-    use_gaze_requested = bool(getattr(gaze_cfg, "load_gaze", False))
-    use_gaze_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
-
-    return backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone
+    return backbone_model, train_tfms, eval_tfms, is_cnn_backbone
 
 
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
@@ -891,7 +861,7 @@ def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tf
     return train_loader, val_loader, test_loader
 
 
-def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: bool) -> torch.nn.Module:
+def _build_model(args, backbone_model, is_cnn_backbone: bool) -> torch.nn.Module:
     backbone_name = str(args.backbone).lower().strip()
 
     if (not is_cnn_backbone) and (backbone_name not in set([b.lower() for b in TRANSFORMER_BACKBONES])):
@@ -902,7 +872,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
 
     need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False)) if gaze_cfg is not None else False
     use_gaze_inj = bool(getattr(gaze_cfg, "inject", False)) if gaze_cfg is not None else False
-    use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) if gaze_cfg is not None else bool(use_gaze_loss)
+    use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) if gaze_cfg is not None else False
 
     gaze_grid = getattr(args, "gaze_grid_size", (14, 14))
     if isinstance(gaze_grid, (list, tuple)) and len(gaze_grid) == 2:
@@ -936,7 +906,8 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         return net
 
     from nets.transformer import Transformer as Net
-    from nets.transformer_utils import GuideGuidanceConfig, EGViTConfig
+    from nets.egvit import EGViTConfig
+    from nets.gaze_guidance import GuideGuidanceConfig
 
     guidance_cfg = GuideGuidanceConfig(
         enabled=bool(use_gaze_inj),
