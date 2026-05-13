@@ -17,7 +17,7 @@ class CNN(nn.Module):
         Torchvision constructor like torchvision.models.vgg19, resnet50, etc.
         Must accept weights=... (torchvision >= 0.13) or pretrained=...
     model : str
-        'rcnn' | 'sscnn' | 'rsscnn'
+        'ranking' | 'classification' | 'multitask' | 'multitask_gaze'
     finetune : bool
         If False, backbone params are frozen.
     num_classes : int
@@ -182,15 +182,15 @@ class CNN(nn.Module):
     # Pairwise forward (project API)
     # -----------------------------
     def forward(self, left_batch: torch.Tensor, right_batch: torch.Tensor):
-        if self.model == "rcnn":
+        if self.model == "ranking":
             return {"left": self.single_forward_ranking(left_batch),
                     "right": self.single_forward_ranking(right_batch)}
 
-        if self.model == "sscnn":
+        if self.model == "classification":
             fusion = self.single_forward_fusion(left_batch, right_batch)
             return {"logits": {"output": fusion["output"]}}
 
-        if self.model == "rsscnn":
+        if self.model in ("multitask", "multitask_gaze"):
             left_out = self.single_forward_ranking(left_batch)
             right_out = self.single_forward_ranking(right_batch)
             fusion = self.single_forward_fusion(left_batch, right_batch)

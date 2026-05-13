@@ -68,8 +68,9 @@ def build_gaze_config(
     out_size: int | None = None,
 ) -> GazeConfig:
     mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
+    model = str(getattr(args, "model", "")).lower().strip()
 
-    if bool(is_cnn_backbone):
+    if bool(is_cnn_backbone) or model != "multitask_gaze":
         mode = "disable"
 
     egvit = mode == "egvit"
@@ -78,7 +79,7 @@ def build_gaze_config(
     pass_to_model = bool(inject or egvit)
 
     kl_requested = mode in ("diag", "guide", "align", "align+gaze", "egvit")
-    supports_kl = (str(getattr(args, "model", "")).lower().strip() == "rsscnn") and (not bool(is_cnn_backbone))
+    supports_kl = (model == "multitask_gaze") and (not bool(is_cnn_backbone))
     compute_kl = bool(kl_requested and supports_kl)
 
     w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)

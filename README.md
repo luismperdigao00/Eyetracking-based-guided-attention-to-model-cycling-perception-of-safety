@@ -48,7 +48,7 @@ Train a baseline pairwise ranking model:
 
 ```bash
 python train.py \
-  --model rcnn \
+  --model ranking \
   --backbone dinov3_vitb16 \
   --comparisons comparisons_df.pickle \
   --dataset images/ \
@@ -61,7 +61,7 @@ Train the gaze-aligned model:
 
 ```bash
 python train.py \
-  --model rsscnn \
+  --model multitask_gaze \
   --backbone dinov3_vitb16 \
   --gaze_mode align \
   --attn_w 1.0 \
@@ -71,11 +71,22 @@ python train.py \
   --cuda true
 ```
 
+Train the paired ranking + classification model without gaze:
+
+```bash
+python train.py \
+  --model multitask \
+  --backbone dinov3_vitb16 \
+  --comparisons comparisons_df.pickle \
+  --dataset images/ \
+  --cuda true
+```
+
 Evaluate a trained checkpoint:
 
 ```bash
 python test.py \
-  --model rsscnn \
+  --model multitask_gaze \
   --backbone dinov3_vitb16 \
   --comparisons comparisons_df.pickle \
   --dataset images/ \

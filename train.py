@@ -236,8 +236,8 @@ def arg_parse():
     parser.add_argument("--wandb_project", type=str, default="SubjectiveCyclingSafety")
 
     # -------------------- MODEL SETTINGS ---------------------
-    parser.add_argument("--model", type=str, default="rcnn",
-                        choices=["rsscnn", "sscnn", "rcnn"])
+    parser.add_argument("--model", type=str, default="ranking",
+                        choices=["ranking", "classification", "multitask", "multitask_gaze"])
     
     parser.add_argument(
         "--backbone",

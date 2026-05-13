@@ -24,14 +24,15 @@ class TransformerConfig:
     Model wrapper configuration.
 
     model:
-      - "rcnn"  : ranking-only (no pairwise class head)
-      - "sscnn" : ranking + pairwise classification head
-      - "rsscnn": ranking + pairwise classification head + (optional) attention map output
+      - "ranking"  : ranking-only (no pairwise class head)
+      - "classification" : pairwise classification-only (no ranking head output)
+      - "multitask": ranking + pairwise classification head
+      - "multitask_gaze": ranking + pairwise classification head + (optional) attention map output
 
     pooling:
       Token pooling strategy used to produce a single vector per branch.
     """
-    model: str = "rsscnn"
+    model: str = "multitask_gaze"
     pooling: str = "cls"
     pool_k: int = 10
     num_classes: int = 2
@@ -81,7 +82,7 @@ class Transformer(nn.Module):
     def __init__(
         self,
         backbone: nn.Module,
-        model: str = "rsscnn",
+        model: str = "multitask_gaze",
         pooling: str = "cls",
         pool_k: int = 10,
         num_classes: int = 2,
@@ -147,8 +148,8 @@ class Transformer(nn.Module):
         )
         self.cfg = cfg
 
-        if self.cfg.model not in ("rcnn", "sscnn", "rsscnn"):
-            raise ValueError(f"Unknown model='{self.cfg.model}'. Expected: rcnn/sscnn/rsscnn.")
+        if self.cfg.model not in ("ranking", "classification", "multitask", "multitask_gaze"):
+            raise ValueError(f"Unknown model='{self.cfg.model}'. Expected: ranking/classification/multitask/multitask_gaze.")
 
         allowed_poolings = {
             "cls",
@@ -522,7 +523,7 @@ class Transformer(nn.Module):
         }
 
         # Step 4) Pairwise classification logits (model-dependent)
-        if self.cfg.model in ("sscnn", "rsscnn"):
+        if self.cfg.model in ("classification", "multitask", "multitask_gaze"):
             logits = self._fusion_logits(pooled_l, pooled_r)
         else:
             b = int(x_left.shape[0])

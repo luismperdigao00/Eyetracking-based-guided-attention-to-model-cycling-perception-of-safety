@@ -131,7 +131,7 @@ def _plot_roc_when_ties_off(results_df: pd.DataFrame, args) -> None:
 
     curves: List[Tuple[str, np.ndarray, np.ndarray]] = []
 
-    if args.model in ("rcnn", "rsscnn") and {"label_r", "rank_left", "rank_right"}.issubset(results_df.columns):
+    if args.model in ("ranking", "multitask", "multitask_gaze") and {"label_r", "rank_left", "rank_right"}.issubset(results_df.columns):
         label_r = _as_numpy_1d(results_df["label_r"])
         rank_left = _as_numpy_1d(results_df["rank_left"])
         rank_right = _as_numpy_1d(results_df["rank_right"])
@@ -141,7 +141,7 @@ def _plot_roc_when_ties_off(results_df: pd.DataFrame, args) -> None:
         rank_score = rank_left[non_tie] - rank_right[non_tie]
         _add_roc_curve(curves, "Ranking", rank_target, rank_score)
 
-    if args.model in ("sscnn", "rsscnn") and {"label_c", "logits_l", "logits_r"}.issubset(results_df.columns):
+    if args.model in ("classification", "multitask", "multitask_gaze") and {"label_c", "logits_l", "logits_r"}.issubset(results_df.columns):
         label_c = _as_numpy_1d(results_df["label_c"]).astype(int)
         logits_l = _as_numpy_1d(results_df["logits_l"])
         logits_r = _as_numpy_1d(results_df["logits_r"])
@@ -674,7 +674,7 @@ def build_model(args):
 
         net = Net(
             backbone=backbone_model,
-            model=str(getattr(args, "model", "rsscnn")).lower().strip(),
+            model=str(getattr(args, "model", "multitask_gaze")).lower().strip(),
             pooling=str(getattr(args, "pooling", "cls")).lower().strip(),
             pool_k=int(getattr(args, "pool_k", 10)),
             num_classes=3 if bool(getattr(args, "ties", False)) else 2,
@@ -742,7 +742,7 @@ def _load_checkpoint(net: torch.nn.Module, ckpt_path: str, device: torch.device)
             f"  ckpt: {ckpt_path}\n"
             f"  missing_keys (sample): {sample_m}\n"
             f"  unexpected_keys (sample): {sample_u}\n"
-            "This usually means you changed one of: model head (rcnn/sscnn/rsscnn), "
+            "This usually means you changed one of: model head (ranking/classification/multitask/multitask_gaze), "
             "ties on/off (2 vs 3 classes), backbone, pooling mode, or finetune block config.\n"
             "Fix by instantiating the exact same architecture/config as training, "
             "or evaluate the correct checkpoint."
@@ -803,7 +803,7 @@ def parse_args():
     p.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps", help="Folder for .npy gaze maps.")
     p.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool, help="Use *_seg.jpg images.")
 
-    p.add_argument("--model", choices=["rcnn", "sscnn", "rsscnn"], default="rcnn", help="Head type used in training.")
+    p.add_argument("--model", choices=["ranking", "classification", "multitask", "multitask_gaze"], default="ranking", help="Head type used in training.")
     p.add_argument("--backbone", type=str, default="vit_base_dino", help="Backbone used in training.")
     
     p.add_argument("--finetune", nargs="?", const=True, default=False, type=str2bool, help="If backbone was finetuned.")

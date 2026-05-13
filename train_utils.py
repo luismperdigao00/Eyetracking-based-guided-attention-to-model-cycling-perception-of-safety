@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from backbone_registry import BACKBONE_ALIAS_TO_TIMM_ID, DEFAULT_SPECS, infer_vit_grid_size, resolve_backbone
-from gaze_policy import GazeConfig, build_gaze_config, normalize_gaze_mode
+from gaze_policy import normalize_gaze_mode
 
 
 @dataclass
@@ -159,25 +159,29 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     # ------------------------------------------------------------------
     # Model-type dependencies (important for “ignored args” correctness)
     # ------------------------------------------------------------------
-    model = getattr(args, "model", "rcnn")
+    model = getattr(args, "model", "ranking")
 
     # Classification-only model ignores ranking-related knobs
-    if model == "sscnn":
+    if model == "classification":
         if getattr(args, "rank_w", 0.0) not in (0.0, 0):
-            _warn(warnings, "--model sscnn: --rank_w is ignored.")
+            _warn(warnings, "--model classification: --rank_w is ignored.")
         if getattr(args, "ties_w", 0.0) not in (0.0, 0):
-            _warn(warnings, "--model sscnn: --ties_w is ignored.")
+            _warn(warnings, "--model classification: --ties_w is ignored.")
         if getattr(args, "ranking_margin", 0.0) != 0.3:
-            _warn(warnings, "--model sscnn: --ranking_margin is ignored.")
+            _warn(warnings, "--model classification: --ranking_margin is ignored.")
         if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_gaze_mode(getattr(args, "gaze_mode", None)) != "disable":
-            _warn(warnings, "--model sscnn: gaze alignment loss is not applicable; --attn_w will be ignored.")
+            _warn(warnings, "--model classification: gaze alignment loss is not applicable; --attn_w will be ignored.")
+
+    if model == "multitask":
+        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_gaze_mode(getattr(args, "gaze_mode", None)) != "disable":
+            _warn(warnings, "--model multitask: gaze alignment loss is not applicable; --attn_w will be ignored.")
 
     # Ranking-only model ignores classification knobs
-    if model == "rcnn":
+    if model == "ranking":
         if getattr(args, "use_class_weights", False):
-            _warn(warnings, "--model rcnn: --use_class_weights is ignored (no CE loss).")
+            _warn(warnings, "--model ranking: --use_class_weights is ignored (no CE loss).")
         if float(getattr(args, "label_smoothing", 0.0)) > 0:
-            _warn(warnings, "--model rcnn: --label_smoothing is ignored (no CE loss).")
+            _warn(warnings, "--model ranking: --label_smoothing is ignored (no CE loss).")
 
     # ------------------------------------------------------------------
     # Gaze dependencies
@@ -189,11 +193,11 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     if attn_w < 0.0:
         _err(errors, f"--attn_w must be >= 0 (got {attn_w}).")
 
-    # KL is only used by the RSSCNN objective in this codebase.
-    model = str(getattr(args, "model", "rcnn")).lower().strip()
+    # KL is only used by the multitask_gaze objective in this codebase.
+    model = str(getattr(args, "model", "ranking")).lower().strip()
     wants_kl = gaze_mode in ("diag", "align", "align+gaze")
 
-    if (model != "rsscnn") and wants_kl:
+    if (model != "multitask_gaze") and wants_kl:
         _warn(warnings, f"--gaze_mode={gaze_mode} requests KL diagnostics/supervision, but --model={model}; KL will be disabled.")
 
     if gaze_mode in ("disable", "diag", "guide") and attn_w > 0.0:
@@ -689,7 +693,7 @@ def print_run_plan(
     print("\n[Loss]")
     parts = []
 
-    if args.model in ("sscnn", "rsscnn"):
+    if args.model in ("classification", "multitask", "multitask_gaze"):
         ce = "CE"
         if args.use_class_weights:
             ce += "(weighted)"
@@ -704,12 +708,15 @@ def print_run_plan(
         parts.append(f"{args.ties_w:g}·ties")
 
     gaze_cfg = getattr(args, 'gaze_cfg', None)
-    gaze_mode = str(getattr(gaze_cfg, 'mode', getattr(args, 'gaze_mode', 'disable')))
+    if gaze_cfg is None:
+        raise RuntimeError(
+            "args.gaze_cfg is missing. Build it with gaze_policy.build_gaze_config(...) "
+            "before printing the run plan."
+        )
+
+    gaze_mode = str(getattr(gaze_cfg, 'mode', 'disable'))
 
     use_kl_in_loss = bool(getattr(gaze_cfg, 'use_kl_in_loss', False))
-    if gaze_cfg is None:
-        gaze_mode = normalize_gaze_mode(getattr(args, 'gaze_mode', None))
-        use_kl_in_loss = bool(gaze_mode in ('align', 'align+gaze') and float(getattr(args, 'attn_w', 0.0) or 0.0) > 0.0)
 
     if use_kl_in_loss:
         parts.append(f"{args.attn_w:g}·KL(gaze↔attn)")
