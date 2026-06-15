@@ -73,6 +73,9 @@ outputs/
 # ============================================================================
 # ANALYSIS IMAGE OUTPUTS
 # ============================================================================
+Analysis/
+build_datasets/
+deployment_outputs/
 Analysis/**/*.png
 Analysis/**/*.jpg
 
