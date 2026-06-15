@@ -7,7 +7,7 @@ This app lets you inspect a perceived-safety model for street-level view images.
 From the repository root, run:
 
 ```bash
-/home/csantiago/.venv/bin/python deployment_app/app.py --port 8765
+python deployment_app/app.py --port 8765
 ```
 
 Keep the terminal open while using the app, then open:
@@ -21,13 +21,13 @@ To stop it, click **Stop Server** in the app or press `Ctrl+C` in the terminal.
 If port `8765` is already busy, start it on another port:
 
 ```bash
-/home/csantiago/.venv/bin/python deployment_app/app.py --port 8766
+python deployment_app/app.py --port 8766
 ```
 
 Outputs are saved under:
 
 ```text
-/deployment_outputs/perceived_safety_app/
+deployment_outputs/perceived_safety_app/
 ```
 
 ## What you can upload
