@@ -38,7 +38,7 @@ class TransformerConfig:
     num_classes: int = 2
 
     finetune: bool = False
-    num_ft_blocks: int = 1
+    num_ft_layers: int = 1
 
     rank_dropout: float = 0.3
     cross_dropout: float = 0.3
@@ -53,6 +53,7 @@ class TransformerConfig:
         layer=-1,
         out_hw=(14, 14),
     )
+    gaze_align_target: str = "attention"
 
     egvit: EGViTConfig = EGViTConfig(enabled=False)
     guidance: GuideGuidanceConfig = GuideGuidanceConfig(enabled=False)
@@ -68,14 +69,14 @@ class Transformer(nn.Module):
 
     Outputs:
       {
-        "left":  {"output": score_l, "attn_map": attn_l},
-        "right": {"output": score_r, "attn_map": attn_r},
+        "left":  {"output": score_l, "attn_map": attn_l, "token_importance": token_l},
+        "right": {"output": score_r, "attn_map": attn_r, "token_importance": token_r},
         "logits":{"output": logits}
       }
 
     Gaze support:
       - Guide: gaze injection occurs inside each ViT block using GII modules.
-      - Align: attention maps are produced when attention recorder is enabled.
+      - Align: attention maps or patch-token importance maps can be aligned to gaze.
       - EG-ViT: gaze-guided patch masking at input + merge before last block.
     """
 
@@ -87,7 +88,7 @@ class Transformer(nn.Module):
         pool_k: int = 10,
         num_classes: int = 2,
         finetune: bool = False,
-        num_ft_blocks: int = 1,
+        num_ft_layers: Optional[int] = None,
         rank_dropout: float = 0.3,
         cross_dropout: float = 0.3,
         use_attn_hook: bool = False,
@@ -97,10 +98,15 @@ class Transformer(nn.Module):
         force_num_prefix_tokens: Optional[int] = None,
         apply_token_norm: bool = False,
         attn_out_hw: Optional[Tuple[int, int]] = None,
+        gaze_align_target: str = "attention",
+        gaze_attention_bias: str = "none",
+        gaze_attention_bias_strength: float = 0.0,
+        gaze_attention_bias_train_only: bool = True,
         use_gaze_injection: bool = False,
         guidance_cfg: Optional[GuideGuidanceConfig] = None,
         use_egvit_masking: bool = False,
         egvit_cfg: Optional[EGViTConfig] = None,
+        num_ft_blocks: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -117,13 +123,16 @@ class Transformer(nn.Module):
         if attn_mode == "last":
             attn_mode = "raw"
 
+        if num_ft_layers is None:
+            num_ft_layers = 1 if num_ft_blocks is None else int(num_ft_blocks)
+
         cfg = TransformerConfig(
             model=str(model).lower().strip(),
             pooling=str(pooling).lower().strip(),
             pool_k=int(pool_k),
             num_classes=int(num_classes),
-            finetune=bool(finetune) and (int(num_ft_blocks) > 0),
-            num_ft_blocks=int(max(0, num_ft_blocks)),
+            finetune=bool(finetune) and (int(num_ft_layers) > 0),
+            num_ft_layers=int(max(0, num_ft_layers)),
             rank_dropout=float(rank_dropout),
             cross_dropout=float(cross_dropout),
             force_num_prefix_tokens=force_num_prefix_tokens,
@@ -134,7 +143,11 @@ class Transformer(nn.Module):
                 mode=attn_mode,
                 layer=int(attn_layer),
                 out_hw=tuple(attn_out_hw) if attn_out_hw is not None else (14, 14),
+                gaze_bias=str(gaze_attention_bias).lower().strip(),
+                gaze_bias_strength=float(gaze_attention_bias_strength),
+                gaze_bias_train_only=bool(gaze_attention_bias_train_only),
             ),
+            gaze_align_target=str(gaze_align_target).lower().strip(),
             egvit=(
                 egvit_cfg
                 if egvit_cfg is not None
@@ -174,6 +187,16 @@ class Transformer(nn.Module):
                 f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: raw/rollout."
             )
 
+        if self.cfg.attention.gaze_bias not in ("none", "cls_to_patch", "all_queries_to_patch"):
+            raise ValueError(
+                f"Unknown gaze_attention_bias='{self.cfg.attention.gaze_bias}'. Expected: none/cls_to_patch/all_queries_to_patch."
+            )
+
+        if self.cfg.gaze_align_target not in ("attention", "patch_tokens"):
+            raise ValueError(
+                f"Unknown gaze_align_target='{self.cfg.gaze_align_target}'. Expected: attention/patch_tokens."
+            )
+
         # ----------------------------------------------------------------------------------
         # Step 3) Runtime flags (controlled externally)
         # ----------------------------------------------------------------------------------
@@ -185,7 +208,7 @@ class Transformer(nn.Module):
         # ----------------------------------------------------------------------------------
         self._freeze_backbone()
         if self.cfg.finetune:
-            self._unfreeze_last_blocks(self.cfg.num_ft_blocks)
+            self._unfreeze_last_layers(self.cfg.num_ft_layers)
 
         # ----------------------------------------------------------------------------------
         # Step 5) Infer token dimensions and prefix tokens
@@ -315,43 +338,29 @@ class Transformer(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def _unfreeze_last_blocks(self, num_ft_blocks: int) -> None:
-        n_req = int(num_ft_blocks)
+    def _unfreeze_last_layers(self, num_ft_layers: int) -> None:
+        """
+        Unfreeze the last N transformer encoder layers.
+
+        In timm ViT-style backbones, the repeated transformer encoder layers are
+        exposed as `backbone.blocks` (or, for some families, `backbone.stages`).
+        This deliberately does not unfreeze patch embedding or token parameters;
+        `num_ft_layers` refers only to the encoder layer stack.
+        """
+        n_req = int(num_ft_layers)
         if n_req <= 0:
             return
 
-        def _unfreeze_param_attr(module: nn.Module, attr_name: str) -> None:
-            if not hasattr(module, attr_name):
-                return
-            obj = getattr(module, attr_name)
-            if isinstance(obj, torch.nn.Parameter):
-                obj.requires_grad = True
+        layers = getattr(self.backbone, "blocks", None)
+        if layers is None:
+            layers = getattr(self.backbone, "stages", None)
 
-        blocks = getattr(self.backbone, "blocks", None)
-        if blocks is None:
-            blocks = getattr(self.backbone, "stages", None)
-
-        if blocks is not None:
-            n_total = len(blocks)
+        if layers is not None:
+            n_total = len(layers)
             n = max(0, min(n_req, n_total))
-            for blk in list(blocks)[-n:]:
-                for p in blk.parameters():
+            for layer in list(layers)[-n:]:
+                for p in layer.parameters():
                     p.requires_grad = True
-
-        norm = getattr(self.backbone, "norm", None)
-        if isinstance(norm, nn.Module):
-            for p in norm.parameters():
-                p.requires_grad = True
-
-        patch_embed = getattr(self.backbone, "patch_embed", None)
-        if isinstance(patch_embed, nn.Module):
-            for p in patch_embed.parameters():
-                p.requires_grad = True
-
-        _unfreeze_param_attr(self.backbone, "pos_embed")
-        _unfreeze_param_attr(self.backbone, "cls_token")
-        _unfreeze_param_attr(self.backbone, "dist_token")
-        _unfreeze_param_attr(self.backbone, "reg_token")
 
     # -------------------------------------------------------------------------------------------------
     # Public controls
@@ -425,18 +434,51 @@ class Transformer(nn.Module):
         backbone_has_grad = any(p.requires_grad for p in self.backbone.parameters())
         return bool(backbone_has_grad)
 
+    def _patch_token_importance_map(self, feats: torch.Tensor) -> Optional[torch.Tensor]:
+        if feats.ndim != 3:
+            return None
+        t_pref = int(self.num_prefix_tokens)
+        if feats.shape[1] <= t_pref:
+            return None
+
+        tokens = feats
+        if self.apply_token_norm and (self.token_norm is not None):
+            try:
+                tokens = self.token_norm(tokens)
+            except Exception:
+                tokens = feats
+
+        patches = tokens[:, t_pref:, :]
+        importance = patches.pow(2).mean(dim=-1).sqrt()
+
+        grid_hw = tuple(self.attn_cfg.out_hw)
+        h, w = int(grid_hw[0]), int(grid_hw[1])
+        if int(importance.shape[1]) == h * w:
+            return importance.view(importance.shape[0], h, w)
+
+        side = int(importance.shape[1] ** 0.5)
+        if side * side == int(importance.shape[1]):
+            return importance.view(importance.shape[0], side, side)
+
+        return None
+
     def _forward_one(
         self,
         x: torch.Tensor,
         gaze_map: Optional[torch.Tensor],
         has_eye_mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Step A) Configure attention recorder gradient behavior
         self.gaze_requires_grad = self._compute_attention_require_grad()
 
         if self.attn_recorder is not None:
             self.attn_recorder.set_keep_grad(bool(self.gaze_requires_grad and self.gaze_backprop_enabled))
             self.attn_recorder.begin_capture()
+            self.attn_recorder.set_gaze_bias_context(
+                gaze_map=gaze_map,
+                has_eye_mask=has_eye_mask,
+                num_prefix_tokens=int(self.num_prefix_tokens),
+            )
 
         # Step B) Backbone forward (Guide and/or EG-ViT apply only when configured and gaze is provided)
         try:
@@ -457,6 +499,7 @@ class Transformer(nn.Module):
         finally:
             if self.attn_recorder is not None:
                 self.attn_recorder.end_capture()
+                self.attn_recorder.clear_gaze_bias_context()
 
         # Step C) Pool tokens -> feature vector
         pooled = pool_tokens(
@@ -494,7 +537,10 @@ class Transformer(nn.Module):
                 used_uniform = True
 
         self._last_branch_used_uniform = bool(used_uniform)
-        return pooled, score, attn_map
+        token_importance = None
+        if self.cfg.gaze_align_target == "patch_tokens":
+            token_importance = self._patch_token_importance_map(feats)
+        return pooled, score, attn_map, token_importance
 
     # -------------------------------------------------------------------------------------------------
     # Forward
@@ -509,11 +555,11 @@ class Transformer(nn.Module):
         has_eye_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         # Step 1) Left branch forward
-        pooled_l, score_l, attn_l = self._forward_one(x_left, gaze_left, has_eye_mask)
+        pooled_l, score_l, attn_l, token_l = self._forward_one(x_left, gaze_left, has_eye_mask)
         used_uniform_l = bool(getattr(self, "_last_branch_used_uniform", False))
 
         # Step 2) Right branch forward
-        pooled_r, score_r, attn_r = self._forward_one(x_right, gaze_right, has_eye_mask)
+        pooled_r, score_r, attn_r, token_r = self._forward_one(x_right, gaze_right, has_eye_mask)
         used_uniform_r = bool(getattr(self, "_last_branch_used_uniform", False))
 
         # Step 3) Attention meta tracking (debugging/logging)
@@ -531,7 +577,7 @@ class Transformer(nn.Module):
 
         # Step 5) Package outputs (legacy-compatible)
         return {
-            "left": {"output": score_l, "attn_map": attn_l},
-            "right": {"output": score_r, "attn_map": attn_r},
+            "left": {"output": score_l, "attn_map": attn_l, "token_importance": token_l},
+            "right": {"output": score_r, "attn_map": attn_r, "token_importance": token_r},
             "logits": {"output": logits},
         }

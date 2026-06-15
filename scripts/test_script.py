@@ -30,7 +30,7 @@ def test(device, net, dataloader, args, logger=None):
     """
     Evaluate a trained model on a comparisons DataLoader.
 
-    - Works for rcnn, sscnn, rsscnn
+    - Works for ranking, classification, multitask, multitask_gaze
     - Supports ties / full_accuracy flags
     - Uses the new compute_loss (incl. gaze KL if enabled)
     - Saves per-batch outputs into 'outputs/' and an aggregated
@@ -108,7 +108,7 @@ def test(device, net, dataloader, args, logger=None):
             if gaze_mode not in ("off", "align", "guide", "align+guide"):
                 gaze_mode = "off"
             
-            use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
+            use_gaze_inj = (args.model == "multitask_gaze") and (gaze_mode in ("guide", "align+guide"))
             
             # Detect transformer wrapper (DataParallel-safe)
             net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
@@ -167,7 +167,7 @@ def test(device, net, dataloader, args, logger=None):
             # ----------------------------
             # 5) Return values for metrics (ignite)
             # ----------------------------
-            if args.model == "rcnn":
+            if args.model == "ranking":
                 rank_left_t = forward_dict["left"]["output"].view(-1)
                 rank_right_t = forward_dict["right"]["output"].view(-1)
 
@@ -191,7 +191,7 @@ def test(device, net, dataloader, args, logger=None):
                     "loss_kl_weighted": loss_kl_weighted,
                 }
 
-            elif args.model == "sscnn":
+            elif args.model == "classification":
                 logits_t = forward_dict["logits"]["output"]
                 logits_np = logits_t.detach().cpu().numpy()
 
@@ -218,7 +218,7 @@ def test(device, net, dataloader, args, logger=None):
                     "loss_class": loss_class,
                 }
 
-            elif args.model == "rsscnn":
+            elif args.model in ("multitask", "multitask_gaze"):
                 rank_left_t = forward_dict["left"]["output"].view(-1)
                 rank_right_t = forward_dict["right"]["output"].view(-1)
                 logits_t = forward_dict["logits"]["output"]
@@ -303,10 +303,10 @@ def test(device, net, dataloader, args, logger=None):
             if "loss_kl_weighted" in evaluator.state.metrics:
                 metrics["loss_kl_weighted_validation"] = evaluator.state.metrics["loss_kl_weighted"]
 
-        if args.full_accuracy and args.ties and args.model != "sscnn":
+        if args.full_accuracy and args.ties and args.model != "classification":
             metrics["accuracy_validation_ties"] = evaluator.state.metrics["acc_ties"]
 
-        if args.model in ["rcnn", "sscnn"]:
+        if args.model in ["ranking", "classification"]:
             metrics.update(
                 {
                     "auc_validation": evaluator.state.metrics.get("auc"),
@@ -315,7 +315,7 @@ def test(device, net, dataloader, args, logger=None):
                 }
             )
 
-        if args.model == "rsscnn":
+        if args.model in ("multitask", "multitask_gaze"):
             metrics.update(
                 {
                     "c_accuracy_validation": evaluator.state.metrics["c_acc"],
@@ -359,7 +359,7 @@ def test(device, net, dataloader, args, logger=None):
         ).attach(engine, "loss_kl_weighted")
 
         # Ranking only
-        if args.model == "rcnn":
+        if args.model == "ranking":
             if args.full_accuracy:
                 RankAccuracy_withMargin(
                     output_transform=lambda x: (
@@ -414,8 +414,8 @@ def test(device, net, dataloader, args, logger=None):
                 device=device,
             ).attach(engine, "f1")
 
-        # SSCNN (classification only)
-        elif args.model == "sscnn":
+        # classification (classification only)
+        elif args.model == "classification":
             Accuracy(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "acc")
             ClassificationAUC(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "auc")
             ClassificationSensitivity(output_transform=lambda x: (x["logits"], x["label"])).attach(
@@ -424,8 +424,8 @@ def test(device, net, dataloader, args, logger=None):
             )
             ClassificationF1(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "f1")
 
-        # RSSCNN (ranking + classification)
-        elif args.model == "rsscnn":
+        # multitask / multitask_gaze (ranking + classification)
+        elif args.model in ("multitask", "multitask_gaze"):
             if args.full_accuracy:
                 RankAccuracy_withMargin(
                     output_transform=lambda x: (

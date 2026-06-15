@@ -37,7 +37,6 @@ from utils.losses import compute_loss
 from utils.log import log
 
 from ignite.exceptions import NotComputableError
-from gaze_policy import normalize_gaze_mode
 from train_utils import print_run_plan
 
         
@@ -151,38 +150,21 @@ def _set_gaze_bp(model: torch.nn.Module, enabled: bool) -> None:
 
 def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool, bool]:
     gaze_cfg = getattr(args, "gaze_cfg", None)
+    if gaze_cfg is None:
+        raise RuntimeError(
+            "args.gaze_cfg is missing. Build it with gaze_policy.build_gaze_config(...) "
+            "before entering the training loop."
+        )
 
-    if gaze_cfg is not None:
-        gaze_mode = str(getattr(gaze_cfg, "mode", "disable")).lower().strip()
+    gaze_mode = str(getattr(gaze_cfg, "mode", "disable")).lower().strip()
+    use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
+    use_gaze_kl = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+    pass_to_model = bool(getattr(gaze_cfg, "pass_to_model", False))
+    compute_kl = bool(getattr(gaze_cfg, "compute_kl", False))
+    load_gaze = bool(getattr(gaze_cfg, "load_gaze", False))
 
-        use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
-        use_gaze_kl = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
-
-        pass_to_model = bool(getattr(gaze_cfg, "pass_to_model", False)) or (gaze_mode == "egvit")
-
-        compute_kl = bool(getattr(gaze_cfg, "compute_kl", False))
-        load_gaze = bool(getattr(gaze_cfg, "load_gaze", False))
-
-        use_gaze_any = bool(load_gaze or pass_to_model or compute_kl or use_gaze_kl)
-
-        return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
-
-    gaze_mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
-    gaze_mode_norm = str(gaze_mode).lower().strip()
-
-    w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
-
-    egvit = gaze_mode_norm == "egvit"
-    use_gaze_inj = gaze_mode_norm in ("guide", "align+gaze")
-
-    kl_requested = gaze_mode_norm in ("diag", "guide", "align", "align+gaze", "egvit")
-    use_gaze_kl = bool(gaze_mode_norm in ("align", "align+gaze") and (w_kl > 0.0))
-
-    pass_to_model = bool(use_gaze_inj or egvit)
-
-    use_gaze_any = bool(gaze_mode_norm != "disable") and bool(use_gaze_inj or kl_requested or egvit)
-
-    return gaze_mode_norm, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
+    use_gaze_any = bool(load_gaze or pass_to_model or compute_kl or use_gaze_kl)
+    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
 
 
 
@@ -241,17 +223,19 @@ def _build_metrics_output(
     Keys per batch:
       - Always:
           loss
-      - rcnn:
+      - ranking:
           rank_left, rank_right, label
-      - sscnn:
+      - classification:
           logits, label
-      - rsscnn:
+      - multitask:
+          rank_left, rank_right, logits, label_r, label_c
+      - multitask_gaze:
           rank_left, rank_right, logits, label_r, label_c,
           loss_kl, loss_kl_weighted, w_kl_eff, gaze_count
     """
     out: Dict[str, Any] = {"loss": float(loss.item())}
 
-    if args.model == "rcnn":
+    if args.model == "ranking":
         out.update(
             {
                 "rank_left": forward_dict["left"]["output"],
@@ -261,7 +245,7 @@ def _build_metrics_output(
         )
         return out
 
-    if args.model == "sscnn":
+    if args.model == "classification":
         out.update(
             {
                 "logits": forward_dict["logits"]["output"],
@@ -272,7 +256,7 @@ def _build_metrics_output(
         )
         return out
 
-    if args.model == "rsscnn":
+    if args.model in ("multitask", "multitask_gaze"):
         out.update(
             {
                 "rank_left": forward_dict["left"]["output"],
@@ -291,6 +275,7 @@ def _build_metrics_output(
             out["w_kl_eff"] = 0.0
             out["gaze_count"] = 0
             out["gaze_mode"] = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off")))
+            out["gaze_align_target"] = str(getattr(args, "gaze_align_target", "attention"))
             out["use_gaze_kl"] = 0.0
             return out
 
@@ -304,6 +289,7 @@ def _build_metrics_output(
         out["w_kl_eff"] = float(parts.get("w_kl_eff", 0.0))
         out["gaze_count"] = int(parts.get("gaze_count", 0))
         out["gaze_mode"] = str(parts.get("gaze_mode", getattr(args, "gaze_mode", getattr(args, "gaze", "off"))))
+        out["gaze_align_target"] = str(parts.get("gaze_align_target", getattr(args, "gaze_align_target", "attention")))
         out["use_gaze_kl"] = float(parts.get("use_gaze_kl", 0.0))
         return out
 
@@ -773,27 +759,27 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
           * Accuracy / RankAccuracy accumulate across the epoch and are finalized at EPOCH_COMPLETED.
 
     Why it exists:
-      - Different model modes (rcnn / sscnn / rsscnn) emit different outputs
+      - Different model modes (ranking / classification / multitask / multitask_gaze) emit different outputs
         (ranking scores vs classification logits), so the correct metrics must be
         attached based on args.model.
       - "full_accuracy" toggles whether ranking accuracy is computed with an
         explicit margin criterion or as a pure ordering comparison.
 
     Expected engine output dictionary keys:
-      - rcnn:   {"loss", "rank_left", "rank_right", "label", ...}
-      - sscnn:  {"loss", "logits", "label", ...}
-      - rsscnn: {"loss", "rank_left", "rank_right", "label_r", "logits", "label_c", ...}
+      - ranking:   {"loss", "rank_left", "rank_right", "label", ...}
+      - classification:  {"loss", "logits", "label", ...}
+      - multitask/multitask_gaze: {"loss", "rank_left", "rank_right", "label_r", "logits", "label_c", ...}
 
     Notes on metric names:
       - "loss"  : RunningAverage over per-iteration loss values (smoothed training curve).
-      - "acc"   : ranking accuracy (rcnn or rsscnn ranking branch).
-      - "c_acc" : classification accuracy (rsscnn classification branch only).
+      - "acc"   : ranking accuracy (ranking/multitask/multitask_gaze ranking branch).
+      - "c_acc" : classification accuracy (multitask/multitask_gaze classification branch).
     """
     for engine in engines:
         # ---------------------------------------------------------------------
-        # RCNN: ranking-only training/evaluation (no classification head metric).
+        # ranking: ranking-only training/evaluation (no classification head metric).
         # ---------------------------------------------------------------------
-        if args.model == "rcnn":
+        if args.model == "ranking":
             # RunningAverage tracks a smoothed loss over iterations for this engine.
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
 
@@ -818,9 +804,9 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             ).attach(engine, "auc")
 
         # ---------------------------------------------------------------------
-        # SSCNN: classification-only training/evaluation (no ranking metric).
+        # classification: classification-only training/evaluation (no ranking metric).
         # ---------------------------------------------------------------------
-        elif args.model == "sscnn":
+        elif args.model == "classification":
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
 
             # Standard multiclass accuracy using predicted logits vs ground-truth label.
@@ -829,9 +815,9 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             ClassificationAUC(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "auc")
 
         # ---------------------------------------------------------------------
-        # RSSCNN: ranking + classification + gaze
+        # multitask / multitask_gaze: ranking + classification, with optional gaze diagnostics
         # ---------------------------------------------------------------------
-        elif args.model == "rsscnn":
+        elif args.model in ("multitask", "multitask_gaze"):
             # 1) Loss (rolling average)
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
 
@@ -887,7 +873,7 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 
     If print_output=False → do NOT print anything (useful for test set).
     """
-    if args.model not in ["sscnn", "rsscnn"]:
+    if args.model not in ["classification", "multitask", "multitask_gaze"]:
         return None
 
     if args.ties:
@@ -1128,7 +1114,7 @@ def _make_validation_handler(
             "epoch_best_val": training_state["epoch_best_val"],
         }
 
-        if args.model in ["rcnn", "sscnn"]:
+        if args.model in ["ranking", "classification"]:
             metrics.update(
                 {
                     "auc_train": engine.state.metrics.get("auc"),
@@ -1137,7 +1123,7 @@ def _make_validation_handler(
                 }
             )
         
-        if args.model == "rsscnn":
+        if args.model in ("multitask", "multitask_gaze"):
             metrics.update(
                 {
                     "loss_kl_train": engine.state.metrics.get("loss_kl") or 0.0,
@@ -1175,11 +1161,11 @@ def _make_validation_handler(
                 "accuracy_validation": float(evaluator.state.metrics.get("acc", 0.0)),
                 "loss_validation": float(evaluator.state.metrics.get("loss", 0.0)),
             }
-            if args.model == "sscnn":
+            if args.model == "classification":
                 available["auc_validation"] = float(evaluator.state.metrics.get("auc", 0.0))
-            if args.model == "rcnn":
+            if args.model == "ranking":
                 available["auc_validation"] = float(evaluator.state.metrics.get("auc", 0.0))
-            if args.model == "rsscnn":
+            if args.model in ("multitask", "multitask_gaze"):
                 available["c_accuracy_validation"] = float(evaluator.state.metrics.get("c_acc", 0.0))
                 available["rank_auc_validation"] = float(evaluator.state.metrics.get("rank_auc", 0.0))
                 available["c_auc_validation"] = float(evaluator.state.metrics.get("c_auc", 0.0))

@@ -22,8 +22,9 @@ Expected network_output_dict structure:
   - network_output_dict["left"]["output"]   : Tensor [B] or [B,1]
   - network_output_dict["right"]["output"]  : Tensor [B] or [B,1]
   - network_output_dict["logits"]["output"] : Tensor [B, C] (if classification head exists)
-  - network_output_dict["left"]["attn_map"] : Tensor [B, H, W] (optional, for gaze KL)
-  - network_output_dict["right"]["attn_map"]: Tensor [B, H, W] (optional, for gaze KL)
+  - network_output_dict["left"]["attn_map"] : Tensor [B, H, W] (optional, for attention gaze KL)
+  - network_output_dict["right"]["attn_map"]: Tensor [B, H, W] (optional, for attention gaze KL)
+  - network_output_dict["left/right"]["token_importance"]: Tensor [B, H, W] (optional, for patch-token gaze KL)
 
 Expected labels dict structure:
   - labels["label_r"] : Tensor [B] in {-1,0,+1}
@@ -407,9 +408,10 @@ def compute_loss(
     Compute the training loss for the configured model type.
 
     Supported args.model:
-      - "rcnn"   : ranking-only
-      - "sscnn"  : classification-only
-      - "rsscnn" : ranking + classification + optional gaze KL
+      - "ranking"   : ranking-only
+      - "classification"  : classification-only
+      - "multitask" : ranking + classification
+      - "multitask_gaze" : ranking + classification + optional gaze KL
 
     Returns:
       - return_parts=False: total_loss
@@ -459,9 +461,9 @@ def compute_loss(
         )
 
     # =================================================================================
-    # 2) RCNN: ranking-only
+    # 2) ranking: ranking-only
     # =================================================================================
-    if model == "rcnn":
+    if model == "ranking":
         loss_nonties, loss_ties = compute_ranking_loss(
             network_output_dict=network_output_dict,
             labels=labels,
@@ -484,9 +486,9 @@ def compute_loss(
         return _ret(total, parts)
 
     # =================================================================================
-    # 3) SSCNN: classification-only
+    # 3) classification: classification-only
     # =================================================================================
-    if model == "sscnn":
+    if model == "classification":
         loss_class = compute_loss_classification(
             network_output_dict=network_output_dict,
             labels=labels,
@@ -497,9 +499,9 @@ def compute_loss(
         return _ret(loss_class, parts)
 
     # =================================================================================
-    # 4) RSSCNN: ranking + classification + optional gaze KL
+    # 4) multitask / multitask_gaze: ranking + classification, with optional gaze KL
     # =================================================================================
-    if model == "rsscnn":
+    if model in ("multitask", "multitask_gaze"):
         # -----------------------------------------------------------------
         # 4.1) Classification loss
         # -----------------------------------------------------------------
@@ -532,13 +534,14 @@ def compute_loss(
         gaze_cfg = getattr(args, "gaze_cfg", None)
         gaze_mode = str(getattr(gaze_cfg, "mode", normalize_gaze_mode(getattr(args, "gaze_mode", None))))
 
-        compute_kl = bool(getattr(gaze_cfg, "compute_kl", False))
-        use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
+        compute_kl = bool(getattr(gaze_cfg, "compute_kl", False)) and (model == "multitask_gaze")
+        use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) and (model == "multitask_gaze")
+        align_target = str(getattr(gaze_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))).lower().strip()
 
         if gaze_cfg is None:
             mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
-            compute_kl = bool(mode in ("diag", "guide", "align", "align+gaze", "egvit"))
-            use_kl_in_loss = bool(mode in ("align", "align+gaze") and (w_kl > 0.0))
+            compute_kl = bool(model == "multitask_gaze" and mode in ("diag", "guide", "align", "align+gaze", "egvit"))
+            use_kl_in_loss = bool(model == "multitask_gaze" and mode in ("align", "align+gaze") and (w_kl > 0.0))
 
         if not compute_kl:
             loss_kl = loss_class.new_zeros(())
@@ -550,8 +553,9 @@ def compute_loss(
                 raise KeyError("labels['has_eye_mask'] missing.")
             if ("gaze_l" not in labels) or ("gaze_r" not in labels):
                 raise KeyError("labels['gaze_l'] / labels['gaze_r'] missing.")
-            if ("attn_map" not in network_output_dict["left"]) or ("attn_map" not in network_output_dict["right"]):
-                raise KeyError("network_output_dict['left/right']['attn_map'] missing.")
+            align_key = "token_importance" if align_target == "patch_tokens" else "attn_map"
+            if (align_key not in network_output_dict["left"]) or (align_key not in network_output_dict["right"]):
+                raise KeyError(f"network_output_dict['left/right']['{align_key}'] missing.")
 
             has_eye_mask = labels["has_eye_mask"]  # BoolTensor [B]
             gaze_count = int(has_eye_mask.long().sum().item())
@@ -560,14 +564,14 @@ def compute_loss(
             if not gaze_any:
                 loss_kl = loss_class.new_zeros(())
             else:
-                attn_l = network_output_dict["left"]["attn_map"]
-                attn_r = network_output_dict["right"]["attn_map"]
-                if (attn_l is None) or (attn_r is None):
-                    raise ValueError("Attention maps are None while KL is being computed.")
+                align_l = network_output_dict["left"][align_key]
+                align_r = network_output_dict["right"][align_key]
+                if (align_l is None) or (align_r is None):
+                    raise ValueError(f"{align_key} maps are None while KL is being computed.")
 
                 loss_kl = attention_kl_loss(
-                    attn_l,
-                    attn_r,
+                    align_l,
+                    align_r,
                     labels["gaze_l"],
                     labels["gaze_r"],
                     has_mask=has_eye_mask,
@@ -599,6 +603,7 @@ def compute_loss(
             "gaze_count": gaze_count,
 
             "gaze_mode": str(gaze_mode),
+            "gaze_align_target": str(align_target),
             "compute_kl": float(compute_kl),
             "use_kl_in_loss": float(use_kl_in_loss),
 
