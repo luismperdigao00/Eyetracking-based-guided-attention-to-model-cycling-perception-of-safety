@@ -1,63 +1,67 @@
-# Perceived Safety Model Inspector
+# Perceived Safety App
 
-Local deployment app for inspecting the pairwise perceived-safety model. The default run is `no5x7zgf` with the best checkpoint.
+This app lets you inspect a perceived-safety model for street-level view images. You can upload any single street-level image to get a perceived safety score, or upload two images to compare which one the model considers safer. The app also generates visual explanations, including attention maps and Grad-CAM heatmaps, to show which image regions contributed to the model prediction.
 
-Run:
+## Launch the app
+
+From the repository root, run:
 
 ```bash
 /home/csantiago/.venv/bin/python deployment_app/app.py --port 8765
 ```
 
-Keep that terminal open while using the app. Open `http://127.0.0.1:8765`. Use `Dataset`, `Seed`, or `Row position` to choose a random or fixed comparison. Each analysis saves originals, overlays, heatmaps, and `metadata.json` under:
+Keep the terminal open while using the app, then open:
 
 ```text
-/home/csantiago/deployment_outputs/perceived_safety_app/
+http://127.0.0.1:8765
 ```
 
-## Stop the app
+To stop it, click **Stop Server** in the app or press `Ctrl+C` in the terminal.
 
-Click **Stop Server** in the top-right corner of the app. You can also return to the terminal where it is running and press `Ctrl+C`.
+If port `8765` is already busy, start it on another port:
 
-If startup reports `OSError: [Errno 98] Address already in use`, an app is already using port `8765`. Open the existing app, stop it, or start this app on another port such as `--port 8766`.
+```bash
+/home/csantiago/.venv/bin/python deployment_app/app.py --port 8766
+```
 
-## Grad-CAM targets:
+Outputs are saved under:
 
-- `branch_score`: explains each image safety score independently. Best default for unsafe-area inspection.
-- `rank_margin`: explains the predicted pairwise decision margin.
-- `pair_predicted_logit`: explains the predicted classification logit when available.
+```text
+/deployment_outputs/perceived_safety_app/
+```
 
-Grad-CAM variants: `positive`, `negative`, `absolute`, and `signed`.
+## What you can upload
 
+Use the upload panel for either:
 
-## Upload a Lisbon image
+- A single street-level image: the app returns one perceived safety score and visual cues for that image.
+- Two street-level images: the app compares them, predicts which side is safer, and generates visual explanations for both images.
 
-Open the app and use the **Upload A Lisbon Image** panel. Choose your local street photo, optionally enter the street/place name, and click **Analyze Upload**. This mode runs the single-image ranking branch and saves `uploaded_original.png`, Raw/Rollout overlays, Grad-CAM variants, and `metadata.json`.
+## Grad-CAM target
 
-The upload mode reports a single safety score. Pairwise safer-side classification still requires two images, so use the comparison panel for the original left-vs-right task.
+The **Grad-CAM target** controls which model output the heatmap explains:
 
-
-## Heatmap colors
-
-- Raw and Rollout: brighter/yellower means more attention mass.
-- Grad-CAM positive: stronger positive evidence for the safety score.
-- Grad-CAM negative: stronger negative evidence for the safety score.
-- Grad-CAM absolute: strong evidence in either direction.
-- Grad-CAM signed: blue decreases safety, red increases safety.
-
-Click any heatmap thumbnail in the app to open a large viewer with its colormap legend, then use browser back to return.
-
-
-## Upload a Lisbon comparison
-
-Use the **Comparison** form under **Upload Lisbon Images**. Provide one left image and one right image, then click **Analyze Comparison**. This runs the full pairwise model, reports the safer side from the ranking scores, includes the classification probability when available, and saves both sides' Raw, Rollout, and Grad-CAM overlays.
-
+- `branch_score`: explains the safety score for each image independently. This is the best default for understanding what makes one image look safer or less safe.
+- `rank_margin`: explains the difference between the two image scores in a pairwise comparison.
+- `pair_predicted_logit`: explains the pairwise classification logit when that output is available.
 
 ## Grad-CAM source
 
-The app has a **Grad-CAM source** selector:
+The **Grad-CAM source** controls where the explanation is extracted from inside the model:
 
-- `attention`: final-attention Grad-CAM over CLS-to-patch attention. This matches the original implementation.
-- `patch_tokens`: token Grad-CAM over patch tokens leaving the final transformer layer. This is most meaningful for models trained with patch/global-average pooling rather than pure CLS pooling.
-- `both`: exports and displays both families.
+- `attention`: Grad-CAM over final CLS-to-patch attention. This matches the original attention-based implementation.
+- `patch_tokens`: Grad-CAM over the final transformer patch tokens. This is useful for models that rely on patch/global-average pooling.
+- `both`: generates both attention-based and patch-token Grad-CAM outputs.
 
-Token Grad-CAM uses patch tokens as the activation map and gradients of the selected target with respect to those tokens.
+## Heatmap meaning
+
+The app can generate several heatmap types:
+
+- Raw attention: brighter regions received more direct model attention.
+- Rollout attention: brighter regions were more influential after attention is propagated through layers.
+- Grad-CAM positive: regions that increased the selected target, such as a higher safety score.
+- Grad-CAM negative: regions that decreased the selected target, such as evidence against safety.
+- Grad-CAM absolute: regions with strong influence in either direction.
+- Grad-CAM signed: red regions increase the target, while blue regions decrease it.
+
+Click a heatmap thumbnail in the app to open a larger view with its color legend.
