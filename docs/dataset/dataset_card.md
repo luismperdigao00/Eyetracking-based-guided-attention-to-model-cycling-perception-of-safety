@@ -2,34 +2,15 @@
 
 ## Summary
 
-EG-PCS contains pairwise perceived cycling safety comparisons, street-view image pairs, and fixation-based gaze maps from an eye-tracking experiment. The dataset supports research on subjective urban safety, pairwise visual ranking, gaze-guided learning, and human-aligned attention models.
+EG-PCS supports research on perceived cycling safety from street-level imagery. The dataset is organized around pairwise judgments: each instance compares a left and right street-level image and records which image was perceived as safer, or whether the pair was judged as similarly safe.
 
-## Dataset Formation
+This card focuses on responsible interpretation and use. For dataset counts, file layout, DOI, and a visual example, see [`README.md`](README.md).
 
-The dataset was formed from 249 survey responses, including 26 surveys collected with eye-tracking technology. Participants evaluated perceived cycling accident safety across different street-view environments using pairwise image comparisons. The eye-tracking subset provides fixation-derived gaze annotations for 1,419 comparisons.
+## Data instances
 
-<p align="center">
-  <img src="../example_trial.png" alt="Example eye-tracking survey trial with gaze maps overlaid on the two compared images" width="800">
-</p>
+Each row in the comparison table represents one pairwise judgment between two street-level images. Rows include the perceived-safety label, image references, optional gaze-map references for the eye-tracking subset, and anonymized survey/trial metadata.
 
-The example above shows one eye-tracking trial used as part of the dataset foundation, with gaze maps overlaid on the two compared street-view images.
-
-## Composition
-
-| Dataset subset | y=-1 | y=0 | y=1 | Total | Gaze subset |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Barcelona | 389 | 334 | 430 | 1,153 | -- |
-| Berlin | 2,905 | 1,363 | 3,002 | 7,270 | 999 |
-| London UK Collideoscope | 204 | 171 | 184 | 559 | -- |
-| London UK Gov | 184 | 184 | 191 | 559 | -- |
-| Munich | 198 | 107 | 228 | 533 | -- |
-| Paris | 176 | 179 | 194 | 549 | -- |
-| Sequences | 627 | 1,487 | 886 | 3,000 | 420 |
-| **Total** | **4,683** | **3,825** | **5,115** | **13,623** | **1,419** |
-
-## Data Instances
-
-Each row in the comparison table represents one pairwise judgment between a left street-view image and a right street-view image. Rows include the perceived safety label, image references, optional gaze-map references, and anonymized survey/trial metadata.
+The dataset should be treated as a pairwise preference dataset rather than an absolute safety audit. A label indicates the relative perceived safety of two images shown in the survey context.
 
 ## Labels
 
@@ -39,21 +20,37 @@ The `score` field is the pairwise ground-truth label:
 - `0`: both images are perceived as similarly safe.
 - `+1`: the right image is perceived as safer.
 
-## Gaze Maps
+These labels capture perceived cycling accident safety, not measured crash risk.
 
-Gaze maps are released as NumPy `.npy` arrays derived from fixation data. They represent visual attention during the perceived-safety comparison task and are intended for gaze-guided training, attention-alignment evaluation, and interpretability analysis.
+## Gaze maps
 
-## Intended Uses
+The eye-tracking subset includes fixation-derived gaze maps stored as NumPy `.npy` arrays. These maps represent where participants looked while making the pairwise safety judgment.
+
+They are suitable for gaze-guided training, attention-alignment evaluation, and interpretability experiments. They should not be treated as complete causal explanations of perceived safety, because fixation patterns are task-dependent and may reflect attention, uncertainty, salience, or comparison strategy.
+
+## Intended uses
 
 - Pairwise perceived cycling safety prediction.
 - Gaze-guided computer vision experiments.
 - Attention-alignment and interpretability studies.
-- Urban perception research using street-view imagery.
+- Urban perception research using street-level imagery.
+- Benchmarking models that combine visual ranking with human attention signals.
+
+## Out-of-scope uses
+
+- Making high-stakes decisions about individual people.
+- Claiming direct measurement of objective crash risk from the labels alone.
+- Treating gaze maps as exhaustive explanations for why a place is safe or unsafe.
+- Ranking cities, neighborhoods, or communities without additional context and validation.
 
 ## Limitations
 
-The labels reflect perceived safety judgments collected in a specific survey setting. They may be influenced by participant demographics, city coverage, image-source coverage, and street-view capture conditions. Gaze maps represent attention during the task and should not be interpreted as complete causal explanations of perceived safety.
+The labels reflect subjective judgments collected in a specific survey setting. They may be influenced by participant demographics, city and image-source coverage, weather, lighting, street-view capture conditions, and the visual context presented in each pair.
 
-## Ethics and Privacy
+The city subsets are not uniform samples of all cycling environments. Model performance on this dataset may not transfer directly to unseen cities, countries, infrastructure types, or image sources without additional validation.
 
-The underlying survey was approved by Instituto Superior Técnico’s Ethics Committee and captured perceived cycling accident safety in different environments using pairwise image comparisons. The public dataset uses anonymized survey/trial metadata and derived gaze maps. It is not intended for identifying individual study participants or for making high-stakes decisions about individual people.
+## Ethics and privacy
+
+The underlying survey was approved by Instituto Superior Tecnico Ethics Committee. The public dataset uses anonymized survey/trial metadata and derived gaze maps. It is not intended for identifying individual study participants.
+
+When using the dataset, report the subjective nature of the labels, the presence or absence of gaze annotations, and any filtering or city-specific evaluation choices that could affect conclusions.
