@@ -37,21 +37,39 @@ Use the upload panel for either:
 - A single street-level image: the app returns one perceived safety score and visual cues for that image.
 - Two street-level images: the app compares them, predicts which side is safer, and generates visual explanations for both images.
 
-## Grad-CAM target
+## Choose a trained model
 
-The **Grad-CAM target** controls which model output the heatmap explains:
+The app shows a **Trained model** dropdown so non-technical users do not need to type W&B run IDs. The standard choices are:
 
-- `branch_score`: explains the safety score for each image independently. This is the best default for understanding what makes one image look safer or less safe.
-- `rank_margin`: explains the difference between the two image scores in a pairwise comparison.
-- `pair_predicted_logit`: explains the pairwise classification logit when that output is available.
+- `2v27tcrz`: EG-PCS-Net, trained on Berlin, gazefrac=1.
+- `g0qvoywf`: EG-PCS-Net, trained on Berlin, gazefrac=0.7.
+- `eyspby9v`: EG-PCS-Net, trained on multiple cities, gazefrac=1.
+- `5062xuio`: Baseline, trained on Berlin.
+- `b6r8bm6l`: GII-ViT, trained on Berlin, gazefrac=1.
+- `6hi41xoa`: EG-ViT, trained on Berlin, gazefrac=1.
 
-## Grad-CAM source
+To use another run, paste its ID into **Custom run ID**. If that field is filled, it overrides the dropdown.
 
-The **Grad-CAM source** controls where the explanation is extracted from inside the model:
+## Grad-CAM controls
 
-- `attention`: Grad-CAM over final CLS-to-patch attention. This matches the original attention-based implementation.
-- `patch_tokens`: Grad-CAM over the final transformer patch tokens. This is useful for models that rely on patch/global-average pooling.
-- `both`: generates both attention-based and patch-token Grad-CAM outputs.
+The app has two Grad-CAM controls. They answer two different questions:
+
+- **Grad-CAM explains** chooses the model output being explained.
+- **Map type** chooses where the Grad-CAM map is extracted from inside the transformer.
+
+### Grad-CAM explains
+
+- `branch_score`: explains the ranking-branch safety score for each image independently. This is the best default for understanding what makes one image look safer or less safe. In single-image upload mode, this is the only available target.
+- `rank_margin`: explains the pairwise ranking margin, meaning why the model score favors one image over the other. This is only meaningful for image comparisons.
+- `pair_predicted_logit`: explains the pairwise classification output for the predicted safer side when that output is available. This is only meaningful for image comparisons.
+
+### Map type
+
+Raw attention and rollout attention are shown separately. **Map type** only controls which Grad-CAM family is generated:
+
+- `attention`: final-attention Grad-CAM. This uses gradients on the final layer CLS-to-patch attention map and matches the original attention-based implementation.
+- `patch_tokens`: patch-token Grad-CAM. This uses gradients on the final transformer patch-token embeddings and is most meaningful for patch/global-average pooling models.
+- `both`: exports both Grad-CAM families, so the result page shows the attention Grad-CAM maps and the Token Grad-CAM maps.
 
 ## Heatmap meaning
 

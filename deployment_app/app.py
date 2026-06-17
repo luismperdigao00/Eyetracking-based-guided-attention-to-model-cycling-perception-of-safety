@@ -36,7 +36,16 @@ REPO_ROOT = Path("/home/csantiago").resolve()
 ANALYSIS_SCRIPT = REPO_ROOT / "Analysis" / "5.checkpoint_eval_accuracy_and_saliency.py"
 OUTPUT_ROOT = REPO_ROOT / "deployment_outputs" / "perceived_safety_app"
 
-DEFAULT_RUN_ID = "no5x7zgf"
+DEFAULT_RUN_ID = "2v27tcrz"
+TRAINED_MODEL_OPTIONS = (
+    ("2v27tcrz", "EG-PCS-Net, trained on Berlin, gazefrac=1"),
+    ("g0qvoywf", "EG-PCS-Net, trained on Berlin, gazefrac=0.7"),
+    ("eyspby9v", "EG-PCS-Net, trained on multiple cities, gazefrac=1"),
+    ("5062xuio", "Baseline, trained on Berlin"),
+    ("b6r8bm6l", "GII-ViT, trained on Berlin, gazefrac=1"),
+    ("6hi41xoa", "EG-ViT, trained on Berlin, gazefrac=1"),
+)
+TRAINED_MODEL_LABELS = dict(TRAINED_MODEL_OPTIONS)
 DEFAULT_CHECKPOINT_KIND = "best"
 DEFAULT_DATASET = "berlin"
 DEFAULT_RANDOM_SEED = None
@@ -52,6 +61,28 @@ GRADCAM_SOURCE_OPTIONS = ("attention", "patch_tokens", "both")
 OVERLAY_ALPHA = 0.52
 HEATMAP_SIZE = 520
 MAP_EPS = 1e-8
+
+REFERENCE_SCORE_RUN_ID = "n7xroowm"
+REFERENCE_SCORE_SPLIT = "splits/comparisons_df.pickle"
+REFERENCE_SCORE_STATS = {
+    "min": -4.55092191696167,
+    "max": 4.994133949279785,
+    "mean": 1.1248155138136906,
+    "std": 2.342709850688805,
+    "percentiles": {
+        0: -4.55092191696167,
+        1: -3.875497341156006,
+        5: -3.0973453521728516,
+        10: -2.3592817783355713,
+        25: -0.6612088680267334,
+        50: 1.3995505571365356,
+        75: 3.121710419654846,
+        90: 4.0767998695373535,
+        95: 4.407219886779785,
+        99: 4.712733745574951,
+        100: 4.994133949279785,
+    },
+}
 
 
 @dataclass
@@ -726,8 +757,22 @@ def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
     return Image.open(BytesIO(image_bytes)).convert("RGB"), str(getattr(file_item, "filename", ""))
 
 
+def selected_run_id_from_form(form) -> str:
+    custom_run_id = str(form.getfirst("custom_run_id", "") or "").strip()
+    if custom_run_id:
+        return custom_run_id
+    return str(form.getfirst("run_id", DEFAULT_RUN_ID) or DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
+
+
+def selected_run_id_from_params(params: dict) -> str:
+    custom_run_id = str(params.get("custom_run_id", [""])[0] or "").strip()
+    if custom_run_id:
+        return custom_run_id
+    return str(params.get("run_id", [DEFAULT_RUN_ID])[0] or DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
+
+
 def analyze_upload_comparison(form) -> dict:
-    run_id = form_get(form, "run_id", DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
+    run_id = selected_run_id_from_form(form)
     checkpoint_kind = form_get(form, "checkpoint_kind", DEFAULT_CHECKPOINT_KIND).strip().lower() or DEFAULT_CHECKPOINT_KIND
     checkpoint_path = form_get(form, "checkpoint_path", "").strip()
     gradcam_target = form_get(form, "gradcam_target", DEFAULT_GRADCAM_TARGET).strip().lower() or DEFAULT_GRADCAM_TARGET
@@ -807,7 +852,7 @@ def analyze_upload(form) -> dict:
     if upload_mode == "comparison":
         return analyze_upload_comparison(form)
 
-    run_id = form_get(form, "run_id", DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
+    run_id = selected_run_id_from_form(form)
     checkpoint_kind = form_get(form, "checkpoint_kind", DEFAULT_CHECKPOINT_KIND).strip().lower() or DEFAULT_CHECKPOINT_KIND
     checkpoint_path = form_get(form, "checkpoint_path", "").strip()
     gradcam_target = form_get(form, "gradcam_target", DEFAULT_GRADCAM_TARGET).strip().lower() or DEFAULT_GRADCAM_TARGET
@@ -872,7 +917,7 @@ def paths_for_json(value):
 
 
 def analyze(params: dict) -> dict:
-    run_id = str(params.get("run_id", [DEFAULT_RUN_ID])[0] or DEFAULT_RUN_ID).strip()
+    run_id = selected_run_id_from_params(params)
     checkpoint_kind = str(params.get("checkpoint_kind", [DEFAULT_CHECKPOINT_KIND])[0] or DEFAULT_CHECKPOINT_KIND).strip().lower()
     checkpoint_path = str(params.get("checkpoint_path", [""])[0] or "").strip()
     dataset = str(params.get("dataset", [DEFAULT_DATASET])[0] or DEFAULT_DATASET).strip()
@@ -960,6 +1005,32 @@ def fmt_pct(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{100.0 * float(value):.2f}%"
 
 
+def reference_score_percentile(value: Optional[float]) -> Optional[float]:
+    if value is None or not np.isfinite(float(value)):
+        return None
+    pairs = sorted((float(v), float(k)) for k, v in REFERENCE_SCORE_STATS["percentiles"].items())
+    score_values = np.array([p[0] for p in pairs], dtype=float)
+    pct_values = np.array([p[1] for p in pairs], dtype=float)
+    return float(np.interp(float(value), score_values, pct_values, left=0.0, right=100.0))
+
+
+def score_context_html(value: Optional[float]) -> str:
+    if value is None or not np.isfinite(float(value)):
+        return '<div class="v">n/a</div>'
+    val = float(value)
+    lo = float(REFERENCE_SCORE_STATS["min"])
+    hi = float(REFERENCE_SCORE_STATS["max"])
+    pos = 50.0 if hi <= lo else 100.0 * (val - lo) / (hi - lo)
+    pos = max(0.0, min(100.0, pos))
+    return (
+        '<div class="score-context">'
+        f'<div class="score-value-row"><span class="score-num">{fmt_float(val)}</span></div>'
+        f'<div class="score-bar" aria-label="Score position in reference distribution"><span class="score-marker" style="left:{pos:.2f}%"></span></div>'
+        f'<div class="score-scale"><span>low {fmt_float(lo, 2)}</span><span>median {fmt_float(REFERENCE_SCORE_STATS["percentiles"][50], 2)}</span><span>high {fmt_float(hi, 2)}</span></div>'
+        '</div>'
+    )
+
+
 def render_layout(title: str, body: str) -> bytes:
     css = """
     :root { color-scheme: light; --ink:#18212f; --muted:#667085; --line:#d8dee8; --bg:#f5f7fb; --panel:#ffffff; --accent:#22577a; }
@@ -992,6 +1063,12 @@ def render_layout(title: str, body: str) -> bytes:
     .metric { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fbfcfe; }
     .metric .k { color: var(--muted); font-size: 12px; font-weight: 650; }
     .metric .v { font-size: 18px; font-weight: 760; margin-top: 3px; }
+    .score-context { display: grid; gap: 6px; margin-top: 4px; }
+    .score-value-row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+    .score-value-row .score-num { font-size: 18px; font-weight: 760; }
+    .score-bar { position: relative; height: 9px; border-radius: 999px; background: linear-gradient(90deg, #9b2f2f 0%, #f2c94c 50%, #28745a 100%); border: 1px solid rgba(24,33,47,0.18); }
+    .score-marker { position: absolute; top: 50%; width: 13px; height: 13px; border-radius: 999px; background: #fff; border: 2px solid var(--ink); transform: translate(-50%, -50%); box-shadow: 0 1px 5px rgba(24,33,47,0.25); }
+    .score-scale { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 10px; line-height: 1.2; }
     .sides { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
     .side { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
     .source-images { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-bottom: 10px; }
@@ -1024,7 +1101,7 @@ def render_layout(title: str, body: str) -> bytes:
     """
     html_doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)}</title><style>{css}</style></head>
-<body><header><div class="wrap"><div class="header-row"><div><h1>Perceived Safety Model Inspector</h1><div class="sub">Run {html.escape(DEFAULT_RUN_ID)} by default. Outputs are written to {html.escape(str(OUTPUT_ROOT))}.</div></div><form class="shutdown-form" method="post" action="/shutdown" onsubmit="return confirm(&quot;Stop the local app server?&quot;);"><button class="shutdown-button" type="submit">Stop Server</button></form></div></div></header><main class="wrap">{body}</main></body></html>"""
+<body><header><div class="wrap"><div class="header-row"><div><h1>Perceived Safety Model Inspector</h1><div class="sub">Default model: {html.escape(trained_model_label(DEFAULT_RUN_ID))}. Outputs are written to {html.escape(str(OUTPUT_ROOT))}.</div></div><form class="shutdown-form" method="post" action="/shutdown" onsubmit="return confirm(&quot;Stop the local app server?&quot;);"><button class="shutdown-button" type="submit">Stop Server</button></form></div></div></header><main class="wrap">{body}</main></body></html>"""
     return html_doc.encode("utf-8")
 
 
@@ -1074,6 +1151,29 @@ def gradcam_source_label(value: str) -> str:
     return labels.get(str(value), str(value))
 
 
+def trained_model_label(run_id: str) -> str:
+    return TRAINED_MODEL_LABELS.get(str(run_id), str(run_id))
+
+
+def model_select_options(selected_run_id: str) -> str:
+    selected = selected_run_id if selected_run_id in TRAINED_MODEL_LABELS else DEFAULT_RUN_ID
+    return "".join(
+        f'<option value="{html.escape(run_id)}" {"selected" if run_id == selected else ""}>{html.escape(label)} ({html.escape(run_id)})</option>'
+        for run_id, label in TRAINED_MODEL_OPTIONS
+    )
+
+
+def model_controls_html(selected_run_id: str = DEFAULT_RUN_ID, custom_run_id: str = "") -> str:
+    selected_run_id = str(selected_run_id or DEFAULT_RUN_ID).strip()
+    custom_run_id = str(custom_run_id or "").strip()
+    if not custom_run_id and selected_run_id not in TRAINED_MODEL_LABELS:
+        custom_run_id = selected_run_id
+    return (
+        f'<label>Trained model<select name="run_id">{model_select_options(selected_run_id)}</select></label>'
+        f'<label>Custom run ID<input name="custom_run_id" value="{html.escape(custom_run_id)}" placeholder="optional W&amp;B run id"></label>'
+    )
+
+
 def select_options(values, selected: str, label_func) -> str:
     selected = str(selected or "")
     return "".join(
@@ -1086,7 +1186,8 @@ def render_form(params: Optional[dict] = None) -> str:
     params = params or {}
     datasets = available_datasets()
     dataset_value = str(params.get("dataset", [DEFAULT_DATASET])[0] if params else DEFAULT_DATASET)
-    run_id = str(params.get("run_id", [DEFAULT_RUN_ID])[0] if params else DEFAULT_RUN_ID)
+    run_id = selected_run_id_from_params(params) if params else DEFAULT_RUN_ID
+    custom_run_id = str(params.get("custom_run_id", [""])[0] if params else "")
     ckpt_kind = str(params.get("checkpoint_kind", [DEFAULT_CHECKPOINT_KIND])[0] if params else DEFAULT_CHECKPOINT_KIND)
     target = str(params.get("gradcam_target", [DEFAULT_GRADCAM_TARGET])[0] if params else DEFAULT_GRADCAM_TARGET)
     source = str(params.get("gradcam_source", [DEFAULT_GRADCAM_SOURCE])[0] if params else DEFAULT_GRADCAM_SOURCE)
@@ -1097,11 +1198,12 @@ def render_form(params: Optional[dict] = None) -> str:
     target_options = select_options(GRADCAM_TARGET_OPTIONS, target, gradcam_target_label)
     kind_options = "".join(f"<option value=\"{k}\" {'selected' if k == ckpt_kind else ''}>{k}</option>" for k in ("best", "last"))
     source_options = select_options(GRADCAM_SOURCE_OPTIONS, source, gradcam_source_label)
+    model_controls = model_controls_html(run_id, custom_run_id)
     return f"""
 <section class="panel">
 <div class="section-head"><h2>Compare Saved Images</h2><span>Choose an existing dataset pair.</span></div>
 <form method="get" action="/analyze">
-<label>Run ID<input name="run_id" value="{html.escape(run_id)}"></label>
+{model_controls}
 <label>Checkpoint<select name="checkpoint_kind">{kind_options}</select></label>
 <label>Dataset<select name="dataset">{dataset_options}</select></label>
 <label>Seed<input name="seed" value="{html.escape(seed)}" placeholder="random"></label>
@@ -1127,7 +1229,7 @@ def render_upload_form(mode: str = "single") -> str:
             f'  <div class="section-head"><h2>Compare Uploaded Urban Images</h2><span>Any street, plaza, road, or built-environment scene.</span></div>\n'
             f'  <form method="post" action="/upload" enctype="multipart/form-data">\n'
             f'    <input type="hidden" name="upload_mode" value="comparison">\n'
-            f'    <label>Run ID<input name="run_id" value="{html.escape(DEFAULT_RUN_ID)}"></label>\n'
+            f'    {model_controls_html(DEFAULT_RUN_ID)}\n'
             f'    <label>Checkpoint<select name="checkpoint_kind">{kind_options}</select></label>\n'
             f'    <label>Place / note<input name="street_name" placeholder="optional"></label>\n'
             f'    <label>Grad-CAM explains<select name="gradcam_target">{target_options}</select></label>\n'
@@ -1144,7 +1246,7 @@ def render_upload_form(mode: str = "single") -> str:
         f'  <div class="section-head"><h2>Analyze One Urban Image</h2><span>Use an image from your computer.</span></div>\n'
         f'  <form method="post" action="/upload" enctype="multipart/form-data">\n'
         f'    <input type="hidden" name="upload_mode" value="single">\n'
-        f'    <label>Run ID<input name="run_id" value="{html.escape(DEFAULT_RUN_ID)}"></label>\n'
+        f'    {model_controls_html(DEFAULT_RUN_ID)}\n'
         f'    <label>Checkpoint<select name="checkpoint_kind">{kind_options}</select></label>\n'
         f'    <label>Place / note<input name="street_name" placeholder="optional"></label>\n'
         f'    <label>Grad-CAM explains<select name="gradcam_target">{single_target_options}</select></label>\n'
@@ -1268,8 +1370,8 @@ def render_results(result: dict, params: dict) -> bytes:
 <section class="panel"><h2>Selected Comparison</h2><div class="summary">
 <div class="metric"><div class="k">Prediction</div><div class="v">{safer_label} safer</div></div>
 <div class="metric"><div class="k">Human label</div><div class="v">{html.escape(actual)}</div></div>
-<div class="metric"><div class="k">Left score</div><div class="v">{fmt_float(pred['left_safety_score'])}</div></div>
-<div class="metric"><div class="k">Right score</div><div class="v">{fmt_float(pred['right_safety_score'])}</div></div>
+<div class="metric"><div class="k">Left score</div>{score_context_html(pred['left_safety_score'])}</div>
+<div class="metric"><div class="k">Right score</div>{score_context_html(pred['right_safety_score'])}</div>
 <div class="metric"><div class="k">P(right safer)</div><div class="v">{fmt_pct(pred['classification_prob_right_safer'])}</div></div>
 </div><div class="links"><a class="button" href="{html.escape(output_url(result['metadata_path']))}">Metadata JSON</a><span class="mono">{html.escape(str(result['run_dir']))}</span></div></section>"""
     side_sections = []
@@ -1302,7 +1404,7 @@ def render_upload_results(result: dict) -> bytes:
     body = mode_nav("single") + f"""
 <section class=\"panel\"><h2>Uploaded Image Result</h2>
   <div class=\"summary\">
-    <div class=\"metric\"><div class=\"k\">Safety score</div><div class=\"v\">{fmt_float(pred['safety_score'])}</div></div>
+    <div class=\"metric\"><div class=\"k\">Safety score</div>{score_context_html(pred['safety_score'])}</div>
     <div class=\"metric\"><div class=\"k\">Place</div><div class=\"v\">{html.escape(str(meta['street_name']))}</div></div>
     <div class=\"metric\"><div class=\"k\">Mode</div><div class=\"v\">Single image</div></div>
   </div>
