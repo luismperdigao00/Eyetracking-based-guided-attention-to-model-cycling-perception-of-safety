@@ -96,43 +96,13 @@ Grad-CAM needs a target: the exact model output we want to explain. EG-PCS-Net h
 
 ### Grad-CAM Targets
 
-Grad-CAM takes the gradient of one scalar target with respect to the final attention map. In short:
-
-```text
-Grad-CAM map = what changes the selected target T
-```
-
-In single-image mode, the target is always the image's ranking-branch safety score.
+Grad-CAM explains one selected model output at a time. In single-image mode, it explains the image's ranking-branch safety score.
 
 In comparison mode, the **Grad-CAM target** menu has three options:
 
-- **Each image safety score**: explains the ranking score of each image separately.
-
-```text
-left map:  T = s_left
-right map: T = s_right
-```
-
-Use this when you want to know what makes each individual image look safer or less safe, without explaining the left-vs-right decision.
-
-- **Ranking-branch winner**: explains why the ranking branch prefers the image with the higher safety score.
-
-```text
-if s_left >= s_right: T = s_left - s_right
-if s_right > s_left: T = s_right - s_left
-```
-
-This is not a subtraction between two finished Grad-CAM maps. The subtraction is inside the target first, then the app computes gradients from that target.
-
-- **Classification-branch winner**: explains the classification branch's predicted comparison class after the two descriptors are concatenated.
-
-```text
-z_left, z_right = classification logits before softmax
-predicted = argmax(z_left, z_right)
-T = z_predicted
-```
-
-This uses the pre-softmax logit, not the probability after softmax. Use it when you want to explain the direct left-vs-right classification decision.
+- **Each image safety score**: explains each image's own ranking-branch score independently. Use this to see what makes each image look safer or less safe, without explaining the left-vs-right decision.
+- **Ranking-branch winner**: explains why the ranking branch prefers the image with the higher safety score. This is not a subtraction between two finished Grad-CAM maps; the app first builds one ranking-margin target, then computes Grad-CAM from that target.
+- **Classification-branch winner**: explains the classification branch's predicted left-vs-right decision after the two descriptors are concatenated. This uses the winning pre-softmax logit, not the probability after softmax.
 
 For each Grad-CAM target, the app shows four views:
 

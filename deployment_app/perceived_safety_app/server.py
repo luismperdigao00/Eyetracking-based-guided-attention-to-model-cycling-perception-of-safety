@@ -823,9 +823,9 @@ def render_single_page() -> bytes:
 
 def gradcam_target_label(value: str) -> str:
     labels = {
-        "branch_score": "Ranking branch safety score (each image independently)",
-        "rank_margin": "Pairwise ranking margin (why one image wins)",
-        "pair_predicted_logit": "Classification branch predicted side (left vs right)",
+        "branch_score": "Each image safety score",
+        "rank_margin": "Ranking-branch winner",
+        "pair_predicted_logit": "Classification-branch winner",
     }
     return labels.get(str(value), str(value))
 
@@ -884,7 +884,7 @@ def render_upload_form(mode: str = "single") -> str:
     <input type="hidden" name="upload_mode" value="comparison">
     {model_controls_html(DEFAULT_RUN_ID)}
     <label>Place / note<input name="street_name" placeholder="optional"></label>
-    <label>Grad-CAM explains<select name="gradcam_target">{target_options}</select></label>
+    <label>Grad-CAM target<select name="gradcam_target">{target_options}</select></label>
     <label>Left image<input type="file" name="upload_left_image" accept="image/*" required></label>
     <label>Right image<input type="file" name="upload_right_image" accept="image/*" required></label>
     {weights_upload_control()}
