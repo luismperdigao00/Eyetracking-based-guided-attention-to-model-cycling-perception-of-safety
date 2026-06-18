@@ -71,39 +71,74 @@ Use the upload panel for either:
 
 The app is upload-only. It no longer includes saved dataset comparison mode, so it does not need the original street-image dataset.
 
-## Choose a trained model
+## Choose Trained Weights
 
-The app shows a **Trained model** dropdown so non-technical users do not need to type internal model IDs. The standard choices are only EG-PCS-Net / DINOv3 runs:
+The app includes several trained weights for the proposed EG-PCS-Net framework:
 
-- `2v27tcrz`: EG-PCS-Net / DINOv3, trained on Berlin, gazefrac=1.
-- `g0qvoywf`: EG-PCS-Net / DINOv3, trained on Berlin, gazefrac=0.7.
-- `eyspby9v`: EG-PCS-Net / DINOv3, trained on multiple cities, gazefrac=1.
+- `2v27tcrz`: trained on Berlin, gazefrac=1.
+- `g0qvoywf`: trained on Berlin, gazefrac=0.7.
+- `eyspby9v`: trained on multiple cities, gazefrac=1.
 
-Each selected model uses its bundled **best** checkpoint by default. You can also upload a compatible `.pt` or `.pth` weights file in the interface; the app will use the selected model's configuration and the uploaded weights for that request.
+The dropdown selects which trained weights to use. You can also upload a compatible `.pt` or `.pth` weights file in the interface.
 
-## Grad-CAM controls
+## Visual explanations
 
-For image comparisons, the app has one Grad-CAM control:
+The app displays several visual interpretability maps for each uploaded image:
 
-- **Grad-CAM explains** chooses the model output being explained.
+- **Raw attention**: where the final transformer attention looks directly.
+- **Attention rollout**: how attention influence accumulates through the transformer layers.
+- **Grad-CAM**: which regions push a selected model output up or down.
 
-For single-image analysis, this control is hidden because the app always explains the ranking-branch safety score.
+Grad-CAM needs a target: the exact model output we want to explain. EG-PCS-Net has two decision paths:
 
-### Grad-CAM explains
+- The **ranking branch** processes each image descriptor independently and outputs one perceived-safety score per image.
+- The **classification branch** concatenates the two image descriptors and outputs two comparison logits: left image safer vs. right image safer.
 
-- `branch_score`: explains the ranking-branch safety score for each image independently. This is the best default for understanding what makes one image look safer or less safe. In single-image upload mode, this is the only available target.
-- `rank_margin`: explains the pairwise ranking margin, meaning why the model score favors one image over the other. This is only meaningful for image comparisons.
-- `pair_predicted_logit`: explains the pairwise classification output for the predicted safer side when that output is available. This is only meaningful for image comparisons.
+### Grad-CAM Targets
 
-## Heatmap meaning
+Grad-CAM takes the gradient of one scalar target with respect to the final attention map. In short:
 
-The app can generate several heatmap types:
+```text
+Grad-CAM map = what changes the selected target T
+```
 
-- Raw attention: brighter regions received more direct model attention.
-- Rollout attention: brighter regions were more influential after attention is propagated through layers.
-- Grad-CAM positive: regions that increased the selected target, such as a higher safety score.
-- Grad-CAM negative: regions that decreased the selected target, such as evidence against safety.
-- Grad-CAM absolute: regions with strong influence in either direction.
-- Grad-CAM signed: red regions increase the target, while blue regions decrease it.
+In single-image mode, the target is always the image's ranking-branch safety score.
+
+In comparison mode, the **Grad-CAM target** menu has three options:
+
+- **Each image safety score**: explains the ranking score of each image separately.
+
+```text
+left map:  T = s_left
+right map: T = s_right
+```
+
+Use this when you want to know what makes each individual image look safer or less safe, without explaining the left-vs-right decision.
+
+- **Ranking-branch winner**: explains why the ranking branch prefers the image with the higher safety score.
+
+```text
+if s_left >= s_right: T = s_left - s_right
+if s_right > s_left: T = s_right - s_left
+```
+
+This is not a subtraction between two finished Grad-CAM maps. The subtraction is inside the target first, then the app computes gradients from that target.
+
+- **Classification-branch winner**: explains the classification branch's predicted comparison class after the two descriptors are concatenated.
+
+```text
+z_left, z_right = classification logits before softmax
+predicted = argmax(z_left, z_right)
+T = z_predicted
+```
+
+This uses the pre-softmax logit, not the probability after softmax. Use it when you want to explain the direct left-vs-right classification decision.
+
+For each Grad-CAM target, the app shows four views:
+
+- **Positive**: regions that increase the selected target.
+- **Negative**: regions that decrease the selected target.
+- **Absolute**: regions with strong influence in either direction.
+- **Signed**: red increases the target, blue decreases it.
 
 Click a heatmap thumbnail in the app to open a larger view with its color legend.
