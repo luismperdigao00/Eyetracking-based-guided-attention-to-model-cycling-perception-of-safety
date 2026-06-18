@@ -1,6 +1,6 @@
 # Perceived Safety App
 
-This app deploys the EG-PCS-Net perceived-safety model with a DINOv3 backbone. You can upload one street-level image to get a perceived-safety score, or upload two images to compare which one the model considers safer. The app also generates raw attention, attention rollout, and final-attention Grad-CAM heatmaps.
+This app deploys the EG-PCS-Net perceived-safety model. You can upload one street-level image to get a perceived-safety score, or upload two images to compare which one the model considers safer. The app also generates attention heatmaps to connect a perceived safety score with visual explanations.
 
 ## Launch the app
 
@@ -16,9 +16,7 @@ You can also run it from inside the deployment folder:
 cd deployment_app
 python run_app.py --port 8765
 ```
-
-
-The deployment folder is self-contained. It no longer needs `train_main_utils.py`, `backbone_registry.py`, `data.py`, `gaze_policy.py`, or `nets/` from the parent repository. The local structure is:
+The local structure is:
 
 ```text
 deployment_app/run_app.py                          # launcher: starts the web app
@@ -35,8 +33,6 @@ deployment_app/model_code/                         # local EG-PCS-Net/DINOv3 mod
 deployment_app/models/                             # bundled best checkpoints for EG-PCS-Net runs
 deployment_app/outputs/                            # saved app outputs, only when Save outputs is checked
 ```
-
-The bundled checkpoints are large, so use Git LFS or release artifacts if pushing this folder to Git. Normal Git repositories are not a good fit for multi-GB `.pt` files.
 
 Keep the terminal open while using the app, then open:
 
