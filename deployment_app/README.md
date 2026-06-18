@@ -101,8 +101,8 @@ Grad-CAM explains one selected model output at a time. In single-image mode, it 
 In comparison mode, the **Grad-CAM target** menu has three options:
 
 - **Each image safety score**: explains each image's own ranking-branch score independently. Use this to see what makes each image look safer or less safe, without explaining the left-vs-right decision.
-- **Ranking-branch winner**: explains why the ranking branch prefers the image with the higher safety score. This is not a subtraction between two finished Grad-CAM maps; the app first builds one ranking-margin target, then computes Grad-CAM from that target.
-- **Classification-branch winner**: explains the classification branch's predicted left-vs-right decision after the two descriptors are concatenated. This uses the winning pre-softmax logit, not the probability after softmax.
+- **Ranking-branch winner**: explains why the ranking branch prefers the image with the higher safety score.
+- **Classification-branch winner**: explains the classification branch's predicted left-vs-right decision after the two descriptors are concatenated. This uses the winning pre-softmax logit.
 
 For each Grad-CAM target, the app shows four views:
 
