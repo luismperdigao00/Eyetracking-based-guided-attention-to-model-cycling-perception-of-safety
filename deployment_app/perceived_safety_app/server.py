@@ -8,12 +8,12 @@ import argparse
 import cgi
 import datetime as dt
 import html
-import importlib.util
 import json
 import mimetypes
-import random
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import traceback
 from dataclasses import dataclass
@@ -32,38 +32,32 @@ matplotlib.use("Agg")
 from matplotlib import cm
 
 
-REPO_ROOT = Path("/home/csantiago").resolve()
-ANALYSIS_SCRIPT = REPO_ROOT / "Analysis" / "5.checkpoint_eval_accuracy_and_saliency.py"
-OUTPUT_ROOT = REPO_ROOT / "deployment_outputs" / "perceived_safety_app"
+PACKAGE_ROOT = Path(__file__).resolve().parent
+APP_ROOT = PACKAGE_ROOT.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
-DEFAULT_RUN_ID = "2v27tcrz"
-TRAINED_MODEL_OPTIONS = (
-    ("2v27tcrz", "EG-PCS-Net, trained on Berlin, gazefrac=1"),
-    ("g0qvoywf", "EG-PCS-Net, trained on Berlin, gazefrac=0.7"),
-    ("eyspby9v", "EG-PCS-Net, trained on multiple cities, gazefrac=1"),
-    ("5062xuio", "Baseline, trained on Berlin"),
-    ("b6r8bm6l", "GII-ViT, trained on Berlin, gazefrac=1"),
-    ("6hi41xoa", "EG-ViT, trained on Berlin, gazefrac=1"),
-)
+from perceived_safety_app import model_runtime, runtime_config
+from perceived_safety_app.model_registry import DEFAULT_RUN_ID, available_model_options
+OUTPUT_ROOT = APP_ROOT / "outputs"
+TEMP_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "perceived_safety_app_unsaved"
+
+TRAINED_MODEL_OPTIONS = available_model_options()
 TRAINED_MODEL_LABELS = dict(TRAINED_MODEL_OPTIONS)
 DEFAULT_CHECKPOINT_KIND = "best"
-DEFAULT_DATASET = "berlin"
-DEFAULT_RANDOM_SEED = None
-DEFAULT_ROW_POSITION = None
 DEFAULT_GRADCAM_TARGET = "branch_score"
-DEFAULT_GRADCAM_SOURCE = "attention"
+DEFAULT_SAVE_OUTPUTS = False
 
 ATTENTION_METHODS = ("raw", "rollout", "gradcam")
 GRADCAM_VARIANTS = ("positive", "negative", "absolute", "signed")
 GRADCAM_TARGET_OPTIONS = ("branch_score", "rank_margin", "pair_predicted_logit")
-GRADCAM_SOURCE_OPTIONS = ("attention", "patch_tokens", "both")
 
 OVERLAY_ALPHA = 0.52
 HEATMAP_SIZE = 520
 MAP_EPS = 1e-8
 
 REFERENCE_SCORE_RUN_ID = "n7xroowm"
-REFERENCE_SCORE_SPLIT = "splits/comparisons_df.pickle"
+REFERENCE_SCORE_SPLIT = "data/comparisons_df.pickle"
 REFERENCE_SCORE_STATS = {
     "min": -4.55092191696167,
     "max": 4.994133949279785,
@@ -99,9 +93,7 @@ class ModelBundle:
     meta: dict
 
 
-_EVAL_MOD = None
 _MODEL_CACHE: Dict[Tuple[str, str, str], ModelBundle] = {}
-_DF_CACHE = None
 
 
 def slugify(value: object) -> str:
@@ -110,35 +102,16 @@ def slugify(value: object) -> str:
 
 
 def load_eval_module():
-    global _EVAL_MOD
-    if _EVAL_MOD is not None:
-        return _EVAL_MOD
-    if not ANALYSIS_SCRIPT.exists():
-        raise FileNotFoundError(f"Could not find evaluator script: {ANALYSIS_SCRIPT}")
-
-    spec = importlib.util.spec_from_file_location("checkpoint_eval_app_runtime", ANALYSIS_SCRIPT)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not import evaluator script: {ANALYSIS_SCRIPT}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-
-    module.VERBOSE = False
-    module.SHOW_PROGRESS = False
-    module.SHOW_DATAFRAMES = False
-    module.PRINT_LATEX = False
-    module.BATCH_SIZE = 1
-    module.NUM_WORKERS = 0
-    module.EVAL_DROP_LAST = False
-    module.PIN_MEMORY = False
-    module.ATTENTION_EXTRACTIONS = "all"
-    _EVAL_MOD = module
-    return module
+    """Return the model runtime module configured for interactive app inference."""
+    runtime_config.VERBOSE = False
+    runtime_config.SHOW_PROGRESS = False
+    runtime_config.ATTENTION_EXTRACTIONS = "all"
+    return model_runtime
 
 
-def get_model_bundle(run_id: str, checkpoint_kind: str, checkpoint_path: str = "") -> ModelBundle:
+def get_model_bundle(run_id: str, checkpoint_path: str = "") -> ModelBundle:
     run_id = (run_id or DEFAULT_RUN_ID).strip()
-    checkpoint_kind = (checkpoint_kind or DEFAULT_CHECKPOINT_KIND).strip().lower()
+    checkpoint_kind = DEFAULT_CHECKPOINT_KIND
     checkpoint_path = str(checkpoint_path or "").strip()
     key = (run_id, checkpoint_kind, checkpoint_path)
     if key in _MODEL_CACHE:
@@ -147,7 +120,7 @@ def get_model_bundle(run_id: str, checkpoint_kind: str, checkpoint_path: str = "
     eval_mod = load_eval_module()
     entry = {
         "tag": f"deployment_{slugify(run_id)}",
-        "wandb_run_id": run_id,
+        "run_id": run_id,
         "checkpoint": checkpoint_path or None,
         "checkpoint_kind": checkpoint_kind,
     }
@@ -174,62 +147,6 @@ def get_model_bundle(run_id: str, checkpoint_kind: str, checkpoint_path: str = "
     )
     _MODEL_CACHE[key] = bundle
     return bundle
-
-
-def load_dataframe():
-    global _DF_CACHE
-    if _DF_CACHE is not None:
-        return _DF_CACHE.copy()
-    eval_mod = load_eval_module()
-    df = eval_mod.load_comparisons_df(eval_mod.COMPARISONS_PKL)
-    _DF_CACHE = df.copy()
-    return df
-
-
-def available_datasets() -> List[str]:
-    df = load_dataframe()
-    names = sorted(str(x) for x in df["dataset"].dropna().unique()) if "dataset" in df.columns else []
-    return ["all", *names]
-
-
-def filter_dataframe(df, dataset: str, ties: bool):
-    eval_mod = load_eval_module()
-    dataset = (dataset or DEFAULT_DATASET).strip()
-    out = df.copy()
-    if dataset and dataset.lower() != "all" and "dataset" in out.columns:
-        out = out[out["dataset"].astype(str) == dataset].copy()
-    out = eval_mod.apply_ties_and_labels(out, ties=ties)
-    if out.empty:
-        raise ValueError(f"No comparisons found for dataset={dataset!r} after label filtering.")
-    return out.reset_index(names="source_index")
-
-
-def choose_row(df, row_position: Optional[int], seed: Optional[int]):
-    if row_position is not None:
-        pos = int(row_position) % len(df)
-        chosen_seed = None
-    else:
-        chosen_seed = int(seed) if seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
-        rng = np.random.RandomState(chosen_seed)
-        pos = int(rng.randint(0, len(df)))
-    return df.iloc[[pos]].copy(), pos, chosen_seed
-
-
-def image_filename(value: object) -> str:
-    s = str(value)
-    return s if s.lower().endswith((".jpg", ".jpeg", ".png")) else f"{s}.jpg"
-
-
-def image_path_for(row, side: str) -> Path:
-    eval_mod = load_eval_module()
-    name = image_filename(row[f"image_{side}"])
-    dataset = str(row.get("dataset", ""))
-    root = Path(eval_mod.DATASET_ROOT)
-    candidates = [root / dataset / name, root / name]
-    for p in candidates:
-        if p.exists():
-            return p
-    return candidates[0]
 
 
 def first_map_np(tensor: torch.Tensor) -> np.ndarray:
@@ -432,109 +349,6 @@ def get_signed_gradcam_maps(eval_mod, bundle: ModelBundle, batch: dict, target: 
         return run_pair_signed_gradcam(eval_mod, net, x_l, x_r, bundle.gaze_grid_size, gaze_l=gaze_l, gaze_r=gaze_r, has_eye_mask=has_eye_mask, score_target=target)
 
 
-def patch_vector_to_2d(cam_vec: torch.Tensor, grid_hw: Tuple[int, int]) -> torch.Tensor:
-    b, p = cam_vec.shape
-    gh, gw = tuple(int(x) for x in grid_hw)
-    if p == gh * gw:
-        return cam_vec.view(b, gh, gw)
-    side = int(np.sqrt(p))
-    if side * side != p:
-        raise RuntimeError(f"Cannot reshape {p} patch-token values into a 2D grid.")
-    return cam_vec.view(b, side, side)
-
-
-def forward_one_tokens_for_grad(net, x, gaze_map=None, has_eye_mask=None):
-    from nets.transformer_forward import forward_backbone_tokens
-    from nets.transformer_tokens import pool_tokens
-
-    feats = forward_backbone_tokens(
-        backbone=net.backbone,
-        x=x,
-        attention_recorder=None,
-        gaze_embedder=getattr(net, "gaze_embedder", None),
-        gii_layers=getattr(net, "gii_layers", None),
-        gii_active_indices=getattr(net, "gii_active_indices", None),
-        gaze_map=gaze_map,
-        has_eye_mask=has_eye_mask,
-        num_prefix_tokens=int(getattr(net, "num_prefix_tokens", 1)),
-        guidance_drop_prob=0.0,
-        egvit_cfg=getattr(net, "egvit_cfg", None),
-        model_training=False,
-    )
-    if feats.ndim != 3:
-        raise RuntimeError(f"Token Grad-CAM expects [B, tokens, channels], got {tuple(feats.shape)}.")
-    feats = feats.detach().requires_grad_(True)
-    pooled = pool_tokens(
-        feats,
-        pooling=str(net.cfg.pooling),
-        num_prefix_tokens=int(getattr(net, "num_prefix_tokens", 1)),
-        pool_k=int(getattr(net.cfg, "pool_k", 10)),
-        apply_token_norm=bool(getattr(net, "apply_token_norm", False)),
-        token_norm=getattr(net, "token_norm", None),
-    )
-    pooled = net.feat_norm(pooled)
-    score = net._rank_score(pooled)
-    return feats, pooled, score
-
-
-def token_gradcam_from_tokens(feats: torch.Tensor, grad_feats: torch.Tensor, grid_hw: Tuple[int, int], num_prefix_tokens: int):
-    prefix = int(num_prefix_tokens)
-    if feats.shape[1] <= prefix:
-        raise RuntimeError("Token Grad-CAM found no patch tokens after prefix-token removal.")
-    patch_tokens = feats[:, prefix:, :]
-    grad_patches = grad_feats[:, prefix:, :]
-    weights = grad_patches.mean(dim=1, keepdim=True)
-    cam_vec = (weights * patch_tokens).sum(dim=-1)
-    return patch_vector_to_2d(cam_vec, grid_hw)
-
-
-def run_branch_token_gradcam(eval_mod, net, x, grid_hw, gaze_map=None, has_eye_mask=None):
-    feats, _pooled, score = forward_one_tokens_for_grad(net, x, gaze_map=gaze_map, has_eye_mask=has_eye_mask)
-    grad_feats = torch.autograd.grad(score.view(-1).sum(), feats, retain_graph=False, allow_unused=False)[0]
-    return token_gradcam_from_tokens(feats, grad_feats, grid_hw, int(getattr(net, "num_prefix_tokens", 1))).detach()
-
-
-def run_pair_token_gradcam(eval_mod, net, x_l, x_r, grid_hw, gaze_l=None, gaze_r=None, has_eye_mask=None, score_target="rank_margin"):
-    feats_l, pooled_l, score_l = forward_one_tokens_for_grad(net, x_l, gaze_map=gaze_l, has_eye_mask=has_eye_mask)
-    feats_r, pooled_r, score_r = forward_one_tokens_for_grad(net, x_r, gaze_map=gaze_r, has_eye_mask=has_eye_mask)
-    target = eval_mod._pair_gradcam_scalar_target(net, pooled_l, score_l, pooled_r, score_r, score_target)
-    grad_l, grad_r = torch.autograd.grad(target, [feats_l, feats_r], retain_graph=False, allow_unused=False)
-    prefix = int(getattr(net, "num_prefix_tokens", 1))
-    return (
-        token_gradcam_from_tokens(feats_l, grad_l, grid_hw, prefix).detach(),
-        token_gradcam_from_tokens(feats_r, grad_r, grid_hw, prefix).detach(),
-    )
-
-
-def get_token_gradcam_maps(eval_mod, bundle: ModelBundle, batch: dict, target: str):
-    target = (target or DEFAULT_GRADCAM_TARGET).strip().lower()
-    if target not in GRADCAM_TARGET_OPTIONS:
-        raise ValueError(f"Unknown Grad-CAM target {target!r}.")
-    net = bundle.net
-    net.zero_grad(set_to_none=True)
-    x_l = eval_mod._batch_tensor(batch, "image_l")
-    x_r = eval_mod._batch_tensor(batch, "image_r")
-    gaze_l = eval_mod._batch_tensor(batch, "gaze_l", as_float=True)
-    gaze_r = eval_mod._batch_tensor(batch, "gaze_r", as_float=True)
-    has_eye_mask = eval_mod._batch_tensor(batch, "has_eyetracker")
-    with torch.enable_grad():
-        if target == "branch_score":
-            m_l = run_branch_token_gradcam(eval_mod, net, x_l, bundle.gaze_grid_size, gaze_map=gaze_l, has_eye_mask=has_eye_mask)
-            net.zero_grad(set_to_none=True)
-            m_r = run_branch_token_gradcam(eval_mod, net, x_r, bundle.gaze_grid_size, gaze_map=gaze_r, has_eye_mask=has_eye_mask)
-            return m_l, m_r
-        return run_pair_token_gradcam(
-            eval_mod,
-            net,
-            x_l,
-            x_r,
-            bundle.gaze_grid_size,
-            gaze_l=gaze_l,
-            gaze_r=gaze_r,
-            has_eye_mask=has_eye_mask,
-            score_target=target,
-        )
-
 
 def gradcam_variant(arr: np.ndarray, variant: str) -> Tuple[np.ndarray, str, bool]:
     signed = normalize_signed(arr)
@@ -548,12 +362,6 @@ def gradcam_variant(arr: np.ndarray, variant: str) -> Tuple[np.ndarray, str, boo
     if variant == "signed":
         return normalize_signed_balanced(arr), "coolwarm", True
     raise ValueError(f"Unknown Grad-CAM variant: {variant}")
-
-
-def make_batch(bundle: ModelBundle, row_df):
-    eval_mod = load_eval_module()
-    loader = eval_mod.make_loader(row_df.reset_index(drop=True), specs=bundle.specs, gaze_grid_size=bundle.gaze_grid_size, ties=bundle.ties, enable_gaze=True)
-    return next(iter(loader))
 
 
 def model_prediction(bundle: ModelBundle, batch: dict) -> dict:
@@ -580,43 +388,42 @@ def model_prediction(bundle: ModelBundle, batch: dict) -> dict:
     return result
 
 
-def compute_attention_maps(bundle: ModelBundle, batch: dict, gradcam_target: str, gradcam_source: str = DEFAULT_GRADCAM_SOURCE):
+def compute_attention_maps(bundle: ModelBundle, batch: dict, gradcam_target: str):
     eval_mod = load_eval_module()
-    source = (gradcam_source or DEFAULT_GRADCAM_SOURCE).strip().lower()
-    if source not in GRADCAM_SOURCE_OPTIONS:
-        raise ValueError(f"Unknown Grad-CAM source {source!r}.")
     maps = {}
     for method in ("raw", "rollout"):
         m_l, m_r = eval_mod.get_attention_maps_for_batch(bundle.net, batch, method, bundle.gaze_grid_size)
         maps[method] = {"left": first_map_np(m_l), "right": first_map_np(m_r)}
 
-    if source in ("attention", "both"):
-        g_l, g_r = get_signed_gradcam_maps(eval_mod, bundle, batch, gradcam_target)
-        signed_maps = {"left": first_map_np(g_l), "right": first_map_np(g_r)}
-        maps["gradcam"] = {}
-        for variant in GRADCAM_VARIANTS:
-            maps["gradcam"][variant] = {
-                "left": gradcam_variant(signed_maps["left"], variant),
-                "right": gradcam_variant(signed_maps["right"], variant),
-            }
-
-    if source in ("patch_tokens", "both"):
-        t_l, t_r = get_token_gradcam_maps(eval_mod, bundle, batch, gradcam_target)
-        token_maps = {"left": first_map_np(t_l), "right": first_map_np(t_r)}
-        maps["token_gradcam"] = {}
-        for variant in GRADCAM_VARIANTS:
-            maps["token_gradcam"][variant] = {
-                "left": gradcam_variant(token_maps["left"], variant),
-                "right": gradcam_variant(token_maps["right"], variant),
-            }
+    g_l, g_r = get_signed_gradcam_maps(eval_mod, bundle, batch, gradcam_target)
+    signed_maps = {"left": first_map_np(g_l), "right": first_map_np(g_r)}
+    maps["gradcam"] = {}
+    for variant in GRADCAM_VARIANTS:
+        maps["gradcam"][variant] = {
+            "left": gradcam_variant(signed_maps["left"], variant),
+            "right": gradcam_variant(signed_maps["right"], variant),
+        }
     return maps
 
 
+def boolish_form_value(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "save"}
+
+
+def should_save_outputs_from_form(form) -> bool:
+    return boolish_form_value(form.getfirst("save_outputs", ""))
+
+
+def should_save_outputs_from_params(params: dict) -> bool:
+    return boolish_form_value(params.get("save_outputs", [""])[0] if params else "")
+
+
+def output_base_dir(save_outputs: bool) -> Path:
+    return OUTPUT_ROOT if save_outputs else TEMP_OUTPUT_ROOT
+
+
 def save_pair_gradcam_artifacts(maps: dict, artifacts: dict, side: str, original_path: Path, run_dir: Path) -> None:
-    families = (
-        ("gradcam", "gradcam", "Grad-CAM"),
-        ("token_gradcam", "token_gradcam", "Token Grad-CAM"),
-    )
+    families = (("gradcam", "gradcam", "Grad-CAM"),)
     for map_key, file_key, _label_prefix in families:
         if map_key not in maps:
             continue
@@ -630,10 +437,7 @@ def save_pair_gradcam_artifacts(maps: dict, artifacts: dict, side: str, original
 
 
 def save_single_gradcam_artifacts(maps: dict, artifacts: dict, original_path: Path, run_dir: Path) -> None:
-    families = (
-        ("gradcam", "gradcam"),
-        ("token_gradcam", "token_gradcam"),
-    )
+    families = (("gradcam", "gradcam"),)
     for map_key, file_key in families:
         if map_key not in maps:
             continue
@@ -648,29 +452,7 @@ def save_single_gradcam_artifacts(maps: dict, artifacts: dict, original_path: Pa
 
 def preprocess_single_image(bundle: ModelBundle, image: Image.Image):
     eval_mod = load_eval_module()
-    tfms, _meta = eval_mod.build_preprocessing_transforms(
-        bundle.specs,
-        phase="eval",
-        augment="none",
-        ties=bundle.ties,
-        gaze_grid_size=bundle.gaze_grid_size,
-        enable_gaze=True,
-        gaze_output="align",
-    )
-    sample = {
-        "image_l": image.convert("RGB"),
-        "image_r": image.convert("RGB"),
-        "score_r": 0,
-        "score_c": 0,
-        "has_eyetracker": False,
-    }
-    sample = tfms(sample)
-    x = sample["image_l"].unsqueeze(0).to(eval_mod.DEVICE, non_blocking=True)
-    gaze = sample.get("gaze_l", None)
-    if gaze is not None:
-        gaze = gaze.unsqueeze(0).to(eval_mod.DEVICE, non_blocking=True).float()
-    has_eye = torch.zeros((1,), dtype=torch.bool, device=eval_mod.DEVICE)
-    return x, gaze, has_eye
+    return eval_mod.single_image_inputs(image, bundle.specs, bundle.gaze_grid_size)
 
 
 def single_attention_map(eval_mod, bundle: ModelBundle, x, gaze, has_eye, method: str):
@@ -687,7 +469,7 @@ def single_attention_map(eval_mod, bundle: ModelBundle, x, gaze, has_eye, method
         eval_mod._restore_attention_state(net, state)
 
 
-def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradcam_target: str, gradcam_source: str = DEFAULT_GRADCAM_SOURCE):
+def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradcam_target: str):
     eval_mod = load_eval_module()
     x, gaze, has_eye = preprocess_single_image(bundle, image)
     maps = {}
@@ -697,19 +479,11 @@ def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradca
         maps[method] = first_map_np(m)
         scores.append(float(score.view(-1)[0].detach().cpu().item()))
 
-    source = (gradcam_source or DEFAULT_GRADCAM_SOURCE).strip().lower()
-    if source in ("attention", "both"):
-        bundle.net.zero_grad(set_to_none=True)
-        with torch.enable_grad():
-            signed = run_branch_signed_gradcam(eval_mod, bundle.net, x, bundle.gaze_grid_size, gaze_map=gaze, has_eye_mask=has_eye)
-        signed_np = first_map_np(signed)
-        maps["gradcam"] = {variant: gradcam_variant(signed_np, variant) for variant in GRADCAM_VARIANTS}
-    if source in ("patch_tokens", "both"):
-        bundle.net.zero_grad(set_to_none=True)
-        with torch.enable_grad():
-            token_signed = run_branch_token_gradcam(eval_mod, bundle.net, x, bundle.gaze_grid_size, gaze_map=gaze, has_eye_mask=has_eye)
-        token_np = first_map_np(token_signed)
-        maps["token_gradcam"] = {variant: gradcam_variant(token_np, variant) for variant in GRADCAM_VARIANTS}
+    bundle.net.zero_grad(set_to_none=True)
+    with torch.enable_grad():
+        signed = run_branch_signed_gradcam(eval_mod, bundle.net, x, bundle.gaze_grid_size, gaze_map=gaze, has_eye_mask=has_eye)
+    signed_np = first_map_np(signed)
+    maps["gradcam"] = {variant: gradcam_variant(signed_np, variant) for variant in GRADCAM_VARIANTS}
 
     safety_score = float(np.mean(scores)) if scores else float("nan")
     return safety_score, maps
@@ -717,34 +491,7 @@ def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradca
 
 def preprocess_uploaded_pair(bundle: ModelBundle, left_image: Image.Image, right_image: Image.Image) -> dict:
     eval_mod = load_eval_module()
-    tfms, _meta = eval_mod.build_preprocessing_transforms(
-        bundle.specs,
-        phase="eval",
-        augment="none",
-        ties=bundle.ties,
-        gaze_grid_size=bundle.gaze_grid_size,
-        enable_gaze=True,
-        gaze_output="align",
-    )
-    sample = {
-        "image_l": left_image.convert("RGB"),
-        "image_r": right_image.convert("RGB"),
-        "score_r": 0,
-        "score_c": 0,
-        "has_eyetracker": False,
-    }
-    sample = tfms(sample)
-    has_eye = torch.zeros((1,), dtype=torch.bool)
-    batch = {
-        "image_l": sample["image_l"].unsqueeze(0),
-        "image_r": sample["image_r"].unsqueeze(0),
-        "gaze_l": sample.get("gaze_l", torch.zeros((1, *bundle.gaze_grid_size), dtype=torch.float32)).unsqueeze(0),
-        "gaze_r": sample.get("gaze_r", torch.zeros((1, *bundle.gaze_grid_size), dtype=torch.float32)).unsqueeze(0),
-        "has_eyetracker": has_eye,
-        "score_r": torch.zeros((1,), dtype=torch.long),
-        "score_c": torch.zeros((1,), dtype=torch.long),
-    }
-    return batch
+    return eval_mod.pair_image_batch(left_image, right_image, bundle.specs, bundle.gaze_grid_size)
 
 
 def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
@@ -758,37 +505,45 @@ def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
 
 
 def selected_run_id_from_form(form) -> str:
-    custom_run_id = str(form.getfirst("custom_run_id", "") or "").strip()
-    if custom_run_id:
-        return custom_run_id
     return str(form.getfirst("run_id", DEFAULT_RUN_ID) or DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
 
 
-def selected_run_id_from_params(params: dict) -> str:
-    custom_run_id = str(params.get("custom_run_id", [""])[0] or "").strip()
-    if custom_run_id:
-        return custom_run_id
-    return str(params.get("run_id", [DEFAULT_RUN_ID])[0] or DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
+def uploaded_weights_path(form, run_id: str) -> Tuple[str, Optional[str]]:
+    file_item = form["weights_file"] if "weights_file" in form else None
+    if file_item is None or not getattr(file_item, "filename", ""):
+        return "", None
+    weights_bytes = file_item.file.read()
+    if not weights_bytes:
+        raise ValueError("Uploaded weights file was empty.")
+    filename = str(getattr(file_item, "filename", "weights.pt"))
+    suffix = Path(filename).suffix.lower() or ".pt"
+    if suffix not in {".pt", ".pth"}:
+        raise ValueError("Weights file must be a .pt or .pth checkpoint.")
+    weights_dir = TEMP_OUTPUT_ROOT / "uploaded_weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    out_path = weights_dir / f"{stamp}_{slugify(run_id)}_{slugify(Path(filename).stem)}{suffix}"
+    out_path.write_bytes(weights_bytes)
+    return str(out_path), filename
 
 
 def analyze_upload_comparison(form) -> dict:
     run_id = selected_run_id_from_form(form)
-    checkpoint_kind = form_get(form, "checkpoint_kind", DEFAULT_CHECKPOINT_KIND).strip().lower() or DEFAULT_CHECKPOINT_KIND
-    checkpoint_path = form_get(form, "checkpoint_path", "").strip()
+    checkpoint_path, weights_filename = uploaded_weights_path(form, run_id)
     gradcam_target = form_get(form, "gradcam_target", DEFAULT_GRADCAM_TARGET).strip().lower() or DEFAULT_GRADCAM_TARGET
-    gradcam_source = form_get(form, "gradcam_source", DEFAULT_GRADCAM_SOURCE).strip().lower() or DEFAULT_GRADCAM_SOURCE
     place_name = form_get(form, "street_name", "Urban comparison").strip() or "Urban comparison"
+    save_outputs = should_save_outputs_from_form(form)
 
     left_image, left_name = uploaded_file_image(form, "upload_left_image")
     right_image, right_name = uploaded_file_image(form, "upload_right_image")
 
-    bundle = get_model_bundle(run_id, checkpoint_kind, checkpoint_path)
+    bundle = get_model_bundle(run_id, checkpoint_path)
     batch = preprocess_uploaded_pair(bundle, left_image, right_image)
     prediction = model_prediction(bundle, batch)
-    maps = compute_attention_maps(bundle, batch, gradcam_target, gradcam_source)
+    maps = compute_attention_maps(bundle, batch, gradcam_target)
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = OUTPUT_ROOT / f"{timestamp}_{slugify(run_id)}_comparison_{slugify(place_name)}"
+    run_dir = output_base_dir(save_outputs) / f"{timestamp}_{slugify(run_id)}_comparison_{slugify(place_name)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     source_images = {"left": left_image, "right": right_image}
@@ -816,11 +571,12 @@ def analyze_upload_comparison(form) -> dict:
     metadata = {
         "created_utc": timestamp,
         "mode": "comparison_upload",
+        "saved_outputs": save_outputs,
         "run_id": run_id,
-        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_kind": DEFAULT_CHECKPOINT_KIND,
         "checkpoint_path": bundle.checkpoint_path,
+        "uploaded_weights_filename": weights_filename,
         "gradcam_target": gradcam_target,
-        "gradcam_source": gradcam_source,
         "street_name": place_name,
         "model_meta": bundle.meta,
         "comparison": {
@@ -837,7 +593,7 @@ def analyze_upload_comparison(form) -> dict:
     }
     metadata_path = run_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir}
+    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir, "saved_outputs": save_outputs}
 
 
 def form_get(form, name: str, default: str = "") -> str:
@@ -853,19 +609,18 @@ def analyze_upload(form) -> dict:
         return analyze_upload_comparison(form)
 
     run_id = selected_run_id_from_form(form)
-    checkpoint_kind = form_get(form, "checkpoint_kind", DEFAULT_CHECKPOINT_KIND).strip().lower() or DEFAULT_CHECKPOINT_KIND
-    checkpoint_path = form_get(form, "checkpoint_path", "").strip()
-    gradcam_target = form_get(form, "gradcam_target", DEFAULT_GRADCAM_TARGET).strip().lower() or DEFAULT_GRADCAM_TARGET
-    gradcam_source = form_get(form, "gradcam_source", DEFAULT_GRADCAM_SOURCE).strip().lower() or DEFAULT_GRADCAM_SOURCE
+    checkpoint_path, weights_filename = uploaded_weights_path(form, run_id)
+    gradcam_target = DEFAULT_GRADCAM_TARGET
     street_name = form_get(form, "street_name", "Urban image").strip() or "Urban image"
+    save_outputs = should_save_outputs_from_form(form)
 
     image, uploaded_name = uploaded_file_image(form, "upload_image")
 
-    bundle = get_model_bundle(run_id, checkpoint_kind, checkpoint_path)
-    safety_score, maps = compute_single_image_outputs(bundle, image, gradcam_target, gradcam_source)
+    bundle = get_model_bundle(run_id, checkpoint_path)
+    safety_score, maps = compute_single_image_outputs(bundle, image, gradcam_target)
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = OUTPUT_ROOT / f"{timestamp}_{slugify(run_id)}_upload_{slugify(street_name)}"
+    run_dir = output_base_dir(save_outputs) / f"{timestamp}_{slugify(run_id)}_upload_{slugify(street_name)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     original_out = run_dir / "uploaded_original.png"
@@ -887,11 +642,12 @@ def analyze_upload(form) -> dict:
     metadata = {
         "created_utc": timestamp,
         "mode": "single_image_upload",
+        "saved_outputs": save_outputs,
         "run_id": run_id,
-        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_kind": DEFAULT_CHECKPOINT_KIND,
         "checkpoint_path": bundle.checkpoint_path,
+        "uploaded_weights_filename": weights_filename,
         "gradcam_target": gradcam_target,
-        "gradcam_source": gradcam_source,
         "uploaded_filename": uploaded_name,
         "street_name": street_name,
         "model_meta": bundle.meta,
@@ -903,7 +659,7 @@ def analyze_upload(form) -> dict:
     }
     metadata_path = run_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir}
+    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir, "saved_outputs": save_outputs}
 
 
 def paths_for_json(value):
@@ -916,85 +672,14 @@ def paths_for_json(value):
     return value
 
 
-def analyze(params: dict) -> dict:
-    run_id = selected_run_id_from_params(params)
-    checkpoint_kind = str(params.get("checkpoint_kind", [DEFAULT_CHECKPOINT_KIND])[0] or DEFAULT_CHECKPOINT_KIND).strip().lower()
-    checkpoint_path = str(params.get("checkpoint_path", [""])[0] or "").strip()
-    dataset = str(params.get("dataset", [DEFAULT_DATASET])[0] or DEFAULT_DATASET).strip()
-    gradcam_target = str(params.get("gradcam_target", [DEFAULT_GRADCAM_TARGET])[0] or DEFAULT_GRADCAM_TARGET).strip().lower()
-    gradcam_source = str(params.get("gradcam_source", [DEFAULT_GRADCAM_SOURCE])[0] or DEFAULT_GRADCAM_SOURCE).strip().lower()
-    seed_text = str(params.get("seed", [""])[0] or "").strip()
-    row_text = str(params.get("row_position", [""])[0] or "").strip()
-    seed = int(seed_text) if seed_text else DEFAULT_RANDOM_SEED
-    row_position = int(row_text) if row_text else DEFAULT_ROW_POSITION
-
-    bundle = get_model_bundle(run_id, checkpoint_kind, checkpoint_path)
-    df = filter_dataframe(load_dataframe(), dataset, ties=bundle.ties)
-    row_df, selected_position, used_seed = choose_row(df, row_position=row_position, seed=seed)
-    row = row_df.iloc[0]
-    batch = make_batch(bundle, row_df)
-    prediction = model_prediction(bundle, batch)
-    maps = compute_attention_maps(bundle, batch, gradcam_target, gradcam_source)
-
-    timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = OUTPUT_ROOT / f"{timestamp}_{slugify(run_id)}_{slugify(dataset)}_pos{selected_position}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    image_paths = {"left": image_path_for(row, "l"), "right": image_path_for(row, "r")}
-    artifacts = {"left": {}, "right": {}}
-
-    for side in ("left", "right"):
-        original_out = run_dir / f"{side}_original.png"
-        Image.open(image_paths[side]).convert("RGB").save(original_out)
-        artifacts[side]["original"] = original_out
-        model_out = run_dir / f"{side}_model_input.png"
-        save_model_input_view(image_paths[side], bundle, model_out)
-        artifacts[side]["model_input"] = model_out
-
-    for method in ("raw", "rollout"):
-        for side in ("left", "right"):
-            arr = normalize01(maps[method][side])
-            overlay = run_dir / f"{side}_{method}_overlay.png"
-            heat = run_dir / f"{side}_{method}_heatmap.png"
-            overlay_heatmap(artifacts[side]["original"], arr, overlay, cmap_name="magma", signed=False)
-            save_heatmap_only(arr, heat, cmap_name="magma", signed=False)
-            artifacts[side][method] = {"overlay": overlay, "heatmap": heat}
-
-    for side in ("left", "right"):
-        save_pair_gradcam_artifacts(maps, artifacts, side, artifacts[side]["original"], run_dir)
-
-    actual_side = "left" if int(row["score"]) == -1 else ("right" if int(row["score"]) == 1 else "tie")
-    metadata = {
-        "created_utc": timestamp,
-        "run_id": run_id,
-        "checkpoint_kind": checkpoint_kind,
-        "checkpoint_path": bundle.checkpoint_path,
-        "dataset_filter": dataset,
-        "selected_position_after_filtering": int(selected_position),
-        "selected_source_index": int(row.get("source_index", -1)),
-        "random_seed": None if used_seed is None else int(used_seed),
-        "gradcam_target": gradcam_target,
-        "gradcam_source": gradcam_source,
-        "model_meta": bundle.meta,
-        "comparison": {
-            "dataset": str(row.get("dataset", "")),
-            "left_image": str(row.get("image_l", "")),
-            "right_image": str(row.get("image_r", "")),
-            "human_label_score": int(row.get("score", 0)),
-            "human_safer_side": actual_side,
-            "survey_id": str(row.get("survey_id", "")),
-            "trial_id": str(row.get("trial_id", "")),
-        },
-        "prediction": prediction,
-        "artifacts": paths_for_json(artifacts),
-    }
-    metadata_path = run_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir}
-
-
 def output_url(path: Path) -> str:
-    rel = path.resolve().relative_to(OUTPUT_ROOT.resolve())
-    return "/outputs/" + "/".join(rel.parts)
+    resolved = path.resolve()
+    try:
+        rel = resolved.relative_to(OUTPUT_ROOT.resolve())
+        return "/outputs/" + "/".join(rel.parts)
+    except ValueError:
+        rel = resolved.relative_to(TEMP_OUTPUT_ROOT.resolve())
+        return "/tmp_outputs/" + "/".join(rel.parts)
 
 
 def fmt_float(value: Optional[float], digits: int = 4) -> str:
@@ -1094,6 +779,9 @@ def render_layout(title: str, body: str) -> bytes:
     .header-row { display:flex; justify-content:space-between; gap:16px; align-items:center; }
     .shutdown-form { display:block; }
     .shutdown-button { background:#a33a2b; white-space:nowrap; }
+    .check-label { display:flex; gap:8px; align-items:center; color:var(--ink); font-size:13px; }
+    .check-label input { width:auto; }
+    .save-note { color:var(--muted); font-size:12px; line-height:1.35; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
     .error { white-space: pre-wrap; color: #8a1f11; background: #fff4f1; border: 1px solid #f1b3a7; border-radius: 8px; padding: 12px; overflow: auto; }
     @media (max-width: 1100px) { form { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .summary { grid-template-columns: repeat(2, minmax(140px, 1fr)); } .maps { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
@@ -1120,14 +808,14 @@ def mode_nav(active: str = "") -> str:
 def render_mode_picker() -> str:
     return (
         "<section class=\"mode-grid\">"
-        "<a class=\"mode-card\" href=\"/comparison\"><span>Comparisons</span><small>Use saved dataset pairs or upload two urban images.</small></a>"
+        "<a class=\"mode-card\" href=\"/comparison\"><span>Comparisons</span><small>Upload two urban images and compare the EG-PCS-Net safety prediction.</small></a>"
         "<a class=\"mode-card\" href=\"/single\"><span>Single Images</span><small>Upload one urban image and inspect the safety score maps.</small></a>"
         "</section>"
     )
 
 
 def render_comparison_page(params: Optional[dict] = None) -> bytes:
-    return render_layout("Compare Urban Images", mode_nav("comparison") + render_form(params) + render_upload_form("comparison"))
+    return render_layout("Compare Urban Images", mode_nav("comparison") + render_upload_form("comparison"))
 
 
 def render_single_page() -> bytes:
@@ -1142,14 +830,6 @@ def gradcam_target_label(value: str) -> str:
     return labels.get(str(value), str(value))
 
 
-def gradcam_source_label(value: str) -> str:
-    labels = {
-        "attention": "Final-attention Grad-CAM",
-        "patch_tokens": "Patch-token Grad-CAM",
-        "both": "Both attention and patch-token maps",
-    }
-    return labels.get(str(value), str(value))
-
 
 def trained_model_label(run_id: str) -> str:
     return TRAINED_MODEL_LABELS.get(str(run_id), str(run_id))
@@ -1163,14 +843,25 @@ def model_select_options(selected_run_id: str) -> str:
     )
 
 
-def model_controls_html(selected_run_id: str = DEFAULT_RUN_ID, custom_run_id: str = "") -> str:
-    selected_run_id = str(selected_run_id or DEFAULT_RUN_ID).strip()
-    custom_run_id = str(custom_run_id or "").strip()
-    if not custom_run_id and selected_run_id not in TRAINED_MODEL_LABELS:
-        custom_run_id = selected_run_id
+def save_outputs_control(checked: bool = DEFAULT_SAVE_OUTPUTS) -> str:
+    checked_attr = " checked" if checked else ""
     return (
-        f'<label>Trained model<select name="run_id">{model_select_options(selected_run_id)}</select></label>'
-        f'<label>Custom run ID<input name="custom_run_id" value="{html.escape(custom_run_id)}" placeholder="optional W&amp;B run id"></label>'
+        '<label class="check-label"><input type="checkbox" name="save_outputs" value="1"' + checked_attr + '> Save outputs</label>'
+        '<div class="save-note">Unchecked results are temporary and are cleared when the app restarts or stops.</div>'
+    )
+
+
+def model_controls_html(selected_run_id: str = DEFAULT_RUN_ID) -> str:
+    selected_run_id = str(selected_run_id or DEFAULT_RUN_ID).strip()
+    return f'<label>Trained model<select name="run_id">{model_select_options(selected_run_id)}</select></label>'
+
+
+def weights_upload_control() -> str:
+    return (
+        '<label class="wide">Optional weights checkpoint'
+        '<input type="file" name="weights_file" accept=".pt,.pth,application/octet-stream">'
+        '<span class="save-note">Leave empty to use the bundled best weights for the selected model. Upload .pt/.pth only when the weights match that model configuration.</span>'
+        '</label>'
     )
 
 
@@ -1182,81 +873,39 @@ def select_options(values, selected: str, label_func) -> str:
     )
 
 
-def render_form(params: Optional[dict] = None) -> str:
-    params = params or {}
-    datasets = available_datasets()
-    dataset_value = str(params.get("dataset", [DEFAULT_DATASET])[0] if params else DEFAULT_DATASET)
-    run_id = selected_run_id_from_params(params) if params else DEFAULT_RUN_ID
-    custom_run_id = str(params.get("custom_run_id", [""])[0] if params else "")
-    ckpt_kind = str(params.get("checkpoint_kind", [DEFAULT_CHECKPOINT_KIND])[0] if params else DEFAULT_CHECKPOINT_KIND)
-    target = str(params.get("gradcam_target", [DEFAULT_GRADCAM_TARGET])[0] if params else DEFAULT_GRADCAM_TARGET)
-    source = str(params.get("gradcam_source", [DEFAULT_GRADCAM_SOURCE])[0] if params else DEFAULT_GRADCAM_SOURCE)
-    seed = str(params.get("seed", [""])[0] if params else "")
-    row_position = str(params.get("row_position", [""])[0] if params else "")
-    checkpoint_path = str(params.get("checkpoint_path", [""])[0] if params else "")
-    dataset_options = "".join(f"<option value=\"{html.escape(d)}\" {'selected' if d == dataset_value else ''}>{html.escape(d)}</option>" for d in datasets)
-    target_options = select_options(GRADCAM_TARGET_OPTIONS, target, gradcam_target_label)
-    kind_options = "".join(f"<option value=\"{k}\" {'selected' if k == ckpt_kind else ''}>{k}</option>" for k in ("best", "last"))
-    source_options = select_options(GRADCAM_SOURCE_OPTIONS, source, gradcam_source_label)
-    model_controls = model_controls_html(run_id, custom_run_id)
-    return f"""
-<section class="panel">
-<div class="section-head"><h2>Compare Saved Images</h2><span>Choose an existing dataset pair.</span></div>
-<form method="get" action="/analyze">
-{model_controls}
-<label>Checkpoint<select name="checkpoint_kind">{kind_options}</select></label>
-<label>Dataset<select name="dataset">{dataset_options}</select></label>
-<label>Seed<input name="seed" value="{html.escape(seed)}" placeholder="random"></label>
-<label>Row position<input name="row_position" value="{html.escape(row_position)}" placeholder="random"></label>
-<label>Grad-CAM explains<select name="gradcam_target">{target_options}</select></label>
-<label>Map type<select name="gradcam_source">{source_options}</select></label>
-<label class="wide">Checkpoint path<input name="checkpoint_path" value="{html.escape(checkpoint_path)}" placeholder="optional explicit .pt path"></label>
-<button type="submit">Analyze Pair</button>
-</form></section>"""
-
-
 def render_upload_form(mode: str = "single") -> str:
     target_options = select_options(GRADCAM_TARGET_OPTIONS, DEFAULT_GRADCAM_TARGET, gradcam_target_label)
-    single_target_options = select_options(("branch_score",), "branch_score", gradcam_target_label)
-    kind_options = "".join(
-        f'<option value="{k}" {"selected" if k == DEFAULT_CHECKPOINT_KIND else ""}>{k}</option>' for k in ("best", "last")
-    )
-    source_options = select_options(GRADCAM_SOURCE_OPTIONS, DEFAULT_GRADCAM_SOURCE, gradcam_source_label)
     mode = (mode or "single").strip().lower()
     if mode == "comparison":
-        return (
-            f'<section class="panel">\n'
-            f'  <div class="section-head"><h2>Compare Uploaded Urban Images</h2><span>Any street, plaza, road, or built-environment scene.</span></div>\n'
-            f'  <form method="post" action="/upload" enctype="multipart/form-data">\n'
-            f'    <input type="hidden" name="upload_mode" value="comparison">\n'
-            f'    {model_controls_html(DEFAULT_RUN_ID)}\n'
-            f'    <label>Checkpoint<select name="checkpoint_kind">{kind_options}</select></label>\n'
-            f'    <label>Place / note<input name="street_name" placeholder="optional"></label>\n'
-            f'    <label>Grad-CAM explains<select name="gradcam_target">{target_options}</select></label>\n'
-            f'    <label>Map type<select name="gradcam_source">{source_options}</select></label>\n'
-            f'    <label>Left image<input type="file" name="upload_left_image" accept="image/*" required></label>\n'
-            f'    <label>Right image<input type="file" name="upload_right_image" accept="image/*" required></label>\n'
-            f'    <label class="wide">Checkpoint path<input name="checkpoint_path" placeholder="optional explicit .pt path"></label>\n'
-            f'    <button type="submit">Analyze Pair</button>\n'
-            f'  </form>\n'
-            f'</section>'
-        )
-    return (
-        f'<section class="panel">\n'
-        f'  <div class="section-head"><h2>Analyze One Urban Image</h2><span>Use an image from your computer.</span></div>\n'
-        f'  <form method="post" action="/upload" enctype="multipart/form-data">\n'
-        f'    <input type="hidden" name="upload_mode" value="single">\n'
-        f'    {model_controls_html(DEFAULT_RUN_ID)}\n'
-        f'    <label>Checkpoint<select name="checkpoint_kind">{kind_options}</select></label>\n'
-        f'    <label>Place / note<input name="street_name" placeholder="optional"></label>\n'
-        f'    <label>Grad-CAM explains<select name="gradcam_target">{single_target_options}</select></label>\n'
-        f'    <label>Map type<select name="gradcam_source">{source_options}</select></label>\n'
-        f'    <label class="file-wide">Image<input type="file" name="upload_image" accept="image/*" required></label>\n'
-        f'    <label class="wide">Checkpoint path<input name="checkpoint_path" placeholder="optional explicit .pt path"></label>\n'
-        f'    <button type="submit">Analyze Image</button>\n'
-        f'  </form>\n'
-        f'</section>'
-    )
+        return f"""
+<section class="panel">
+  <div class="section-head"><h2>Compare Uploaded Urban Images</h2><span>Any street, plaza, road, or built-environment scene.</span></div>
+  <form method="post" action="/upload" enctype="multipart/form-data">
+    <input type="hidden" name="upload_mode" value="comparison">
+    {model_controls_html(DEFAULT_RUN_ID)}
+    <label>Place / note<input name="street_name" placeholder="optional"></label>
+    <label>Grad-CAM explains<select name="gradcam_target">{target_options}</select></label>
+    <label>Left image<input type="file" name="upload_left_image" accept="image/*" required></label>
+    <label>Right image<input type="file" name="upload_right_image" accept="image/*" required></label>
+    {weights_upload_control()}
+    {save_outputs_control()}
+    <button type="submit">Analyze Pair</button>
+  </form>
+</section>"""
+    return f"""
+<section class="panel">
+  <div class="section-head"><h2>Analyze One Urban Image</h2><span>Use an image from your computer. The explanation uses the ranking branch safety score.</span></div>
+  <form method="post" action="/upload" enctype="multipart/form-data">
+    <input type="hidden" name="upload_mode" value="single">
+    {model_controls_html(DEFAULT_RUN_ID)}
+    <label>Place / note<input name="street_name" placeholder="optional"></label>
+    <label class="file-wide">Image<input type="file" name="upload_image" accept="image/*" required></label>
+    {weights_upload_control()}
+    {save_outputs_control()}
+    <button type="submit">Analyze Image</button>
+  </form>
+</section>"""
+
 
 def heatmap_legend(label: str) -> dict:
     key = label.lower().strip()
@@ -1323,7 +972,7 @@ def render_map_viewer(query: str) -> bytes:
     params = parse_qs(query)
     src = params.get("src", [""])[0]
     label = params.get("label", ["Heatmap"])[0]
-    if not src.startswith("/outputs/"):
+    if not (src.startswith("/outputs/") or src.startswith("/tmp_outputs/")):
         raise ValueError("Invalid heatmap source.")
     legend = heatmap_legend(label)
     bar = html.escape(legend["bar"], quote=True)
@@ -1347,15 +996,10 @@ def render_map_viewer(query: str) -> bytes:
 
 def gradcam_figures(artifact_pack: dict) -> List[str]:
     figures = []
-    families = (
-        ("gradcam", "Grad-CAM"),
-        ("token_gradcam", "Token Grad-CAM"),
-    )
-    for key_prefix, label_prefix in families:
-        for variant in GRADCAM_VARIANTS:
-            key = f"{key_prefix}_{variant}"
-            if key in artifact_pack:
-                figures.append(artifact_figure(artifact_pack[key]["overlay"], f"{label_prefix} {variant}"))
+    for variant in GRADCAM_VARIANTS:
+        key = f"gradcam_{variant}"
+        if key in artifact_pack:
+            figures.append(artifact_figure(artifact_pack[key]["overlay"], f"Grad-CAM {variant}"))
     return figures
 
 
@@ -1366,6 +1010,9 @@ def render_results(result: dict, params: dict) -> bytes:
     comparison = meta["comparison"]
     safer_label = "Left" if pred["predicted_safer_side"] == "left" else "Right"
     actual = comparison["human_safer_side"].capitalize()
+    save_status = "Saved to disk" if result.get("saved_outputs") else "Temporary result"
+    save_note = "This result is stored under deployment_outputs." if result.get("saved_outputs") else "This result is not saved permanently and will be cleared when the app restarts or stops."
+    metadata_link = f'<a class="button" href="{html.escape(output_url(result["metadata_path"]))}">Metadata JSON</a>' if result.get("saved_outputs") else '<span class="sub">Metadata is temporary for this result.</span>'
     summary = f"""
 <section class="panel"><h2>Selected Comparison</h2><div class="summary">
 <div class="metric"><div class="k">Prediction</div><div class="v">{safer_label} safer</div></div>
@@ -1373,7 +1020,8 @@ def render_results(result: dict, params: dict) -> bytes:
 <div class="metric"><div class="k">Left score</div>{score_context_html(pred['left_safety_score'])}</div>
 <div class="metric"><div class="k">Right score</div>{score_context_html(pred['right_safety_score'])}</div>
 <div class="metric"><div class="k">P(right safer)</div><div class="v">{fmt_pct(pred['classification_prob_right_safer'])}</div></div>
-</div><div class="links"><a class="button" href="{html.escape(output_url(result['metadata_path']))}">Metadata JSON</a><span class="mono">{html.escape(str(result['run_dir']))}</span></div></section>"""
+<div class="metric"><div class="k">Storage</div><div class="v">{save_status}</div></div>
+</div><div class="links">{metadata_link}<span class="mono">{html.escape(str(result['run_dir']))}</span><span class="sub">{html.escape(save_note)}</span></div></section>"""
     side_sections = []
     for side_label, side in (("Left", "left"), ("Right", "right")):
         side_art = artifacts[side]
@@ -1401,14 +1049,18 @@ def render_upload_results(result: dict) -> bytes:
         artifact_figure(artifacts["rollout"]["overlay"], "Attention rollout"),
         *gradcam_figures(artifacts),
     ]
+    save_status = "Saved to disk" if result.get("saved_outputs") else "Temporary result"
+    save_note = "This result is stored under deployment_outputs." if result.get("saved_outputs") else "This result is not saved permanently and will be cleared when the app restarts or stops."
+    metadata_link = f'<a class="button" href="{html.escape(output_url(result["metadata_path"]))}">Metadata JSON</a>' if result.get("saved_outputs") else '<span class="sub">Metadata is temporary for this result.</span>'
     body = mode_nav("single") + f"""
 <section class=\"panel\"><h2>Uploaded Image Result</h2>
   <div class=\"summary\">
     <div class=\"metric\"><div class=\"k\">Safety score</div>{score_context_html(pred['safety_score'])}</div>
     <div class=\"metric\"><div class=\"k\">Place</div><div class=\"v\">{html.escape(str(meta['street_name']))}</div></div>
     <div class=\"metric\"><div class=\"k\">Mode</div><div class=\"v\">Single image</div></div>
+    <div class=\"metric\"><div class=\"k\">Storage</div><div class=\"v\">{save_status}</div></div>
   </div>
-  <div class=\"links\"><a class=\"button\" href=\"{html.escape(output_url(result['metadata_path']))}\">Metadata JSON</a><span class=\"mono\">{html.escape(str(result['run_dir']))}</span></div>
+  <div class=\"links\">{metadata_link}<span class=\"mono\">{html.escape(str(result['run_dir']))}</span><span class=\"sub\">{html.escape(save_note)}</span></div>
 </section>
 <section class=\"panel\"><h2>Interpretability Maps</h2>
   <div class=\"source-images\">
@@ -1445,7 +1097,10 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
             self.send_bytes(b"ok\n", "text/plain; charset=utf-8")
             return
         if parsed.path.startswith("/outputs/"):
-            self.serve_output(parsed.path[len("/outputs/"):])
+            self.serve_output(parsed.path[len("/outputs/"):], OUTPUT_ROOT)
+            return
+        if parsed.path.startswith("/tmp_outputs/"):
+            self.serve_output(parsed.path[len("/tmp_outputs/"):], TEMP_OUTPUT_ROOT)
             return
         if parsed.path == "/comparison":
             self.send_bytes(render_comparison_page())
@@ -1460,12 +1115,7 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
                 self.send_bytes(render_error(exc, None), status=500)
             return
         if parsed.path == "/analyze":
-            params = parse_qs(parsed.query)
-            try:
-                result = analyze(params)
-                self.send_bytes(render_results(result, params))
-            except Exception as exc:
-                self.send_bytes(render_error(exc, params), status=500)
+            self.send_bytes(render_comparison_page())
             return
         self.send_bytes(render_home())
 
@@ -1501,19 +1151,12 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
                 self.send_bytes(render_error(exc, None), status=500)
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8")
-        params = parse_qs(raw)
-        try:
-            result = analyze(params)
-            self.send_bytes(render_results(result, params))
-        except Exception as exc:
-            self.send_bytes(render_error(exc, params), status=500)
+        self.send_error(404)
 
-    def serve_output(self, rel_path: str):
+    def serve_output(self, rel_path: str, root: Path):
         try:
-            target = (OUTPUT_ROOT / rel_path).resolve()
-            target.relative_to(OUTPUT_ROOT.resolve())
+            target = (root / rel_path).resolve()
+            target.relative_to(root.resolve())
             if not target.exists() or not target.is_file():
                 self.send_error(404)
                 return
@@ -1536,6 +1179,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(list(argv) if argv is not None else None)
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(TEMP_OUTPUT_ROOT, ignore_errors=True)
+    TEMP_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     server = ReusableThreadingHTTPServer((args.host, args.port), SafetyAppHandler)
     print(f"Perceived Safety Model Inspector running at http://{args.host}:{args.port}")
     print(f"Outputs: {OUTPUT_ROOT}")
@@ -1545,6 +1190,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("\nStopping server.")
     finally:
         server.server_close()
+        shutil.rmtree(TEMP_OUTPUT_ROOT, ignore_errors=True)
     return 0
 
 
