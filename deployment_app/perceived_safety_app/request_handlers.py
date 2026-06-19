@@ -10,8 +10,8 @@ import html
 import json
 import mimetypes
 import re
+import shutil
 import tempfile
-import threading
 import traceback
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -48,15 +48,13 @@ from perceived_safety_app.image_preprocessing import pair_image_batch, single_im
 from perceived_safety_app.model_catalog import DEFAULT_RUN_ID, available_model_options
 from perceived_safety_app.model_checkpoints import build_model_for_checkpoint, resolve_checkpoint
 from perceived_safety_app.prediction import _batch_tensor, forward_model_matching_train
-OUTPUT_ROOT = APP_ROOT / "outputs"
-TEMP_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "perceived_safety_app_unsaved"
+TEMP_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "perceived_safety_app_outputs"
+TEMP_OUTPUT_MAX_AGE_SECONDS = 60 * 60
 
 TRAINED_MODEL_OPTIONS = available_model_options()
 TRAINED_MODEL_LABELS = dict(TRAINED_MODEL_OPTIONS)
 DEFAULT_CHECKPOINT_KIND = "best"
 DEFAULT_GRADCAM_TARGET = "branch_score"
-DEFAULT_SAVE_OUTPUTS = False
-
 GRADCAM_VARIANTS = ("positive", "negative", "absolute", "signed")
 GRADCAM_TARGET_OPTIONS = ("branch_score", "rank_margin", "pair_predicted_logit")
 
@@ -411,17 +409,25 @@ def compute_explanation_maps(bundle: ModelBundle, batch: dict, gradcam_target: s
     return maps
 
 
-def boolish_form_value(value: object) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "save"}
+def cleanup_temp_outputs(max_age_seconds: int = TEMP_OUTPUT_MAX_AGE_SECONDS) -> None:
+    if not TEMP_OUTPUT_ROOT.exists():
+        return
+    cutoff = dt.datetime.utcnow().timestamp() - int(max_age_seconds)
+    for child in TEMP_OUTPUT_ROOT.iterdir():
+        try:
+            if child.stat().st_mtime >= cutoff:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            elif child.is_file():
+                child.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
-def should_save_outputs_from_form(form) -> bool:
-    return boolish_form_value(form.getfirst("save_outputs", ""))
-
-
-
-def output_base_dir(save_outputs: bool) -> Path:
-    return OUTPUT_ROOT if save_outputs else TEMP_OUTPUT_ROOT
+def output_base_dir() -> Path:
+    cleanup_temp_outputs()
+    return TEMP_OUTPUT_ROOT
 
 
 def save_pair_gradcam_artifacts(maps: dict, artifacts: dict, side: str, original_path: Path, run_dir: Path) -> None:
@@ -538,8 +544,6 @@ def analyze_upload_comparison(form) -> dict:
     checkpoint_path, weights_filename = uploaded_weights_path(form, run_id)
     gradcam_target = form_get(form, "gradcam_target", DEFAULT_GRADCAM_TARGET).strip().lower() or DEFAULT_GRADCAM_TARGET
     place_name = form_get(form, "street_name", "Urban comparison").strip() or "Urban comparison"
-    save_outputs = should_save_outputs_from_form(form)
-
     left_image, left_name = uploaded_file_image(form, "upload_left_image")
     right_image, right_name = uploaded_file_image(form, "upload_right_image")
 
@@ -549,7 +553,7 @@ def analyze_upload_comparison(form) -> dict:
     maps = compute_explanation_maps(bundle, batch, gradcam_target)
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = output_base_dir(save_outputs) / f"{timestamp}_{slugify(run_id)}_comparison_{slugify(place_name)}"
+    run_dir = output_base_dir() / f"{timestamp}_{slugify(run_id)}_comparison_{slugify(place_name)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     source_images = {"left": left_image, "right": right_image}
@@ -577,7 +581,7 @@ def analyze_upload_comparison(form) -> dict:
     metadata = {
         "created_utc": timestamp,
         "mode": "comparison_upload",
-        "saved_outputs": save_outputs,
+        "saved_outputs": False,
         "run_id": run_id,
         "checkpoint_kind": DEFAULT_CHECKPOINT_KIND,
         "checkpoint_path": bundle.checkpoint_path,
@@ -599,7 +603,7 @@ def analyze_upload_comparison(form) -> dict:
     }
     metadata_path = run_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir, "saved_outputs": save_outputs}
+    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir, "saved_outputs": False}
 
 
 def form_get(form, name: str, default: str = "") -> str:
@@ -618,15 +622,13 @@ def analyze_upload(form) -> dict:
     checkpoint_path, weights_filename = uploaded_weights_path(form, run_id)
     gradcam_target = DEFAULT_GRADCAM_TARGET
     street_name = form_get(form, "street_name", "Urban image").strip() or "Urban image"
-    save_outputs = should_save_outputs_from_form(form)
-
     image, uploaded_name = uploaded_file_image(form, "upload_image")
 
     bundle = get_model_bundle(run_id, checkpoint_path)
     safety_score, maps = compute_single_image_outputs(bundle, image, gradcam_target)
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = output_base_dir(save_outputs) / f"{timestamp}_{slugify(run_id)}_upload_{slugify(street_name)}"
+    run_dir = output_base_dir() / f"{timestamp}_{slugify(run_id)}_upload_{slugify(street_name)}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     original_out = run_dir / "uploaded_original.png"
@@ -648,7 +650,7 @@ def analyze_upload(form) -> dict:
     metadata = {
         "created_utc": timestamp,
         "mode": "single_image_upload",
-        "saved_outputs": save_outputs,
+        "saved_outputs": False,
         "run_id": run_id,
         "checkpoint_kind": DEFAULT_CHECKPOINT_KIND,
         "checkpoint_path": bundle.checkpoint_path,
@@ -665,7 +667,7 @@ def analyze_upload(form) -> dict:
     }
     metadata_path = run_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir, "saved_outputs": save_outputs}
+    return {"metadata": metadata, "metadata_path": metadata_path, "artifacts": artifacts, "run_dir": run_dir, "saved_outputs": False}
 
 
 def paths_for_json(value):
@@ -679,13 +681,8 @@ def paths_for_json(value):
 
 
 def output_url(path: Path) -> str:
-    resolved = path.resolve()
-    try:
-        rel = resolved.relative_to(OUTPUT_ROOT.resolve())
-        return "/outputs/" + "/".join(rel.parts)
-    except ValueError:
-        rel = resolved.relative_to(TEMP_OUTPUT_ROOT.resolve())
-        return "/tmp_outputs/" + "/".join(rel.parts)
+    rel = path.resolve().relative_to(TEMP_OUTPUT_ROOT.resolve())
+    return "/tmp_outputs/" + "/".join(rel.parts)
 
 
 def fmt_float(value: Optional[float], digits: int = 4) -> str:
@@ -776,8 +773,6 @@ def render_layout(title: str, body: str) -> bytes:
     @media (max-width: 900px) { .viewer { grid-template-columns: 1fr; } .viewer-legend { position: static; } }
     .links { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top: 12px; }
     .header-row { display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    .shutdown-form { display:block; }
-    .shutdown-button { background:#a33a2b; white-space:nowrap; }
     .check-label { display:flex; gap:8px; align-items:center; color:var(--ink); font-size:13px; }
     .check-label input { width:auto; }
     .save-note { color:var(--muted); font-size:12px; line-height:1.35; }
@@ -809,7 +804,7 @@ def render_layout(title: str, body: str) -> bytes:
 """
     html_doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)}</title><style>{css}</style></head>
-<body><header><div class="wrap"><div class="header-row"><div><h1>Perceived Safety Model Inspector</h1><div class="sub">Default model: {html.escape(trained_model_label(DEFAULT_RUN_ID))}. Outputs are written to {html.escape(str(OUTPUT_ROOT))}.</div></div><form class="shutdown-form" method="post" action="/shutdown" onsubmit="return confirm(&quot;Stop the local app server?&quot;);"><button class="shutdown-button" type="submit">Stop Server</button></form></div></div></header><main class="wrap">{body}</main>{script}</body></html>"""
+<body><header><div class="wrap"><div class="header-row"><div><h1>Perceived Safety Model Inspector</h1><div class="sub">Default model: {html.escape(trained_model_label(DEFAULT_RUN_ID))}. Results are temporary and automatically cleaned up.</div></div></div></div></header><main class="wrap">{body}</main>{script}</body></html>"""
     return html_doc.encode("utf-8")
 
 
@@ -863,13 +858,6 @@ def model_select_options(selected_run_id: str) -> str:
     )
 
 
-def save_outputs_control(checked: bool = DEFAULT_SAVE_OUTPUTS) -> str:
-    checked_attr = " checked" if checked else ""
-    return (
-        '<label class="check-label"><input type="checkbox" name="save_outputs" value="1"' + checked_attr + '> Save outputs</label>'
-        '<div class="save-note">Unchecked results are temporary and are cleared when the app restarts or stops.</div>'
-    )
-
 
 def model_controls_html(selected_run_id: str = DEFAULT_RUN_ID) -> str:
     selected_run_id = str(selected_run_id or DEFAULT_RUN_ID).strip()
@@ -920,7 +908,6 @@ def render_upload_form(mode: str = "single") -> str:
     <label>Left image<input type="file" name="upload_left_image" accept="image/*" required></label>
     <label>Right image<input type="file" name="upload_right_image" accept="image/*" required></label>
     {weights_upload_control()}
-    {save_outputs_control()}
     <button type="submit">Analyze Pair</button>
   </form>
 </section>"""
@@ -934,7 +921,6 @@ def render_upload_form(mode: str = "single") -> str:
     <label>Place / note<input name="street_name" placeholder="optional"></label>
     <label class="file-wide">Image<input type="file" name="upload_image" accept="image/*" required></label>
     {weights_upload_control()}
-    {save_outputs_control()}
     <button type="submit">Analyze Image</button>
   </form>
 </section>"""
@@ -1005,7 +991,7 @@ def render_map_viewer(query: str) -> bytes:
     params = parse_qs(query)
     src = params.get("src", [""])[0]
     label = params.get("label", ["Heatmap"])[0]
-    if not (src.startswith("/outputs/") or src.startswith("/tmp_outputs/")):
+    if not src.startswith("/tmp_outputs/"):
         raise ValueError("Invalid heatmap source.")
     legend = heatmap_legend(label)
     bar = html.escape(legend["bar"], quote=True)
@@ -1043,9 +1029,7 @@ def render_results(result: dict) -> bytes:
     comparison = meta["comparison"]
     safer_label = "Left" if pred["predicted_safer_side"] == "left" else "Right"
     actual = comparison["human_safer_side"].capitalize()
-    save_status = "Saved to disk" if result.get("saved_outputs") else "Temporary result"
-    save_note = "This result is stored under deployment_outputs." if result.get("saved_outputs") else "This result is not saved permanently and will be cleared when the app restarts or stops."
-    metadata_link = f'<a class="button" href="{html.escape(output_url(result["metadata_path"]))}">Metadata JSON</a>' if result.get("saved_outputs") else '<span class="sub">Metadata is temporary for this result.</span>'
+    save_note = "Result files are temporary and cleaned up automatically."
     summary = f"""
 <section class="panel"><h2>Selected Comparison</h2><div class="summary">
 <div class="metric"><div class="k">Prediction</div><div class="v">{safer_label} safer</div></div>
@@ -1053,8 +1037,7 @@ def render_results(result: dict) -> bytes:
 <div class="metric"><div class="k">Left score</div>{score_context_html(pred['left_safety_score'])}</div>
 <div class="metric"><div class="k">Right score</div>{score_context_html(pred['right_safety_score'])}</div>
 <div class="metric"><div class="k">P(right safer)</div><div class="v">{fmt_pct(pred['classification_prob_right_safer'])}</div></div>
-<div class="metric"><div class="k">Storage</div><div class="v">{save_status}</div></div>
-</div><div class="links">{metadata_link}<span class="mono">{html.escape(str(result['run_dir']))}</span><span class="sub">{html.escape(save_note)}</span></div></section>"""
+</div><div class="links"><span class="sub">{html.escape(save_note)}</span></div></section>"""
     side_sections = []
     for side_label, side in (("Left", "left"), ("Right", "right")):
         side_art = artifacts[side]
@@ -1082,18 +1065,15 @@ def render_upload_results(result: dict) -> bytes:
         artifact_figure(artifacts["rollout"]["overlay"], "Attention rollout"),
         *gradcam_figures(artifacts),
     ]
-    save_status = "Saved to disk" if result.get("saved_outputs") else "Temporary result"
-    save_note = "This result is stored under deployment_outputs." if result.get("saved_outputs") else "This result is not saved permanently and will be cleared when the app restarts or stops."
-    metadata_link = f'<a class="button" href="{html.escape(output_url(result["metadata_path"]))}">Metadata JSON</a>' if result.get("saved_outputs") else '<span class="sub">Metadata is temporary for this result.</span>'
+    save_note = "Result files are temporary and cleaned up automatically."
     body = mode_nav("single") + f"""
 <section class=\"panel\"><h2>Uploaded Image Result</h2>
   <div class=\"summary\">
     <div class=\"metric\"><div class=\"k\">Safety score</div>{score_context_html(pred['safety_score'])}</div>
     <div class=\"metric\"><div class=\"k\">Place</div><div class=\"v\">{html.escape(str(meta['street_name']))}</div></div>
     <div class=\"metric\"><div class=\"k\">Mode</div><div class=\"v\">Single image</div></div>
-    <div class=\"metric\"><div class=\"k\">Storage</div><div class=\"v\">{save_status}</div></div>
   </div>
-  <div class=\"links\">{metadata_link}<span class=\"mono\">{html.escape(str(result['run_dir']))}</span><span class=\"sub\">{html.escape(save_note)}</span></div>
+  <div class=\"links\"><span class=\"sub\">{html.escape(save_note)}</span></div>
 </section>
 <section class=\"panel\"><h2>Interpretability Maps</h2>
   <div class=\"source-images\">
@@ -1129,9 +1109,6 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self.send_bytes(b"ok\n", "text/plain; charset=utf-8")
             return
-        if parsed.path.startswith("/outputs/"):
-            self.serve_output(parsed.path[len("/outputs/"):], OUTPUT_ROOT)
-            return
         if parsed.path.startswith("/tmp_outputs/"):
             self.serve_output(parsed.path[len("/tmp_outputs/"):], TEMP_OUTPUT_ROOT)
             return
@@ -1154,16 +1131,6 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/shutdown":
-            body = render_layout(
-                "Server Stopped",
-                "<section class=\"panel\"><h2>Server stopped</h2>"
-                "<p>You can close this browser tab. Run the Python command again to restart the app.</p></section>",
-            )
-            self.send_bytes(body)
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
-            return
-
         if parsed.path == "/upload":
             try:
                 form = cgi.FieldStorage(

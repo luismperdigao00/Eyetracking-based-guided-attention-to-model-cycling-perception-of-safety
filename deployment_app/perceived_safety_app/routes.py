@@ -7,7 +7,7 @@ import shutil
 from http.server import ThreadingHTTPServer
 from typing import Iterable, Optional
 
-from perceived_safety_app.request_handlers import OUTPUT_ROOT, TEMP_OUTPUT_ROOT, SafetyAppHandler
+from perceived_safety_app.request_handlers import TEMP_OUTPUT_ROOT, SafetyAppHandler
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -20,13 +20,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(TEMP_OUTPUT_ROOT, ignore_errors=True)
     TEMP_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     server = ReusableThreadingHTTPServer((args.host, args.port), SafetyAppHandler)
     print(f"Perceived Safety Model Inspector running at http://{args.host}:{args.port}")
-    print(f"Outputs: {OUTPUT_ROOT}")
+    print(f"Temporary outputs: {TEMP_OUTPUT_ROOT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -45,7 +45,7 @@ deployment_app/
 │       ├── tokens.py
 │       └── attention_alignment.py
 ├── models/                            # bundled trained checkpoints
-└── outputs/                           # saved analysis outputs when Save outputs is enabled
+└── outputs/                           # unused in public mode; results stay temporary
 ```
 
 Keep the terminal open while using the app, then open:
@@ -54,7 +54,7 @@ Keep the terminal open while using the app, then open:
 http://127.0.0.1:8765
 ```
 
-To stop it, click **Stop Server** in the app or press `Ctrl+C` in the terminal.
+To stop it during local development, press `Ctrl+C` in the terminal.
 
 If port `8765` is already busy, start it on another port:
 
@@ -62,15 +62,7 @@ If port `8765` is already busy, start it on another port:
 python deployment_app/run_app.py --port 8766
 ```
 
-By default, analysis results are temporary so uploaded examples do not fill the disk. Check **Save outputs** in the app only when you want to keep a result.
-
-Saved outputs are written under:
-
-```text
-deployment_app/outputs/
-```
-
-Temporary outputs are cleared when the app restarts or stops.
+Analysis results are temporary. The public app does not expose persistent saving, and old temporary result files are cleaned up automatically so the container does not accumulate user uploads.
 
 ## What you can upload
 
