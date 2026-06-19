@@ -58,7 +58,7 @@ DEFAULT_GRADCAM_TARGET = "branch_score"
 GRADCAM_VARIANTS = ("positive", "negative", "absolute", "signed")
 GRADCAM_TARGET_OPTIONS = ("branch_score", "rank_margin", "pair_predicted_logit")
 
-OVERLAY_ALPHA = 0.52
+OVERLAY_ALPHA = 0.72
 HEATMAP_SIZE = 520
 MAP_EPS = 1e-8
 
@@ -223,32 +223,34 @@ def _pil_resample_from_specs(specs: dict) -> int:
     return Image.Resampling.BILINEAR
 
 
-def model_input_view(image: Image.Image, bundle: ModelBundle) -> Image.Image:
-    """Recreate the deterministic eval resize + center crop used by the model."""
-    specs = bundle.specs
+def model_input_geometry(image_size: Tuple[int, int], specs: dict) -> Tuple[Tuple[int, int], Tuple[int, int, int, int]]:
+    """Return the resized dimensions and center-crop box used for inference."""
     input_size = specs.get("input_size", (3, int(specs.get("img_size", 224)), int(specs.get("img_size", 224))))
     out_size = int(input_size[-1])
     crop_pct = float(specs.get("crop_pct", 1.0) or 1.0)
     resize_short = max(out_size, int(round(out_size / crop_pct)))
-    resample = _pil_resample_from_specs(specs)
-
-    img = image.convert("RGB")
-    width, height = img.size
+    width, height = image_size
     if width <= 0 or height <= 0:
         raise ValueError(f"Invalid image size for model-input view: {(width, height)}")
     if width <= height:
         new_width = resize_short
-        new_height = int(round(resize_short * height / width))
+        new_height = int(resize_short * height / width)
     else:
         new_height = resize_short
-        new_width = int(round(resize_short * width / height))
+        new_width = int(resize_short * width / height)
     new_width = max(out_size, new_width)
     new_height = max(out_size, new_height)
-    img = img.resize((new_width, new_height), resample)
-
     left = max(0, (new_width - out_size) // 2)
     top = max(0, (new_height - out_size) // 2)
-    return img.crop((left, top, left + out_size, top + out_size))
+    return (new_width, new_height), (left, top, left + out_size, top + out_size)
+
+
+def model_input_view(image: Image.Image, bundle: ModelBundle) -> Image.Image:
+    """Recreate the deterministic eval resize + center crop used by the model."""
+    img = image.convert("RGB")
+    resized_size, crop_box = model_input_geometry(img.size, bundle.specs)
+    img = img.resize(resized_size, _pil_resample_from_specs(bundle.specs))
+    return img.crop(crop_box)
 
 
 def save_model_input_view(source: Path | Image.Image, bundle: ModelBundle, out_path: Path) -> None:
@@ -267,12 +269,42 @@ def colorize(arr: np.ndarray, cmap_name: str, *, signed: bool = False) -> Image.
     return Image.fromarray((rgba[:, :, :3] * 255).astype(np.uint8), mode="RGB")
 
 
-def overlay_heatmap(image_path: Path, heatmap: np.ndarray, out_path: Path, *, cmap_name: str, signed: bool = False) -> None:
+def overlay_heatmap(
+    image_path: Path,
+    heatmap: np.ndarray,
+    out_path: Path,
+    *,
+    specs: dict,
+    cmap_name: str,
+    signed: bool = False,
+) -> None:
+    """Project a model-space heatmap onto only the original region seen by the model."""
     base = Image.open(image_path).convert("RGB")
-    heat = resize_array(heatmap, base.size, signed=signed)
+    resized_size, resized_crop = model_input_geometry(base.size, specs)
+    resized_width, resized_height = resized_size
+    left, top, right, bottom = resized_crop
+
+    scale_x = base.width / resized_width
+    scale_y = base.height / resized_height
+    original_crop = (
+        max(0, int(round(left * scale_x))),
+        max(0, int(round(top * scale_y))),
+        min(base.width, int(round(right * scale_x))),
+        min(base.height, int(round(bottom * scale_y))),
+    )
+    crop_width = max(1, original_crop[2] - original_crop[0])
+    crop_height = max(1, original_crop[3] - original_crop[1])
+    heat = resize_array(heatmap, (crop_width, crop_height), signed=signed)
     colored = colorize(heat, cmap_name, signed=signed)
     base = ImageEnhance.Contrast(base).enhance(1.04)
-    Image.blend(base, colored, OVERLAY_ALPHA).save(out_path)
+    base = ImageEnhance.Brightness(base).enhance(0.52)
+    base_crop = base.crop(original_crop)
+    magnitude = np.abs(heat) if signed else heat
+    visible_heat = np.clip((magnitude - 0.08) / 0.92, 0.0, 1.0)
+    opacity = np.power(visible_heat, 0.6) * OVERLAY_ALPHA
+    mask = Image.fromarray((opacity * 255).astype(np.uint8), mode="L")
+    base.paste(Image.composite(colored, base_crop, mask), original_crop[:2])
+    base.save(out_path)
 
 
 def save_heatmap_only(heatmap: np.ndarray, out_path: Path, *, cmap_name: str, signed: bool = False) -> None:
@@ -430,7 +462,9 @@ def output_base_dir() -> Path:
     return TEMP_OUTPUT_ROOT
 
 
-def save_pair_gradcam_artifacts(maps: dict, artifacts: dict, side: str, original_path: Path, run_dir: Path) -> None:
+def save_pair_gradcam_artifacts(
+    maps: dict, artifacts: dict, side: str, original_path: Path, run_dir: Path, specs: dict
+) -> None:
     families = (("gradcam", "gradcam", "Grad-CAM"),)
     for map_key, file_key, _label_prefix in families:
         if map_key not in maps:
@@ -439,12 +473,14 @@ def save_pair_gradcam_artifacts(maps: dict, artifacts: dict, side: str, original
             arr, cmap_name, is_signed = maps[map_key][variant][side]
             overlay = run_dir / f"{side}_{file_key}_{variant}_overlay.png"
             heat = run_dir / f"{side}_{file_key}_{variant}_heatmap.png"
-            overlay_heatmap(original_path, arr, overlay, cmap_name=cmap_name, signed=is_signed)
+            overlay_heatmap(original_path, arr, overlay, specs=specs, cmap_name=cmap_name, signed=is_signed)
             save_heatmap_only(arr, heat, cmap_name=cmap_name, signed=is_signed)
             artifacts[side][f"{file_key}_{variant}"] = {"overlay": overlay, "heatmap": heat}
 
 
-def save_single_gradcam_artifacts(maps: dict, artifacts: dict, original_path: Path, run_dir: Path) -> None:
+def save_single_gradcam_artifacts(
+    maps: dict, artifacts: dict, original_path: Path, run_dir: Path, specs: dict
+) -> None:
     families = (("gradcam", "gradcam"),)
     for map_key, file_key in families:
         if map_key not in maps:
@@ -453,7 +489,7 @@ def save_single_gradcam_artifacts(maps: dict, artifacts: dict, original_path: Pa
             arr, cmap_name, is_signed = maps[map_key][variant]
             overlay = run_dir / f"upload_{file_key}_{variant}_overlay.png"
             heat = run_dir / f"upload_{file_key}_{variant}_heatmap.png"
-            overlay_heatmap(original_path, arr, overlay, cmap_name=cmap_name, signed=is_signed)
+            overlay_heatmap(original_path, arr, overlay, specs=specs, cmap_name=cmap_name, signed=is_signed)
             save_heatmap_only(arr, heat, cmap_name=cmap_name, signed=is_signed)
             artifacts[f"{file_key}_{variant}"] = {"overlay": overlay, "heatmap": heat}
 
@@ -571,12 +607,14 @@ def analyze_upload_comparison(form) -> dict:
             arr = normalize01(maps[method][side])
             overlay = run_dir / f"{side}_{method}_overlay.png"
             heat = run_dir / f"{side}_{method}_heatmap.png"
-            overlay_heatmap(artifacts[side]["original"], arr, overlay, cmap_name="magma", signed=False)
+            overlay_heatmap(
+                artifacts[side]["original"], arr, overlay, specs=bundle.specs, cmap_name="magma", signed=False
+            )
             save_heatmap_only(arr, heat, cmap_name="magma", signed=False)
             artifacts[side][method] = {"overlay": overlay, "heatmap": heat}
 
     for side in ("left", "right"):
-        save_pair_gradcam_artifacts(maps, artifacts, side, artifacts[side]["original"], run_dir)
+        save_pair_gradcam_artifacts(maps, artifacts, side, artifacts[side]["original"], run_dir, bundle.specs)
 
     metadata = {
         "created_utc": timestamp,
@@ -641,11 +679,11 @@ def analyze_upload(form) -> dict:
         arr = normalize01(maps[method])
         overlay = run_dir / f"upload_{method}_overlay.png"
         heat = run_dir / f"upload_{method}_heatmap.png"
-        overlay_heatmap(artifacts["original"], arr, overlay, cmap_name="magma", signed=False)
+        overlay_heatmap(artifacts["original"], arr, overlay, specs=bundle.specs, cmap_name="magma", signed=False)
         save_heatmap_only(arr, heat, cmap_name="magma", signed=False)
         artifacts[method] = {"overlay": overlay, "heatmap": heat}
 
-    save_single_gradcam_artifacts(maps, artifacts, artifacts["original"], run_dir)
+    save_single_gradcam_artifacts(maps, artifacts, artifacts["original"], run_dir, bundle.specs)
 
     metadata = {
         "created_utc": timestamp,
