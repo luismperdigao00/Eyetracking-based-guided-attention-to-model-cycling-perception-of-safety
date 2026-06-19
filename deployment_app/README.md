@@ -16,24 +16,35 @@ You can also run it from inside the deployment folder:
 cd deployment_app
 python run_app.py --port 8765
 ```
-The local structure is:
+## Project Structure
 
 ```text
-deployment_app/run_app.py                         # launcher: starts the web app
-deployment_app/perceived_safety_app/routes.py     # HTTP server bootstrap
-deployment_app/perceived_safety_app/request_handlers.py # upload routes, HTML, result pages
-deployment_app/perceived_safety_app/config.py     # device, paths, runtime settings
-deployment_app/perceived_safety_app/image_preprocessing.py # upload image preprocessing
-deployment_app/perceived_safety_app/model_catalog.py # bundled model settings
-deployment_app/perceived_safety_app/model_checkpoints.py # checkpoint lookup and model loading
-deployment_app/perceived_safety_app/prediction.py # forward-pass helpers
-deployment_app/perceived_safety_app/explanation_maps.py # attention maps and Grad-CAM
-deployment_app/model_code/backbone.py             # DINOv3 backbone and preprocessing specs
-deployment_app/model_code/gaze_config.py          # deployment gaze config
-deployment_app/model_code/model_factory.py        # EG-PCS-Net model construction
-deployment_app/model_code/transformer/            # transformer model components
-deployment_app/models/                            # bundled best checkpoints for EG-PCS-Net runs
-deployment_app/outputs/                           # saved app outputs, only when Save outputs is checked
+deployment_app/
+├── run_app.py                         # command-line launcher
+├── requirements.txt                   # deployment dependencies
+├── perceived_safety_app/              # web app, inference orchestration, and outputs rendering
+│   ├── __init__.py
+│   ├── config.py                      # device selection, paths, and runtime flags
+│   ├── routes.py                      # HTTP server bootstrap and lifecycle
+│   ├── request_handlers.py            # upload handling, result pages, and artifact serving
+│   ├── image_preprocessing.py         # deterministic image preprocessing for uploaded images
+│   ├── model_catalog.py               # bundled model metadata and selectable runs
+│   ├── model_checkpoints.py           # checkpoint resolution, model reconstruction, and weight loading
+│   ├── prediction.py                  # model forward-pass helpers
+│   └── explanation_maps.py            # attention rollout, raw attention, and Grad-CAM extraction
+├── model_code/                        # self-contained EG-PCS-Net/DINOv3 implementation
+│   ├── __init__.py
+│   ├── backbone.py                    # DINOv3 backbone resolution and preprocessing specs
+│   ├── gaze_config.py                 # deployment gaze-alignment configuration
+│   ├── model_factory.py               # EG-PCS-Net model construction
+│   └── transformer/                   # transformer wrapper and attention utilities
+│       ├── __init__.py
+│       ├── model.py
+│       ├── forward.py
+│       ├── tokens.py
+│       └── attention_alignment.py
+├── models/                            # bundled trained checkpoints
+└── outputs/                           # saved analysis outputs when Save outputs is enabled
 ```
 
 Keep the terminal open while using the app, then open:
