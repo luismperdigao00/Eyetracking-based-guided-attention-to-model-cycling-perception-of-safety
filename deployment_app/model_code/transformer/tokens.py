@@ -4,27 +4,15 @@ Token-level helpers shared by transformer mechanisms.
 This module answers questions like:
   - What did the backbone return?
   - How many prefix/register tokens exist?
-  - What is the patch grid?
   - How should tokens be pooled for the ranking/classification heads?
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
-
-def _ensure_gaze_4d(gaze: torch.Tensor) -> torch.Tensor:
-    if gaze.ndim == 4:
-        return gaze
-    if gaze.ndim == 3:
-        return gaze.unsqueeze(1)
-    if gaze.ndim == 2:
-        return gaze.unsqueeze(1).unsqueeze(1)
-    raise ValueError(f"Unsupported gaze tensor shape: {tuple(gaze.shape)}")
 
 
 def _safe_module_device(module: nn.Module) -> torch.device:
@@ -122,59 +110,6 @@ def infer_num_prefix_tokens(backbone: nn.Module, force: Optional[int] = None) ->
     if npt is not None:
         return int(npt)
     return 1
-
-
-def _as_hw_int(value: Any, *, name: str) -> Tuple[int, int]:
-    if isinstance(value, (tuple, list)):
-        if len(value) != 2:
-            raise RuntimeError(f"{name} must have length 2, got {value!r}.")
-        h, w = value
-    else:
-        h = w = value
-
-    h, w = int(h), int(w)
-    if h <= 0 or w <= 0:
-        raise RuntimeError(f"{name} must be positive, got {(h, w)}.")
-    return h, w
-
-
-def infer_patch_grid(backbone: nn.Module, num_patches: Optional[int] = None) -> Tuple[int, int]:
-    pe = getattr(backbone, "patch_embed", None)
-    if pe is not None:
-        gs = getattr(pe, "grid_size", None)
-        if gs is not None:
-            grid_hw = _as_hw_int(gs, name="backbone.patch_embed.grid_size")
-            np = getattr(pe, "num_patches", None)
-            if np is not None and int(np) != grid_hw[0] * grid_hw[1]:
-                raise RuntimeError(
-                    "Inconsistent ViT metadata: "
-                    f"grid_size={grid_hw} but num_patches={int(np)}."
-                )
-            return grid_hw
-
-        np = getattr(pe, "num_patches", None)
-        if isinstance(np, int) and np > 0:
-            g = int(math.isqrt(np))
-            if g * g == int(np):
-                return g, g
-            raise RuntimeError(
-                "Cannot infer non-square ViT grid from num_patches alone; "
-                "expected patch_embed.grid_size on the backbone."
-            )
-
-    if num_patches is not None and int(num_patches) > 0:
-        g = int(math.isqrt(int(num_patches)))
-        if g * g == int(num_patches):
-            return g, g
-        raise RuntimeError(
-            "Cannot infer non-square ViT grid from num_patches alone; "
-            "pass a backbone with patch_embed.grid_size."
-        )
-
-    raise RuntimeError(
-        "Could not infer ViT patch grid; expected backbone.patch_embed.grid_size "
-        "or a square patch_embed.num_patches."
-    )
 
 
 def pool_tokens(

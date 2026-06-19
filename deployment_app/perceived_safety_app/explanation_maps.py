@@ -306,11 +306,6 @@ def _run_pair_final_attention_gradcam(
     finally:
         _restore_final_attention_gradcam(net, recorder, old_state)
 
-def _batch_tensor(batch: dict, key: str, *, as_float: bool = False):
-    if key not in batch:
-        return None
-    x = batch[key].to(config.DEVICE, non_blocking=True)
-    return x.float() if as_float else x
 
 def get_vit_ranking_gradcam_maps(net, batch: dict, grid_hw: Tuple[int, int]):
     """Return final-attention Grad-CAM maps for the configured ranking/pair target."""

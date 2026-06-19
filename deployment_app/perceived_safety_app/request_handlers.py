@@ -4,23 +4,20 @@
 
 from __future__ import annotations
 
-import argparse
 import cgi
 import datetime as dt
 import html
 import json
 import mimetypes
 import re
-import shutil
-import sys
 import tempfile
 import threading
 import traceback
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
 
 import numpy as np
@@ -32,13 +29,25 @@ matplotlib.use("Agg")
 from matplotlib import cm
 
 
-PACKAGE_ROOT = Path(__file__).resolve().parent
-APP_ROOT = PACKAGE_ROOT.parent
-if str(PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_ROOT))
+APP_ROOT = Path(__file__).resolve().parents[1]
 
-from perceived_safety_app import model_runtime, config
+from perceived_safety_app import config
+from perceived_safety_app.explanation_maps import (
+    _attention_heads_to_2d_feature_map,
+    _configure_final_attention_gradcam,
+    _pair_gradcam_scalar_target,
+    _prepare_self_attention_mode,
+    _raw_eval_layer,
+    _restore_attention_state,
+    _restore_final_attention_gradcam,
+    _snapshot_attention_state,
+    _to_2d,
+    get_explanation_maps_for_batch,
+)
+from perceived_safety_app.image_preprocessing import pair_image_batch, single_image_inputs
 from perceived_safety_app.model_catalog import DEFAULT_RUN_ID, available_model_options
+from perceived_safety_app.model_checkpoints import build_model_for_checkpoint, resolve_checkpoint
+from perceived_safety_app.prediction import _batch_tensor, forward_model_matching_train
 OUTPUT_ROOT = APP_ROOT / "outputs"
 TEMP_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "perceived_safety_app_unsaved"
 
@@ -48,7 +57,6 @@ DEFAULT_CHECKPOINT_KIND = "best"
 DEFAULT_GRADCAM_TARGET = "branch_score"
 DEFAULT_SAVE_OUTPUTS = False
 
-ATTENTION_METHODS = ("raw", "rollout", "gradcam")
 GRADCAM_VARIANTS = ("positive", "negative", "absolute", "signed")
 GRADCAM_TARGET_OPTIONS = ("branch_score", "rank_margin", "pair_predicted_logit")
 
@@ -56,8 +64,6 @@ OVERLAY_ALPHA = 0.52
 HEATMAP_SIZE = 520
 MAP_EPS = 1e-8
 
-REFERENCE_SCORE_RUN_ID = "n7xroowm"
-REFERENCE_SCORE_SPLIT = "data/comparisons_df.pickle"
 REFERENCE_SCORE_STATS = {
     "min": -4.55092191696167,
     "max": 4.994133949279785,
@@ -101,12 +107,11 @@ def slugify(value: object) -> str:
     return s.strip("_") or "item"
 
 
-def load_eval_module():
-    """Return the model runtime module configured for interactive app inference."""
+def configure_runtime() -> None:
+    """Configure interactive app inference options."""
     config.VERBOSE = False
     config.SHOW_PROGRESS = False
     config.ATTENTION_EXTRACTIONS = "all"
-    return model_runtime
 
 
 def get_model_bundle(run_id: str, checkpoint_path: str = "") -> ModelBundle:
@@ -117,15 +122,15 @@ def get_model_bundle(run_id: str, checkpoint_path: str = "") -> ModelBundle:
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
 
-    eval_mod = load_eval_module()
+    configure_runtime()
     entry = {
         "tag": f"deployment_{slugify(run_id)}",
         "run_id": run_id,
         "checkpoint": checkpoint_path or None,
         "checkpoint_kind": checkpoint_kind,
     }
-    rr = eval_mod.resolve_checkpoint(entry)
-    net, specs, gaze_grid_size = eval_mod.build_model_for_checkpoint(rr)
+    rr = resolve_checkpoint(entry)
+    net, specs, gaze_grid_size = build_model_for_checkpoint(rr)
     net.eval()
 
     bundle = ModelBundle(
@@ -277,14 +282,14 @@ def save_heatmap_only(heatmap: np.ndarray, out_path: Path, *, cmap_name: str, si
     colorize(heat, cmap_name, signed=signed).save(out_path)
 
 
-def signed_gradcam_from_final_attention(eval_mod, attn: torch.Tensor, grad_attn: torch.Tensor, grid_hw, num_prefix_tokens: int):
+def signed_gradcam_from_final_attention(attn: torch.Tensor, grad_attn: torch.Tensor, grid_hw, num_prefix_tokens: int):
     prefix = int(num_prefix_tokens)
     if attn.shape[-1] <= prefix:
         raise RuntimeError("Final attention matrix has no spatial patch columns after prefix-token removal.")
     attn_spatial = attn[:, :, 0, prefix:]
     grad_spatial = grad_attn[:, :, 0, prefix:]
-    feat_attn, native_hw = eval_mod._attention_heads_to_2d_feature_map(attn_spatial, grid_hw)
-    grad_map, _ = eval_mod._attention_heads_to_2d_feature_map(grad_spatial, grid_hw)
+    feat_attn, native_hw = _attention_heads_to_2d_feature_map(attn_spatial, grid_hw)
+    grad_map, _ = _attention_heads_to_2d_feature_map(grad_spatial, grid_hw)
     weights = grad_map.mean(dim=(2, 3), keepdim=True)
     cam = (weights * feat_attn).sum(dim=1)
     if tuple(native_hw) != tuple(grid_hw):
@@ -292,8 +297,8 @@ def signed_gradcam_from_final_attention(eval_mod, attn: torch.Tensor, grad_attn:
     return cam
 
 
-def run_branch_signed_gradcam(eval_mod, net, x, grid_hw, gaze_map=None, has_eye_mask=None):
-    recorder, old_state = eval_mod._configure_final_attention_gradcam(net)
+def run_branch_signed_gradcam(net, x, grid_hw, gaze_map=None, has_eye_mask=None):
+    recorder, old_state = _configure_final_attention_gradcam(net)
     try:
         x = x.detach().requires_grad_(True)
         _, score, _, _ = net._forward_one(x, gaze_map=gaze_map, has_eye_mask=has_eye_mask)
@@ -301,13 +306,13 @@ def run_branch_signed_gradcam(eval_mod, net, x, grid_hw, gaze_map=None, has_eye_
         if final_attn is None or (not torch.is_tensor(final_attn)) or (not final_attn.requires_grad):
             raise RuntimeError("Final attention matrix was not captured with gradients.")
         grad_attn = torch.autograd.grad(score.view(-1).sum(), final_attn, retain_graph=False, allow_unused=False)[0]
-        return signed_gradcam_from_final_attention(eval_mod, final_attn, grad_attn, grid_hw, int(getattr(net, "num_prefix_tokens", 1))).detach()
+        return signed_gradcam_from_final_attention(final_attn, grad_attn, grid_hw, int(getattr(net, "num_prefix_tokens", 1))).detach()
     finally:
-        eval_mod._restore_final_attention_gradcam(net, recorder, old_state)
+        _restore_final_attention_gradcam(net, recorder, old_state)
 
 
-def run_pair_signed_gradcam(eval_mod, net, x_l, x_r, grid_hw, gaze_l=None, gaze_r=None, has_eye_mask=None, score_target="rank_margin"):
-    recorder, old_state = eval_mod._configure_final_attention_gradcam(net)
+def run_pair_signed_gradcam(net, x_l, x_r, grid_hw, gaze_l=None, gaze_r=None, has_eye_mask=None, score_target="rank_margin"):
+    recorder, old_state = _configure_final_attention_gradcam(net)
     try:
         x_l = x_l.detach().requires_grad_(True)
         x_r = x_r.detach().requires_grad_(True)
@@ -318,35 +323,35 @@ def run_pair_signed_gradcam(eval_mod, net, x_l, x_r, grid_hw, gaze_l=None, gaze_
         captured = [final_attn_l, final_attn_r]
         if any(a is None or (not torch.is_tensor(a)) or (not a.requires_grad) for a in captured):
             raise RuntimeError("Final attention matrices were not captured with gradients for both branches.")
-        target = eval_mod._pair_gradcam_scalar_target(net, pooled_l, score_l, pooled_r, score_r, score_target)
+        target = _pair_gradcam_scalar_target(net, pooled_l, score_l, pooled_r, score_r, score_target)
         grad_l, grad_r = torch.autograd.grad(target, captured, retain_graph=False, allow_unused=False)
         prefix = int(getattr(net, "num_prefix_tokens", 1))
         return (
-            signed_gradcam_from_final_attention(eval_mod, final_attn_l, grad_l, grid_hw, prefix).detach(),
-            signed_gradcam_from_final_attention(eval_mod, final_attn_r, grad_r, grid_hw, prefix).detach(),
+            signed_gradcam_from_final_attention(final_attn_l, grad_l, grid_hw, prefix).detach(),
+            signed_gradcam_from_final_attention(final_attn_r, grad_r, grid_hw, prefix).detach(),
         )
     finally:
-        eval_mod._restore_final_attention_gradcam(net, recorder, old_state)
+        _restore_final_attention_gradcam(net, recorder, old_state)
 
 
-def get_signed_gradcam_maps(eval_mod, bundle: ModelBundle, batch: dict, target: str):
+def get_signed_gradcam_maps(bundle: ModelBundle, batch: dict, target: str):
     target = (target or DEFAULT_GRADCAM_TARGET).strip().lower()
     if target not in GRADCAM_TARGET_OPTIONS:
         raise ValueError(f"Unknown Grad-CAM target {target!r}.")
     net = bundle.net
     net.zero_grad(set_to_none=True)
-    x_l = eval_mod._batch_tensor(batch, "image_l")
-    x_r = eval_mod._batch_tensor(batch, "image_r")
-    gaze_l = eval_mod._batch_tensor(batch, "gaze_l", as_float=True)
-    gaze_r = eval_mod._batch_tensor(batch, "gaze_r", as_float=True)
-    has_eye_mask = eval_mod._batch_tensor(batch, "has_eyetracker")
+    x_l = _batch_tensor(batch, "image_l")
+    x_r = _batch_tensor(batch, "image_r")
+    gaze_l = _batch_tensor(batch, "gaze_l", as_float=True)
+    gaze_r = _batch_tensor(batch, "gaze_r", as_float=True)
+    has_eye_mask = _batch_tensor(batch, "has_eyetracker")
     with torch.enable_grad():
         if target == "branch_score":
-            m_l = run_branch_signed_gradcam(eval_mod, net, x_l, bundle.gaze_grid_size, gaze_map=gaze_l, has_eye_mask=has_eye_mask)
+            m_l = run_branch_signed_gradcam(net, x_l, bundle.gaze_grid_size, gaze_map=gaze_l, has_eye_mask=has_eye_mask)
             net.zero_grad(set_to_none=True)
-            m_r = run_branch_signed_gradcam(eval_mod, net, x_r, bundle.gaze_grid_size, gaze_map=gaze_r, has_eye_mask=has_eye_mask)
+            m_r = run_branch_signed_gradcam(net, x_r, bundle.gaze_grid_size, gaze_map=gaze_r, has_eye_mask=has_eye_mask)
             return m_l, m_r
-        return run_pair_signed_gradcam(eval_mod, net, x_l, x_r, bundle.gaze_grid_size, gaze_l=gaze_l, gaze_r=gaze_r, has_eye_mask=has_eye_mask, score_target=target)
+        return run_pair_signed_gradcam(net, x_l, x_r, bundle.gaze_grid_size, gaze_l=gaze_l, gaze_r=gaze_r, has_eye_mask=has_eye_mask, score_target=target)
 
 
 
@@ -365,9 +370,9 @@ def gradcam_variant(arr: np.ndarray, variant: str) -> Tuple[np.ndarray, str, boo
 
 
 def model_prediction(bundle: ModelBundle, batch: dict) -> dict:
-    eval_mod = load_eval_module()
+    configure_runtime()
     with torch.inference_mode():
-        out = eval_mod.forward_model_matching_train(bundle.net, batch)
+        out = forward_model_matching_train(bundle.net, batch)
     score_l = float(out["left"]["output"].view(-1)[0].detach().cpu().item())
     score_r = float(out["right"]["output"].view(-1)[0].detach().cpu().item())
     result = {
@@ -389,13 +394,13 @@ def model_prediction(bundle: ModelBundle, batch: dict) -> dict:
 
 
 def compute_explanation_maps(bundle: ModelBundle, batch: dict, gradcam_target: str):
-    eval_mod = load_eval_module()
+    configure_runtime()
     maps = {}
     for method in ("raw", "rollout"):
-        m_l, m_r = eval_mod.get_explanation_maps_for_batch(bundle.net, batch, method, bundle.gaze_grid_size)
+        m_l, m_r = get_explanation_maps_for_batch(bundle.net, batch, method, bundle.gaze_grid_size)
         maps[method] = {"left": first_map_np(m_l), "right": first_map_np(m_r)}
 
-    g_l, g_r = get_signed_gradcam_maps(eval_mod, bundle, batch, gradcam_target)
+    g_l, g_r = get_signed_gradcam_maps(bundle, batch, gradcam_target)
     signed_maps = {"left": first_map_np(g_l), "right": first_map_np(g_r)}
     maps["gradcam"] = {}
     for variant in GRADCAM_VARIANTS:
@@ -413,9 +418,6 @@ def boolish_form_value(value: object) -> bool:
 def should_save_outputs_from_form(form) -> bool:
     return boolish_form_value(form.getfirst("save_outputs", ""))
 
-
-def should_save_outputs_from_params(params: dict) -> bool:
-    return boolish_form_value(params.get("save_outputs", [""])[0] if params else "")
 
 
 def output_base_dir(save_outputs: bool) -> Path:
@@ -451,37 +453,37 @@ def save_single_gradcam_artifacts(maps: dict, artifacts: dict, original_path: Pa
 
 
 def preprocess_single_image(bundle: ModelBundle, image: Image.Image):
-    eval_mod = load_eval_module()
-    return eval_mod.single_image_inputs(image, bundle.specs, bundle.gaze_grid_size)
+    configure_runtime()
+    return single_image_inputs(image, bundle.specs, bundle.gaze_grid_size)
 
 
-def single_attention_map(eval_mod, bundle: ModelBundle, x, gaze, has_eye, method: str):
+def single_attention_map(bundle: ModelBundle, x, gaze, has_eye, method: str):
     net = bundle.net
-    state = eval_mod._snapshot_attention_state(net)
+    state = _snapshot_attention_state(net)
     try:
-        eval_mod._prepare_self_attention_mode(net, method, layer=eval_mod._raw_eval_layer(net))
+        _prepare_self_attention_mode(net, method, layer=_raw_eval_layer(net))
         with torch.inference_mode():
             _pooled, score, attn_map, _token_map = net._forward_one(x, gaze_map=gaze, has_eye_mask=has_eye)
         if attn_map is None:
             raise RuntimeError(f"{method} extraction returned no attention map for the uploaded image.")
-        return eval_mod._to_2d(attn_map).detach(), score.detach()
+        return _to_2d(attn_map).detach(), score.detach()
     finally:
-        eval_mod._restore_attention_state(net, state)
+        _restore_attention_state(net, state)
 
 
 def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradcam_target: str):
-    eval_mod = load_eval_module()
+    configure_runtime()
     x, gaze, has_eye = preprocess_single_image(bundle, image)
     maps = {}
     scores = []
     for method in ("raw", "rollout"):
-        m, score = single_attention_map(eval_mod, bundle, x, gaze, has_eye, method)
+        m, score = single_attention_map(bundle, x, gaze, has_eye, method)
         maps[method] = first_map_np(m)
         scores.append(float(score.view(-1)[0].detach().cpu().item()))
 
     bundle.net.zero_grad(set_to_none=True)
     with torch.enable_grad():
-        signed = run_branch_signed_gradcam(eval_mod, bundle.net, x, bundle.gaze_grid_size, gaze_map=gaze, has_eye_mask=has_eye)
+        signed = run_branch_signed_gradcam(bundle.net, x, bundle.gaze_grid_size, gaze_map=gaze, has_eye_mask=has_eye)
     signed_np = first_map_np(signed)
     maps["gradcam"] = {variant: gradcam_variant(signed_np, variant) for variant in GRADCAM_VARIANTS}
 
@@ -490,8 +492,8 @@ def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradca
 
 
 def preprocess_uploaded_pair(bundle: ModelBundle, left_image: Image.Image, right_image: Image.Image) -> dict:
-    eval_mod = load_eval_module()
-    return eval_mod.pair_image_batch(left_image, right_image, bundle.specs, bundle.gaze_grid_size)
+    configure_runtime()
+    return pair_image_batch(left_image, right_image, bundle.specs, bundle.gaze_grid_size)
 
 
 def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
@@ -690,14 +692,6 @@ def fmt_pct(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{100.0 * float(value):.2f}%"
 
 
-def reference_score_percentile(value: Optional[float]) -> Optional[float]:
-    if value is None or not np.isfinite(float(value)):
-        return None
-    pairs = sorted((float(v), float(k)) for k, v in REFERENCE_SCORE_STATS["percentiles"].items())
-    score_values = np.array([p[0] for p in pairs], dtype=float)
-    pct_values = np.array([p[1] for p in pairs], dtype=float)
-    return float(np.interp(float(value), score_values, pct_values, left=0.0, right=100.0))
-
 
 def score_context_html(value: Optional[float]) -> str:
     if value is None or not np.isfinite(float(value)):
@@ -814,7 +808,7 @@ def render_mode_picker() -> str:
     )
 
 
-def render_comparison_page(params: Optional[dict] = None) -> bytes:
+def render_comparison_page() -> bytes:
     return render_layout("Compare Urban Images", mode_nav("comparison") + render_upload_form("comparison"))
 
 
@@ -1003,7 +997,7 @@ def gradcam_figures(artifact_pack: dict) -> List[str]:
     return figures
 
 
-def render_results(result: dict, params: dict) -> bytes:
+def render_results(result: dict) -> bytes:
     meta = result["metadata"]
     artifacts = result["artifacts"]
     pred = meta["prediction"]
@@ -1075,7 +1069,7 @@ def render_home() -> bytes:
     return render_layout("Perceived Safety Model Inspector", render_mode_picker())
 
 
-def render_error(exc: BaseException, params: Optional[dict] = None) -> bytes:
+def render_error(exc: BaseException) -> bytes:
     tb = traceback.format_exc()
     body = mode_nav() + f"<section class=\"panel\"><h2>Analysis Error</h2><div class=\"error\">{html.escape(str(exc))}\n\n{html.escape(tb)}</div></section>"
     return render_layout("Analysis Error", body)
@@ -1112,7 +1106,7 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
             try:
                 self.send_bytes(render_map_viewer(parsed.query))
             except Exception as exc:
-                self.send_bytes(render_error(exc, None), status=500)
+                self.send_bytes(render_error(exc), status=500)
             return
         if parsed.path == "/analyze":
             self.send_bytes(render_comparison_page())
@@ -1144,11 +1138,11 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
                 )
                 result = analyze_upload(form)
                 if result["metadata"].get("mode") == "comparison_upload":
-                    self.send_bytes(render_results(result, {}))
+                    self.send_bytes(render_results(result))
                 else:
                     self.send_bytes(render_upload_results(result))
             except Exception as exc:
-                self.send_bytes(render_error(exc, None), status=500)
+                self.send_bytes(render_error(exc), status=500)
             return
 
         self.send_error(404)
@@ -1167,32 +1161,3 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         print(f"[{dt.datetime.utcnow().isoformat(timespec='seconds')}Z] {self.address_string()} {fmt % args}")
-
-
-class ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-
-
-def main(argv: Optional[Iterable[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the perceived-safety local deployment app.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
-    args = parser.parse_args(list(argv) if argv is not None else None)
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(TEMP_OUTPUT_ROOT, ignore_errors=True)
-    TEMP_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    server = ReusableThreadingHTTPServer((args.host, args.port), SafetyAppHandler)
-    print(f"Perceived Safety Model Inspector running at http://{args.host}:{args.port}")
-    print(f"Outputs: {OUTPUT_ROOT}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping server.")
-    finally:
-        server.server_close()
-        shutil.rmtree(TEMP_OUTPUT_ROOT, ignore_errors=True)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

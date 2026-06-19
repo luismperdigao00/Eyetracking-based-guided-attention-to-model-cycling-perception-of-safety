@@ -20,11 +20,9 @@ The local structure is:
 
 ```text
 deployment_app/run_app.py                         # launcher: starts the web app
-deployment_app/perceived_safety_app/server.py     # small app entrypoint
 deployment_app/perceived_safety_app/routes.py     # HTTP server bootstrap
 deployment_app/perceived_safety_app/request_handlers.py # upload routes, HTML, result pages
 deployment_app/perceived_safety_app/config.py     # device, paths, runtime settings
-deployment_app/perceived_safety_app/model_runtime.py # compatibility facade
 deployment_app/perceived_safety_app/image_preprocessing.py # upload image preprocessing
 deployment_app/perceived_safety_app/model_catalog.py # bundled model settings
 deployment_app/perceived_safety_app/model_checkpoints.py # checkpoint lookup and model loading
