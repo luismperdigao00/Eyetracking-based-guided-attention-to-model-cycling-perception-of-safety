@@ -10,16 +10,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from perceived_safety_app import runtime_config
-from perceived_safety_app.inference import _batch_tensor, forward_model_matching_train
+from perceived_safety_app import config
+from perceived_safety_app.prediction import _batch_tensor, forward_model_matching_train
 
 def get_selected_attention_methods(selection=None) -> List[str]:
-    selection = runtime_config.ATTENTION_EXTRACTIONS if selection is None else selection
+    selection = config.ATTENTION_EXTRACTIONS if selection is None else selection
 
     if isinstance(selection, str):
         s = selection.lower().strip()
         if s in ("all", "*"):
-            raw_items = list(runtime_config.VALID_ATTENTION_EXTRACTIONS)
+            raw_items = list(config.VALID_ATTENTION_EXTRACTIONS)
         else:
             raw_items = [x for x in re.split(r"[\s,;/+]+", s) if x]
     else:
@@ -39,16 +39,16 @@ def get_selected_attention_methods(selection=None) -> List[str]:
     methods = []
     for item in raw_items:
         method = aliases.get(str(item).lower().strip(), str(item).lower().strip())
-        if method not in runtime_config.VALID_ATTENTION_EXTRACTIONS:
+        if method not in config.VALID_ATTENTION_EXTRACTIONS:
             raise ValueError(
                 f"Unknown attention extraction '{item}'. Expected one of "
-                f"{runtime_config.VALID_ATTENTION_EXTRACTIONS} or 'all'."
+                f"{config.VALID_ATTENTION_EXTRACTIONS} or 'all'."
             )
         if method not in methods:
             methods.append(method)
 
     if not methods:
-        raise ValueError("runtime_config.ATTENTION_EXTRACTIONS resolved to an empty method list.")
+        raise ValueError("config.ATTENTION_EXTRACTIONS resolved to an empty method list.")
     return methods
 
 def _to_2d(x: torch.Tensor) -> torch.Tensor:
@@ -101,12 +101,12 @@ def _require_attention_recorder(net, method: str):
     if recorder is None:
         raise RuntimeError(
             f"Attention extraction '{method}' requires a Transformer built with attention hooks. "
-            "Check runtime_config.ATTENTION_EXTRACTIONS/runtime_config.GLOBAL_ATTN_OVERRIDE and avoid CNN backbones for this evaluator."
+            "Check config.ATTENTION_EXTRACTIONS/config.GLOBAL_ATTN_OVERRIDE and avoid CNN backbones for this evaluator."
         )
     return recorder
 
 def _raw_eval_layer(net) -> int:
-    override_layer = runtime_config.GLOBAL_ATTN_OVERRIDE.get("attn_layer", None)
+    override_layer = config.GLOBAL_ATTN_OVERRIDE.get("attn_layer", None)
     if override_layer is not None:
         return int(override_layer)
 
@@ -127,7 +127,7 @@ def _prepare_self_attention_mode(net, method: str, layer: Optional[int] = None) 
         layer=int(_raw_eval_layer(net) if layer is None else layer),
     )
 
-def _extract_self_attention_maps(net, batch: dict, method: str):
+def _extract_self_explanation_maps(net, batch: dict, method: str):
     _prepare_self_attention_mode(net, method, layer=_raw_eval_layer(net))
     with torch.inference_mode():
         out = forward_model_matching_train(net, batch)
@@ -142,7 +142,7 @@ def _normalize_2d_map_batch(x: torch.Tensor) -> torch.Tensor:
     flat = x.flatten(1)
     xmin = flat.min(dim=1, keepdim=True)[0]
     xmax = flat.max(dim=1, keepdim=True)[0]
-    return ((flat - xmin) / (xmax - xmin + runtime_config.MAP_EPS)).view_as(x)
+    return ((flat - xmin) / (xmax - xmin + config.MAP_EPS)).view_as(x)
 
 def _attention_heads_to_2d_feature_map(attn_spatial: torch.Tensor, grid_hw: Tuple[int, int]):
     """Reshape CLS-to-patch attention into [B, heads, H, W]."""
@@ -178,7 +178,7 @@ def _standard_gradcam_from_final_attention(attn: torch.Tensor, grad_attn: torch.
     return _normalize_2d_map_batch(cam)
 
 def _gradcam_score_target() -> str:
-    return str(runtime_config.GRADCAM_SCORE_TARGET).lower().strip()
+    return str(config.GRADCAM_SCORE_TARGET).lower().strip()
 
 def _configure_final_attention_gradcam(net):
     """Force final raw attention capture with gradients while preserving model eval behavior."""
@@ -309,7 +309,7 @@ def _run_pair_final_attention_gradcam(
 def _batch_tensor(batch: dict, key: str, *, as_float: bool = False):
     if key not in batch:
         return None
-    x = batch[key].to(runtime_config.DEVICE, non_blocking=True)
+    x = batch[key].to(config.DEVICE, non_blocking=True)
     return x.float() if as_float else x
 
 def get_vit_ranking_gradcam_maps(net, batch: dict, grid_hw: Tuple[int, int]):
@@ -341,10 +341,10 @@ def get_vit_ranking_gradcam_maps(net, batch: dict, grid_hw: Tuple[int, int]):
             score_target=score_target,
         )
 
-def get_attention_maps_for_batch(net, batch: dict, method: str, grid_hw: Tuple[int, int]):
+def get_explanation_maps_for_batch(net, batch: dict, method: str, grid_hw: Tuple[int, int]):
     method = str(method).lower().strip()
     if method in ("raw", "rollout"):
-        return _extract_self_attention_maps(net, batch, method)
+        return _extract_self_explanation_maps(net, batch, method)
     if method == "gradcam":
         return get_vit_ranking_gradcam_maps(net, batch, grid_hw)
     raise ValueError(f"Unknown attention extraction method: {method}")

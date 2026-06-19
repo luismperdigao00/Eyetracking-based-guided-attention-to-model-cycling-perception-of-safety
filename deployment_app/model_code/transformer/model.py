@@ -1,4 +1,4 @@
-# nets/transformer.py
+# transformer/model.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,9 +7,9 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from nets.attention_alignment import AttentionConfig, AttentionRecorder, uniform_attention_map
-from nets.transformer_forward import forward_backbone_tokens
-from nets.transformer_tokens import infer_embed_dim, infer_num_prefix_tokens, pool_tokens
+from transformer.attention_alignment import AttentionConfig, AttentionRecorder, uniform_attention_map
+from transformer.forward import forward_backbone_tokens
+from transformer.tokens import infer_embed_dim, infer_num_prefix_tokens, pool_tokens
 
 
 # -------------------------------------------------------------------------------------------------

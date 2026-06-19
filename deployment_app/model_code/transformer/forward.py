@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from nets.transformer_tokens import _normalize_backbone_output
+from transformer.tokens import _normalize_backbone_output
 
 
 def forward_backbone_tokens(backbone: nn.Module, x: torch.Tensor) -> torch.Tensor:

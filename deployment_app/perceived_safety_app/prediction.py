@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from perceived_safety_app.runtime_config import DEVICE
+from perceived_safety_app.config import DEVICE
 
 
 def _model_wants_gaze(net) -> bool:

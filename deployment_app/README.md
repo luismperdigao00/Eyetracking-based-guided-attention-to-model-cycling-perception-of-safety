@@ -19,19 +19,23 @@ python run_app.py --port 8765
 The local structure is:
 
 ```text
-deployment_app/run_app.py                          # launcher: starts the web app
-deployment_app/perceived_safety_app/server.py      # web server, routes, HTML, result pages
-deployment_app/perceived_safety_app/model_runtime.py       # small compatibility facade
-deployment_app/perceived_safety_app/runtime_config.py      # device, paths, runtime settings
-deployment_app/perceived_safety_app/preprocessing.py       # upload image preprocessing
-deployment_app/perceived_safety_app/model_registry.py      # bundled model settings
-deployment_app/perceived_safety_app/checkpoint_resolver.py # checkpoint lookup
-deployment_app/perceived_safety_app/model_loader.py        # rebuild model and load weights
-deployment_app/perceived_safety_app/inference.py           # forward-pass helpers
-deployment_app/perceived_safety_app/attention_maps.py      # attention maps and Grad-CAM
-deployment_app/model_code/                         # local EG-PCS-Net/DINOv3 model implementation
-deployment_app/models/                             # bundled best checkpoints for EG-PCS-Net runs
-deployment_app/outputs/                            # saved app outputs, only when Save outputs is checked
+deployment_app/run_app.py                         # launcher: starts the web app
+deployment_app/perceived_safety_app/server.py     # small app entrypoint
+deployment_app/perceived_safety_app/routes.py     # HTTP server bootstrap
+deployment_app/perceived_safety_app/request_handlers.py # upload routes, HTML, result pages
+deployment_app/perceived_safety_app/config.py     # device, paths, runtime settings
+deployment_app/perceived_safety_app/model_runtime.py # compatibility facade
+deployment_app/perceived_safety_app/image_preprocessing.py # upload image preprocessing
+deployment_app/perceived_safety_app/model_catalog.py # bundled model settings
+deployment_app/perceived_safety_app/model_checkpoints.py # checkpoint lookup and model loading
+deployment_app/perceived_safety_app/prediction.py # forward-pass helpers
+deployment_app/perceived_safety_app/explanation_maps.py # attention maps and Grad-CAM
+deployment_app/model_code/backbone.py             # DINOv3 backbone and preprocessing specs
+deployment_app/model_code/gaze_config.py          # deployment gaze config
+deployment_app/model_code/model_factory.py        # EG-PCS-Net model construction
+deployment_app/model_code/transformer/            # transformer model components
+deployment_app/models/                            # bundled best checkpoints for EG-PCS-Net runs
+deployment_app/outputs/                           # saved app outputs, only when Save outputs is checked
 ```
 
 Keep the terminal open while using the app, then open:

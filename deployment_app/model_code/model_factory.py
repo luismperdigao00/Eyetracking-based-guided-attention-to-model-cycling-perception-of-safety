@@ -11,7 +11,7 @@ from dataclasses import replace
 
 import torch
 
-from nets.transformer import Transformer
+from transformer.model import Transformer
 
 
 SUPPORTED_BACKBONES = {"dinov3_vitb16"}

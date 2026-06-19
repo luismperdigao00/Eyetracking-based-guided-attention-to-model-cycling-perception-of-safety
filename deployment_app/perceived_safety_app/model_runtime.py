@@ -3,26 +3,24 @@
 """Compatibility facade for deployment runtime helpers.
 
 The implementation is split across focused modules:
-- runtime_config.py: device, paths, runtime settings
-- preprocessing.py: upload image preprocessing
-- model_registry.py: bundled model settings
-- checkpoint_resolver.py: checkpoint lookup
-- model_loader.py: model reconstruction and weight loading
-- inference.py: forward-pass helpers
-- attention_maps.py: attention and Grad-CAM extraction
+- config.py: device, paths, runtime settings
+- image_preprocessing.py: uploaded-image preprocessing
+- model_catalog.py: bundled model settings
+- model_checkpoints.py: checkpoint lookup, model reconstruction, and weight loading
+- prediction.py: forward-pass helpers
+- explanation_maps.py: attention and Grad-CAM extraction
 """
 
 from __future__ import annotations
 
-from perceived_safety_app.runtime_config import *
-from perceived_safety_app.preprocessing import *
-from perceived_safety_app.checkpoint_resolver import *
-from perceived_safety_app.model_loader import *
-from perceived_safety_app.inference import *
-from perceived_safety_app.attention_maps import *
+from perceived_safety_app.config import *
+from perceived_safety_app.image_preprocessing import *
+from perceived_safety_app.model_checkpoints import *
+from perceived_safety_app.prediction import *
+from perceived_safety_app.explanation_maps import *
 
-from perceived_safety_app.inference import _batch_tensor, _model_wants_gaze
-from perceived_safety_app.attention_maps import (
+from perceived_safety_app.prediction import _batch_tensor, _model_wants_gaze
+from perceived_safety_app.explanation_maps import (
     _attention_heads_to_2d_feature_map,
     _configure_final_attention_gradcam,
     _pair_gradcam_scalar_target,

@@ -8,7 +8,7 @@ import torch
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
-from perceived_safety_app.runtime_config import DEVICE
+from perceived_safety_app.config import DEVICE
 
 
 def _interp_mode(mode: str):
