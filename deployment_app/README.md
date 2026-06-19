@@ -32,9 +32,10 @@ deployment_app/
 │   ├── model_checkpoints.py           # checkpoint resolution, model reconstruction, and weight loading
 │   ├── prediction.py                  # model forward-pass helpers
 │   └── explanation_maps.py            # attention rollout, raw attention, and Grad-CAM extraction
-├── model_code/                        # self-contained EG-PCS-Net/DINOv3 implementation
+|
+├── model_code/                        # self-contained Siamese ViT implementation
 │   ├── __init__.py
-│   ├── backbone.py                    # DINOv3 backbone resolution and preprocessing specs
+│   ├── backbone.py                    # backbone resolution and preprocessing specs
 │   ├── gaze_config.py                 # deployment gaze-alignment configuration
 │   ├── model_factory.py               # EG-PCS-Net model construction
 │   └── transformer/                   # transformer wrapper and attention utilities

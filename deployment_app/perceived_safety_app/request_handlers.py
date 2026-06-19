@@ -511,9 +511,13 @@ def selected_run_id_from_form(form) -> str:
 
 
 def uploaded_weights_path(form, run_id: str) -> Tuple[str, Optional[str]]:
+    source = form_get(form, "weights_source", "bundled").strip().lower()
+    if source != "upload":
+        return "", None
+
     file_item = form["weights_file"] if "weights_file" in form else None
     if file_item is None or not getattr(file_item, "filename", ""):
-        return "", None
+        raise ValueError("Choose a .pt or .pth checkpoint when uploading your own trained weights.")
     weights_bytes = file_item.file.read()
     if not weights_bytes:
         raise ValueError("Uploaded weights file was empty.")
@@ -734,6 +738,7 @@ def render_layout(title: str, body: str) -> bytes:
     .mode-card small { color:var(--muted); font-size:14px; line-height:1.4; }
     .wide { grid-column: span 4; }
     .file-wide { grid-column: span 2; }
+    .is-hidden { display: none !important; }
     form { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 12px; align-items: end; }
     label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); font-weight: 650; }
     input, select { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; color: var(--ink); background: #fff; font-size: 14px; }
@@ -781,9 +786,30 @@ def render_layout(title: str, body: str) -> bytes:
     @media (max-width: 1100px) { form { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .summary { grid-template-columns: repeat(2, minmax(140px, 1fr)); } .maps { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 760px) { .wrap { padding: 16px; } form, .sides, .maps, .summary, .mode-grid { grid-template-columns: 1fr; } .section-head { display:block; } h1 { font-size: 21px; } }
     """
+    script = """
+<script>
+(function () {
+  function syncWeightsUpload(form) {
+    var source = form.querySelector('[data-weights-source]');
+    var panel = form.querySelector('[data-custom-weights]');
+    var input = form.querySelector('[data-weights-file]');
+    if (!source || !panel || !input) return;
+    var custom = source.value === 'upload';
+    panel.classList.toggle('is-hidden', !custom);
+    input.required = custom;
+    if (!custom) input.value = '';
+  }
+  document.querySelectorAll('form').forEach(function (form) {
+    syncWeightsUpload(form);
+    var source = form.querySelector('[data-weights-source]');
+    if (source) source.addEventListener('change', function () { syncWeightsUpload(form); });
+  });
+})();
+</script>
+"""
     html_doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)}</title><style>{css}</style></head>
-<body><header><div class="wrap"><div class="header-row"><div><h1>Perceived Safety Model Inspector</h1><div class="sub">Default model: {html.escape(trained_model_label(DEFAULT_RUN_ID))}. Outputs are written to {html.escape(str(OUTPUT_ROOT))}.</div></div><form class="shutdown-form" method="post" action="/shutdown" onsubmit="return confirm(&quot;Stop the local app server?&quot;);"><button class="shutdown-button" type="submit">Stop Server</button></form></div></div></header><main class="wrap">{body}</main></body></html>"""
+<body><header><div class="wrap"><div class="header-row"><div><h1>Perceived Safety Model Inspector</h1><div class="sub">Default model: {html.escape(trained_model_label(DEFAULT_RUN_ID))}. Outputs are written to {html.escape(str(OUTPUT_ROOT))}.</div></div><form class="shutdown-form" method="post" action="/shutdown" onsubmit="return confirm(&quot;Stop the local app server?&quot;);"><button class="shutdown-button" type="submit">Stop Server</button></form></div></div></header><main class="wrap">{body}</main>{script}</body></html>"""
     return html_doc.encode("utf-8")
 
 
@@ -847,14 +873,25 @@ def save_outputs_control(checked: bool = DEFAULT_SAVE_OUTPUTS) -> str:
 
 def model_controls_html(selected_run_id: str = DEFAULT_RUN_ID) -> str:
     selected_run_id = str(selected_run_id or DEFAULT_RUN_ID).strip()
-    return f'<label>Trained model<select name="run_id">{model_select_options(selected_run_id)}</select></label>'
+    return f'<label>Model configuration<select name="run_id">{model_select_options(selected_run_id)}</select></label>'
+
+
+def model_weights_source_control() -> str:
+    return (
+        '<label>Model weights'
+        '<select name="weights_source" data-weights-source>'
+        '<option value="bundled" selected>Bundled trained weights</option>'
+        '<option value="upload">Upload my trained weights</option>'
+        '</select>'
+        '</label>'
+    )
 
 
 def weights_upload_control() -> str:
     return (
-        '<label class="wide">Optional weights checkpoint'
-        '<input type="file" name="weights_file" accept=".pt,.pth,application/octet-stream">'
-        '<span class="save-note">Leave empty to use the bundled best weights for the selected model. Upload .pt/.pth only when the weights match that model configuration.</span>'
+        '<label class="wide is-hidden" data-custom-weights>Weights checkpoint'
+        '<input type="file" name="weights_file" accept=".pt,.pth,application/octet-stream" data-weights-file>'
+        '<span class="save-note">Upload a .pt or .pth checkpoint compatible with the selected model configuration.</span>'
         '</label>'
     )
 
@@ -877,6 +914,7 @@ def render_upload_form(mode: str = "single") -> str:
   <form method="post" action="/upload" enctype="multipart/form-data">
     <input type="hidden" name="upload_mode" value="comparison">
     {model_controls_html(DEFAULT_RUN_ID)}
+    {model_weights_source_control()}
     <label>Place / note<input name="street_name" placeholder="optional"></label>
     <label>Grad-CAM target<select name="gradcam_target">{target_options}</select></label>
     <label>Left image<input type="file" name="upload_left_image" accept="image/*" required></label>
@@ -892,6 +930,7 @@ def render_upload_form(mode: str = "single") -> str:
   <form method="post" action="/upload" enctype="multipart/form-data">
     <input type="hidden" name="upload_mode" value="single">
     {model_controls_html(DEFAULT_RUN_ID)}
+    {model_weights_source_control()}
     <label>Place / note<input name="street_name" placeholder="optional"></label>
     <label class="file-wide">Image<input type="file" name="upload_image" accept="image/*" required></label>
     {weights_upload_control()}
