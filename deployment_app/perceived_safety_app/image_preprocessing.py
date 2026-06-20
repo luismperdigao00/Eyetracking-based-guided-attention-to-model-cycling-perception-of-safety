@@ -26,10 +26,7 @@ def _preprocessing_specs(specs: dict) -> dict:
     if not isinstance(input_size, (tuple, list)) or len(input_size) != 3:
         raise ValueError(f"Expected specs['input_size']=(C,H,W), got {input_size!r}.")
     out_size = int(input_size[-1])
-    crop_pct = float(specs.get("crop_pct", 0.875))
-    resize_short = max(out_size, int(round(out_size / crop_pct)))
     return {
-        "resize_short": resize_short,
         "out_size": out_size,
         "interpolation": _interp_mode(str(specs.get("interpolation", "bilinear"))),
         "mean": tuple(float(x) for x in specs.get("mean", (0.485, 0.456, 0.406))),
@@ -38,11 +35,14 @@ def _preprocessing_specs(specs: dict) -> dict:
 
 
 def preprocess_image_for_model(image, specs: dict) -> torch.Tensor:
-    """Deterministic upload preprocessing: resize, center crop, tensor, normalize."""
+    """Resize the complete upload to the square model input, then normalize."""
     cfg = _preprocessing_specs(specs)
     img = image.convert("RGB")
-    img = TF.resize(img, cfg["resize_short"], interpolation=cfg["interpolation"])
-    img = TF.center_crop(img, cfg["out_size"])
+    img = TF.resize(
+        img,
+        [cfg["out_size"], cfg["out_size"]],
+        interpolation=cfg["interpolation"],
+    )
     tensor = TF.to_tensor(img)
     return TF.normalize(tensor, mean=cfg["mean"], std=cfg["std"])
 

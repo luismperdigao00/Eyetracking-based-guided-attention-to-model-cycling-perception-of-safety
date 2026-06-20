@@ -71,11 +71,9 @@ Use the upload panel for either:
 - A single street-level image: the app returns one perceived safety score and visual cues for that image.
 - Two street-level images: the app compares them, predicts which side is safer, and generates visual explanations for both images.
 
-The app is upload-only. It no longer includes saved dataset comparison mode, so it does not need the original street-image dataset.
-
 ## Choose Trained Weights
 
-The app includes several trained weights for the proposed EG-PCS-Net framework:
+The app includes several trained EG-PCS-Net weights:
 
 - `2v27tcrz`: trained on Berlin, gazefrac=1.
 - `g0qvoywf`: trained on Berlin, gazefrac=0.7.
@@ -90,4 +88,3 @@ The app displays several visual interpretability maps for each uploaded image:
 - **Raw attention**: where the final transformer attention looks directly.
 - **Attention rollout**: how attention influence accumulates through the transformer layers.
 - **Grad-CAM**: which regions push a selected model output up or down.
-

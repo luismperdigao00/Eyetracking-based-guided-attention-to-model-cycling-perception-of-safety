@@ -223,34 +223,17 @@ def _pil_resample_from_specs(specs: dict) -> int:
     return Image.Resampling.BILINEAR
 
 
-def model_input_geometry(image_size: Tuple[int, int], specs: dict) -> Tuple[Tuple[int, int], Tuple[int, int, int, int]]:
-    """Return the resized dimensions and center-crop box used for inference."""
+def model_input_size(specs: dict) -> Tuple[int, int]:
+    """Return the square spatial input expected by the model."""
     input_size = specs.get("input_size", (3, int(specs.get("img_size", 224)), int(specs.get("img_size", 224))))
     out_size = int(input_size[-1])
-    crop_pct = float(specs.get("crop_pct", 1.0) or 1.0)
-    resize_short = max(out_size, int(round(out_size / crop_pct)))
-    width, height = image_size
-    if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid image size for model-input view: {(width, height)}")
-    if width <= height:
-        new_width = resize_short
-        new_height = int(resize_short * height / width)
-    else:
-        new_height = resize_short
-        new_width = int(resize_short * width / height)
-    new_width = max(out_size, new_width)
-    new_height = max(out_size, new_height)
-    left = max(0, (new_width - out_size) // 2)
-    top = max(0, (new_height - out_size) // 2)
-    return (new_width, new_height), (left, top, left + out_size, top + out_size)
+    return out_size, out_size
 
 
 def model_input_view(image: Image.Image, bundle: ModelBundle) -> Image.Image:
-    """Recreate the deterministic eval resize + center crop used by the model."""
+    """Recreate the full-image square resize used by the model."""
     img = image.convert("RGB")
-    resized_size, crop_box = model_input_geometry(img.size, bundle.specs)
-    img = img.resize(resized_size, _pil_resample_from_specs(bundle.specs))
-    return img.crop(crop_box)
+    return img.resize(model_input_size(bundle.specs), _pil_resample_from_specs(bundle.specs))
 
 
 def save_model_input_view(source: Path | Image.Image, bundle: ModelBundle, out_path: Path) -> None:
@@ -278,33 +261,17 @@ def overlay_heatmap(
     cmap_name: str,
     signed: bool = False,
 ) -> None:
-    """Project a model-space heatmap onto only the original region seen by the model."""
+    """Project the full model-space heatmap back to the original resolution."""
     base = Image.open(image_path).convert("RGB")
-    resized_size, resized_crop = model_input_geometry(base.size, specs)
-    resized_width, resized_height = resized_size
-    left, top, right, bottom = resized_crop
-
-    scale_x = base.width / resized_width
-    scale_y = base.height / resized_height
-    original_crop = (
-        max(0, int(round(left * scale_x))),
-        max(0, int(round(top * scale_y))),
-        min(base.width, int(round(right * scale_x))),
-        min(base.height, int(round(bottom * scale_y))),
-    )
-    crop_width = max(1, original_crop[2] - original_crop[0])
-    crop_height = max(1, original_crop[3] - original_crop[1])
-    heat = resize_array(heatmap, (crop_width, crop_height), signed=signed)
+    heat = resize_array(heatmap, base.size, signed=signed)
     colored = colorize(heat, cmap_name, signed=signed)
     base = ImageEnhance.Contrast(base).enhance(1.04)
     base = ImageEnhance.Brightness(base).enhance(0.52)
-    base_crop = base.crop(original_crop)
     magnitude = np.abs(heat) if signed else heat
     visible_heat = np.clip((magnitude - 0.08) / 0.92, 0.0, 1.0)
     opacity = np.power(visible_heat, 0.6) * OVERLAY_ALPHA
     mask = Image.fromarray((opacity * 255).astype(np.uint8), mode="L")
-    base.paste(Image.composite(colored, base_crop, mask), original_crop[:2])
-    base.save(out_path)
+    Image.composite(colored, base, mask).save(out_path)
 
 
 def save_heatmap_only(heatmap: np.ndarray, out_path: Path, *, cmap_name: str, signed: bool = False) -> None:
