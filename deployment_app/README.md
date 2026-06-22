@@ -71,6 +71,8 @@ Use the upload panel for either:
 - A single street-level image: the app returns one perceived safety score and visual cues for that image.
 - Two street-level images: the app compares them, predicts which side is safer, and generates visual explanations for both images.
 
+Uploads use the same deterministic evaluation geometry as training: resize the shortest side to 256 pixels, then take a `256 x 256` square crop. The interactive preview lets users move that crop along the longer image dimension; leaving it untouched uses the original center-crop default. Predictions and interpretability maps describe only the selected crop.
+
 ## Choose Trained Weights
 
 The app includes several trained EG-PCS-Net weights:

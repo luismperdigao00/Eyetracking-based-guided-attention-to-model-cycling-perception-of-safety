@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import numpy as np
 import torch
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 
 import matplotlib
 matplotlib.use("Agg")
@@ -44,7 +44,12 @@ from perceived_safety_app.explanation_maps import (
     _to_2d,
     get_explanation_maps_for_batch,
 )
-from perceived_safety_app.image_preprocessing import pair_image_batch, single_image_inputs
+from perceived_safety_app.image_preprocessing import (
+    pair_image_batch,
+    prepare_image_for_model,
+    preprocessing_geometry,
+    single_image_inputs,
+)
 from perceived_safety_app.model_catalog import DEFAULT_RUN_ID, available_model_options
 from perceived_safety_app.model_checkpoints import build_model_for_checkpoint, resolve_checkpoint
 from perceived_safety_app.prediction import _batch_tensor, forward_model_matching_train
@@ -204,50 +209,31 @@ def resize_array(arr: np.ndarray, size: Tuple[int, int], *, signed: bool = False
         pil = Image.fromarray(((np.clip(a, -1.0, 1.0) + 1.0) * 127.5).astype(np.uint8), mode="L")
         out = np.asarray(pil.resize(size, Image.Resampling.BICUBIC), dtype=np.float32) / 127.5 - 1.0
         return np.clip(out, -1.0, 1.0)
-    pil = Image.fromarray((normalize01(a) * 255.0).astype(np.uint8), mode="L")
+    pil = Image.fromarray((np.clip(a, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
     out = np.asarray(pil.resize(size, Image.Resampling.BICUBIC), dtype=np.float32) / 255.0
     return np.clip(out, 0.0, 1.0)
 
 
 
-def _pil_resample_from_specs(specs: dict) -> int:
-    interp = str(specs.get("interpolation", "bilinear")).lower().strip()
-    if interp in ("bicubic", "cubic"):
-        return Image.Resampling.BICUBIC
-    if interp in ("nearest", "nearest-exact"):
-        return Image.Resampling.NEAREST
-    if interp in ("box", "area"):
-        return Image.Resampling.BOX
-    if interp in ("lanczos", "antialias"):
-        return Image.Resampling.LANCZOS
-    return Image.Resampling.BILINEAR
+def model_input_view(image: Image.Image, bundle: ModelBundle, crop_position: float = 0.5) -> Image.Image:
+    """Recreate the exact deterministic evaluation input seen by the model."""
+    return prepare_image_for_model(image, bundle.specs, crop_position)
 
 
-def model_input_size(specs: dict) -> Tuple[int, int]:
-    """Return the square spatial input expected by the model."""
-    input_size = specs.get("input_size", (3, int(specs.get("img_size", 224)), int(specs.get("img_size", 224))))
-    out_size = int(input_size[-1])
-    return out_size, out_size
-
-
-def model_input_view(image: Image.Image, bundle: ModelBundle) -> Image.Image:
-    """Recreate the full-image square resize used by the model."""
-    img = image.convert("RGB")
-    return img.resize(model_input_size(bundle.specs), _pil_resample_from_specs(bundle.specs))
-
-
-def save_model_input_view(source: Path | Image.Image, bundle: ModelBundle, out_path: Path) -> None:
+def save_model_input_view(
+    source: Path | Image.Image, bundle: ModelBundle, out_path: Path, crop_position: float = 0.5
+) -> None:
     if isinstance(source, Path):
         image = Image.open(source).convert("RGB")
     else:
         image = source.convert("RGB")
-    model_input_view(image, bundle).save(out_path)
+    model_input_view(image, bundle, crop_position).save(out_path)
 
 def colorize(arr: np.ndarray, cmap_name: str, *, signed: bool = False) -> Image.Image:
     if signed:
         values = (np.clip(arr, -1.0, 1.0) + 1.0) / 2.0
     else:
-        values = normalize01(arr)
+        values = np.clip(arr, 0.0, 1.0)
     rgba = cm.get_cmap(cmap_name)(values)
     return Image.fromarray((rgba[:, :, :3] * 255).astype(np.uint8), mode="RGB")
 
@@ -260,18 +246,34 @@ def overlay_heatmap(
     specs: dict,
     cmap_name: str,
     signed: bool = False,
+    crop_position: float = 0.5,
 ) -> None:
-    """Project the full model-space heatmap back to the original resolution."""
+    """Project model-space heat onto the original region used during evaluation."""
     base = Image.open(image_path).convert("RGB")
-    heat = resize_array(heatmap, base.size, signed=signed)
+    resized_size, resized_crop = preprocessing_geometry(base.size, specs, crop_position)
+    resized_width, resized_height = resized_size
+    left, top, right, bottom = resized_crop
+    scale_x = base.width / resized_width
+    scale_y = base.height / resized_height
+    original_crop = (
+        max(0, int(round(left * scale_x))),
+        max(0, int(round(top * scale_y))),
+        min(base.width, int(round(right * scale_x))),
+        min(base.height, int(round(bottom * scale_y))),
+    )
+    crop_size = (
+        max(1, original_crop[2] - original_crop[0]),
+        max(1, original_crop[3] - original_crop[1]),
+    )
+    heat = resize_array(heatmap, crop_size, signed=signed)
     colored = colorize(heat, cmap_name, signed=signed)
-    base = ImageEnhance.Contrast(base).enhance(1.04)
-    base = ImageEnhance.Brightness(base).enhance(0.52)
+    base_crop = base.crop(original_crop)
+    base_crop = ImageEnhance.Contrast(base_crop).enhance(1.04)
+    base_crop = ImageEnhance.Brightness(base_crop).enhance(0.52)
     magnitude = np.abs(heat) if signed else heat
-    visible_heat = np.clip((magnitude - 0.08) / 0.92, 0.0, 1.0)
-    opacity = np.power(visible_heat, 0.6) * OVERLAY_ALPHA
+    opacity = np.power(np.clip(magnitude, 0.0, 1.0), 0.6) * OVERLAY_ALPHA
     mask = Image.fromarray((opacity * 255).astype(np.uint8), mode="L")
-    Image.composite(colored, base, mask).save(out_path)
+    Image.composite(colored, base_crop, mask).save(out_path)
 
 
 def save_heatmap_only(heatmap: np.ndarray, out_path: Path, *, cmap_name: str, signed: bool = False) -> None:
@@ -430,7 +432,13 @@ def output_base_dir() -> Path:
 
 
 def save_pair_gradcam_artifacts(
-    maps: dict, artifacts: dict, side: str, original_path: Path, run_dir: Path, specs: dict
+    maps: dict,
+    artifacts: dict,
+    side: str,
+    original_path: Path,
+    run_dir: Path,
+    specs: dict,
+    crop_position: float,
 ) -> None:
     families = (("gradcam", "gradcam", "Grad-CAM"),)
     for map_key, file_key, _label_prefix in families:
@@ -440,13 +448,26 @@ def save_pair_gradcam_artifacts(
             arr, cmap_name, is_signed = maps[map_key][variant][side]
             overlay = run_dir / f"{side}_{file_key}_{variant}_overlay.png"
             heat = run_dir / f"{side}_{file_key}_{variant}_heatmap.png"
-            overlay_heatmap(original_path, arr, overlay, specs=specs, cmap_name=cmap_name, signed=is_signed)
+            overlay_heatmap(
+                original_path,
+                arr,
+                overlay,
+                specs=specs,
+                cmap_name=cmap_name,
+                signed=is_signed,
+                crop_position=crop_position,
+            )
             save_heatmap_only(arr, heat, cmap_name=cmap_name, signed=is_signed)
             artifacts[side][f"{file_key}_{variant}"] = {"overlay": overlay, "heatmap": heat}
 
 
 def save_single_gradcam_artifacts(
-    maps: dict, artifacts: dict, original_path: Path, run_dir: Path, specs: dict
+    maps: dict,
+    artifacts: dict,
+    original_path: Path,
+    run_dir: Path,
+    specs: dict,
+    crop_position: float,
 ) -> None:
     families = (("gradcam", "gradcam"),)
     for map_key, file_key in families:
@@ -456,14 +477,22 @@ def save_single_gradcam_artifacts(
             arr, cmap_name, is_signed = maps[map_key][variant]
             overlay = run_dir / f"upload_{file_key}_{variant}_overlay.png"
             heat = run_dir / f"upload_{file_key}_{variant}_heatmap.png"
-            overlay_heatmap(original_path, arr, overlay, specs=specs, cmap_name=cmap_name, signed=is_signed)
+            overlay_heatmap(
+                original_path,
+                arr,
+                overlay,
+                specs=specs,
+                cmap_name=cmap_name,
+                signed=is_signed,
+                crop_position=crop_position,
+            )
             save_heatmap_only(arr, heat, cmap_name=cmap_name, signed=is_signed)
             artifacts[f"{file_key}_{variant}"] = {"overlay": overlay, "heatmap": heat}
 
 
-def preprocess_single_image(bundle: ModelBundle, image: Image.Image):
+def preprocess_single_image(bundle: ModelBundle, image: Image.Image, crop_position: float = 0.5):
     configure_runtime()
-    return single_image_inputs(image, bundle.specs, bundle.gaze_grid_size)
+    return single_image_inputs(image, bundle.specs, bundle.gaze_grid_size, crop_position)
 
 
 def single_attention_map(bundle: ModelBundle, x, gaze, has_eye, method: str):
@@ -480,9 +509,11 @@ def single_attention_map(bundle: ModelBundle, x, gaze, has_eye, method: str):
         _restore_attention_state(net, state)
 
 
-def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradcam_target: str):
+def compute_single_image_outputs(
+    bundle: ModelBundle, image: Image.Image, gradcam_target: str, crop_position: float = 0.5
+):
     configure_runtime()
-    x, gaze, has_eye = preprocess_single_image(bundle, image)
+    x, gaze, has_eye = preprocess_single_image(bundle, image, crop_position)
     maps = {}
     scores = []
     for method in ("raw", "rollout"):
@@ -500,9 +531,22 @@ def compute_single_image_outputs(bundle: ModelBundle, image: Image.Image, gradca
     return safety_score, maps
 
 
-def preprocess_uploaded_pair(bundle: ModelBundle, left_image: Image.Image, right_image: Image.Image) -> dict:
+def preprocess_uploaded_pair(
+    bundle: ModelBundle,
+    left_image: Image.Image,
+    right_image: Image.Image,
+    left_crop_position: float = 0.5,
+    right_crop_position: float = 0.5,
+) -> dict:
     configure_runtime()
-    return pair_image_batch(left_image, right_image, bundle.specs, bundle.gaze_grid_size)
+    return pair_image_batch(
+        left_image,
+        right_image,
+        bundle.specs,
+        bundle.gaze_grid_size,
+        left_crop_position,
+        right_crop_position,
+    )
 
 
 def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
@@ -512,11 +556,20 @@ def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
     image_bytes = file_item.file.read()
     if not image_bytes:
         raise ValueError(f"Uploaded image for {name} was empty.")
-    return Image.open(BytesIO(image_bytes)).convert("RGB"), str(getattr(file_item, "filename", ""))
+    image = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
+    return image, str(getattr(file_item, "filename", ""))
 
 
 def selected_run_id_from_form(form) -> str:
     return str(form.getfirst("run_id", DEFAULT_RUN_ID) or DEFAULT_RUN_ID).strip() or DEFAULT_RUN_ID
+
+
+def selected_crop_position(form, prefix: str) -> float:
+    raw = form.getfirst(f"{prefix}_crop_position", "0.5")
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return 0.5
 
 
 def uploaded_weights_path(form, run_id: str) -> Tuple[str, Optional[str]]:
@@ -549,9 +602,19 @@ def analyze_upload_comparison(form) -> dict:
     place_name = form_get(form, "street_name", "Urban comparison").strip() or "Urban comparison"
     left_image, left_name = uploaded_file_image(form, "upload_left_image")
     right_image, right_name = uploaded_file_image(form, "upload_right_image")
+    crop_positions = {
+        "left": selected_crop_position(form, "left"),
+        "right": selected_crop_position(form, "right"),
+    }
 
     bundle = get_model_bundle(run_id, checkpoint_path)
-    batch = preprocess_uploaded_pair(bundle, left_image, right_image)
+    batch = preprocess_uploaded_pair(
+        bundle,
+        left_image,
+        right_image,
+        crop_positions["left"],
+        crop_positions["right"],
+    )
     prediction = model_prediction(bundle, batch)
     maps = compute_explanation_maps(bundle, batch, gradcam_target)
 
@@ -566,7 +629,7 @@ def analyze_upload_comparison(form) -> dict:
         source_images[side].save(original_out)
         artifacts[side]["original"] = original_out
         model_out = run_dir / f"{side}_model_input.png"
-        save_model_input_view(source_images[side], bundle, model_out)
+        save_model_input_view(source_images[side], bundle, model_out, crop_positions[side])
         artifacts[side]["model_input"] = model_out
 
     for method in ("raw", "rollout"):
@@ -575,13 +638,27 @@ def analyze_upload_comparison(form) -> dict:
             overlay = run_dir / f"{side}_{method}_overlay.png"
             heat = run_dir / f"{side}_{method}_heatmap.png"
             overlay_heatmap(
-                artifacts[side]["original"], arr, overlay, specs=bundle.specs, cmap_name="magma", signed=False
+                artifacts[side]["original"],
+                arr,
+                overlay,
+                specs=bundle.specs,
+                cmap_name="magma",
+                signed=False,
+                crop_position=crop_positions[side],
             )
             save_heatmap_only(arr, heat, cmap_name="magma", signed=False)
             artifacts[side][method] = {"overlay": overlay, "heatmap": heat}
 
     for side in ("left", "right"):
-        save_pair_gradcam_artifacts(maps, artifacts, side, artifacts[side]["original"], run_dir, bundle.specs)
+        save_pair_gradcam_artifacts(
+            maps,
+            artifacts,
+            side,
+            artifacts[side]["original"],
+            run_dir,
+            bundle.specs,
+            crop_positions[side],
+        )
 
     metadata = {
         "created_utc": timestamp,
@@ -593,6 +670,7 @@ def analyze_upload_comparison(form) -> dict:
         "uploaded_weights_filename": weights_filename,
         "gradcam_target": gradcam_target,
         "street_name": place_name,
+        "crop_positions": crop_positions,
         "model_meta": bundle.meta,
         "comparison": {
             "dataset": "upload",
@@ -628,9 +706,10 @@ def analyze_upload(form) -> dict:
     gradcam_target = DEFAULT_GRADCAM_TARGET
     street_name = form_get(form, "street_name", "Urban image").strip() or "Urban image"
     image, uploaded_name = uploaded_file_image(form, "upload_image")
+    crop_position = selected_crop_position(form, "single")
 
     bundle = get_model_bundle(run_id, checkpoint_path)
-    safety_score, maps = compute_single_image_outputs(bundle, image, gradcam_target)
+    safety_score, maps = compute_single_image_outputs(bundle, image, gradcam_target, crop_position)
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     run_dir = output_base_dir() / f"{timestamp}_{slugify(run_id)}_upload_{slugify(street_name)}"
@@ -639,18 +718,28 @@ def analyze_upload(form) -> dict:
     original_out = run_dir / "uploaded_original.png"
     image.save(original_out)
     model_out = run_dir / "uploaded_model_input.png"
-    save_model_input_view(image, bundle, model_out)
+    save_model_input_view(image, bundle, model_out, crop_position)
     artifacts = {"original": original_out, "model_input": model_out}
 
     for method in ("raw", "rollout"):
         arr = normalize01(maps[method])
         overlay = run_dir / f"upload_{method}_overlay.png"
         heat = run_dir / f"upload_{method}_heatmap.png"
-        overlay_heatmap(artifacts["original"], arr, overlay, specs=bundle.specs, cmap_name="magma", signed=False)
+        overlay_heatmap(
+            artifacts["original"],
+            arr,
+            overlay,
+            specs=bundle.specs,
+            cmap_name="magma",
+            signed=False,
+            crop_position=crop_position,
+        )
         save_heatmap_only(arr, heat, cmap_name="magma", signed=False)
         artifacts[method] = {"overlay": overlay, "heatmap": heat}
 
-    save_single_gradcam_artifacts(maps, artifacts, artifacts["original"], run_dir, bundle.specs)
+    save_single_gradcam_artifacts(
+        maps, artifacts, artifacts["original"], run_dir, bundle.specs, crop_position
+    )
 
     metadata = {
         "created_utc": timestamp,
@@ -663,6 +752,7 @@ def analyze_upload(form) -> dict:
         "gradcam_target": gradcam_target,
         "uploaded_filename": uploaded_name,
         "street_name": street_name,
+        "crop_position": crop_position,
         "model_meta": bundle.meta,
         "prediction": {
             "safety_score": safety_score,
@@ -763,7 +853,7 @@ def render_layout(title: str, body: str) -> bytes:
     figure { margin: 0; }
     figcaption { color: var(--muted); font-size: 12px; font-weight: 650; margin: 6px 0 0; }
     .map-link { display: block; cursor: zoom-in; }
-    .maps img { width: 100%; aspect-ratio: 4 / 3; object-fit: contain; border-radius: 6px; border: 1px solid var(--line); background: #edf0f5; transition: transform 120ms ease, box-shadow 120ms ease; }
+    .maps img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); background: #edf0f5; transition: transform 120ms ease, box-shadow 120ms ease; }
     .map-link:hover img { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(24,33,47,0.12); }
     .map-title { display:block; color: var(--ink); font-weight: 760; }
     .map-note { display:block; min-height: 30px; line-height: 1.25; margin-top: 2px; }
@@ -781,10 +871,16 @@ def render_layout(title: str, body: str) -> bytes:
     .check-label { display:flex; gap:8px; align-items:center; color:var(--ink); font-size:13px; }
     .check-label input { width:auto; }
     .save-note { color:var(--muted); font-size:12px; line-height:1.35; }
+    .crop-upload { grid-column: span 3; display:grid; gap:8px; align-self:start; }
+    .crop-upload-single { grid-column: span 6; }
+    .crop-preview { display:grid; gap:8px; border:1px solid var(--line); border-radius:8px; padding:10px; background:#fbfcfe; }
+    .crop-preview canvas { display:block; width:100%; max-height:420px; border-radius:6px; background:#111827; touch-action:none; cursor:crosshair; }
+    .crop-controls { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; }
+    .crop-controls button { min-width:84px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
     .error { white-space: pre-wrap; color: #8a1f11; background: #fff4f1; border: 1px solid #f1b3a7; border-radius: 8px; padding: 12px; overflow: auto; }
     @media (max-width: 1100px) { form { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .summary { grid-template-columns: repeat(2, minmax(140px, 1fr)); } .maps { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 760px) { .wrap { padding: 16px; } form, .sides, .maps, .summary, .mode-grid { grid-template-columns: 1fr; } .section-head { display:block; } h1 { font-size: 21px; } }
+    @media (max-width: 760px) { .wrap { padding: 16px; } form, .sides, .maps, .summary, .mode-grid { grid-template-columns: 1fr; } .crop-upload, .crop-upload-single { grid-column: span 1; } .section-head { display:block; } h1 { font-size: 21px; } }
     """
     script = """
 <script>
@@ -799,6 +895,100 @@ def render_layout(title: str, body: str) -> bytes:
     input.required = custom;
     if (!custom) input.value = '';
   }
+  function initCropPicker(picker) {
+    var fileInput = picker.querySelector('[data-crop-file]');
+    var valueInput = picker.querySelector('[data-crop-value]');
+    var preview = picker.querySelector('[data-crop-preview]');
+    var canvas = picker.querySelector('[data-crop-canvas]');
+    var slider = picker.querySelector('[data-crop-slider]');
+    var reset = picker.querySelector('[data-crop-reset]');
+    var ctx = canvas.getContext('2d');
+    var image = null;
+    var objectUrl = null;
+    var dragging = false;
+
+    function position() {
+      var value = Number(valueInput.value);
+      return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.5;
+    }
+    function setPosition(value) {
+      value = Math.max(0, Math.min(1, value));
+      valueInput.value = value.toFixed(4);
+      slider.value = String(Math.round(value * 100));
+      draw();
+    }
+    function draw() {
+      if (!image) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      var side = Math.min(canvas.width, canvas.height);
+      var travelX = canvas.width - side;
+      var travelY = canvas.height - side;
+      var x = travelX * position();
+      var y = travelY * position();
+      ctx.fillStyle = 'rgba(10, 18, 30, 0.62)';
+      if (travelX > 0) {
+        ctx.fillRect(0, 0, x, canvas.height);
+        ctx.fillRect(x + side, 0, canvas.width - x - side, canvas.height);
+      }
+      if (travelY > 0) {
+        ctx.fillRect(0, 0, canvas.width, y);
+        ctx.fillRect(0, y + side, canvas.width, canvas.height - y - side);
+      }
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = Math.max(2, canvas.width / 360);
+      ctx.strokeRect(x + 1, y + 1, side - 2, side - 2);
+    }
+    function setFromPointer(event) {
+      if (!image) return;
+      var rect = canvas.getBoundingClientRect();
+      var px = (event.clientX - rect.left) * canvas.width / rect.width;
+      var py = (event.clientY - rect.top) * canvas.height / rect.height;
+      var side = Math.min(canvas.width, canvas.height);
+      var travel = Math.max(canvas.width - side, canvas.height - side);
+      if (travel <= 0) return setPosition(0.5);
+      var coordinate = canvas.width > canvas.height ? px : py;
+      setPosition((coordinate - side / 2) / travel);
+    }
+    fileInput.addEventListener('change', function () {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      image = null;
+      valueInput.value = '0.5';
+      slider.value = '50';
+      if (!fileInput.files || !fileInput.files[0]) {
+        preview.classList.add('is-hidden');
+        return;
+      }
+      objectUrl = URL.createObjectURL(fileInput.files[0]);
+      var nextImage = new Image();
+      nextImage.onload = function () {
+        image = nextImage;
+        var scale = Math.min(900 / image.naturalWidth, 420 / image.naturalHeight);
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        slider.disabled = canvas.width === canvas.height;
+        preview.classList.remove('is-hidden');
+        draw();
+      };
+      nextImage.src = objectUrl;
+    });
+    slider.addEventListener('input', function () { setPosition(Number(slider.value) / 100); });
+    reset.addEventListener('click', function () { setPosition(0.5); });
+    canvas.addEventListener('pointerdown', function (event) {
+      dragging = true;
+      canvas.setPointerCapture(event.pointerId);
+      setFromPointer(event);
+    });
+    canvas.addEventListener('pointermove', function (event) {
+      if (dragging) setFromPointer(event);
+    });
+    canvas.addEventListener('pointerup', function (event) {
+      dragging = false;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    });
+    canvas.addEventListener('pointercancel', function () { dragging = false; });
+  }
+  document.querySelectorAll('[data-crop-picker]').forEach(initCropPicker);
   document.querySelectorAll('form').forEach(function (form) {
     syncWeightsUpload(form);
     var source = form.querySelector('[data-weights-source]');
@@ -897,6 +1087,22 @@ def select_options(values, selected: str, label_func) -> str:
     )
 
 
+def crop_upload_control(file_name: str, label: str, prefix: str, *, single: bool = False) -> str:
+    css_class = "crop-upload crop-upload-single" if single else "crop-upload"
+    return f"""
+    <div class="{css_class}" data-crop-picker>
+      <label>{html.escape(label)}<input type="file" name="{html.escape(file_name)}" accept="image/*" required data-crop-file></label>
+      <input type="hidden" name="{html.escape(prefix)}_crop_position" value="0.5" data-crop-value>
+      <div class="crop-preview is-hidden" data-crop-preview>
+        <canvas data-crop-canvas aria-label="{html.escape(label)} crop selection"></canvas>
+        <div class="crop-controls">
+          <label>Crop position<input type="range" min="0" max="100" step="1" value="50" data-crop-slider></label>
+          <button type="button" class="ghost" data-crop-reset>Center</button>
+        </div>
+      </div>
+    </div>"""
+
+
 def render_upload_form(mode: str = "single") -> str:
     target_options = select_options(GRADCAM_TARGET_OPTIONS, DEFAULT_GRADCAM_TARGET, gradcam_target_label)
     mode = (mode or "single").strip().lower()
@@ -910,8 +1116,8 @@ def render_upload_form(mode: str = "single") -> str:
     {model_weights_source_control()}
     <label>Place / note<input name="street_name" placeholder="optional"></label>
     <label>Grad-CAM target<select name="gradcam_target">{target_options}</select></label>
-    <label>Left image<input type="file" name="upload_left_image" accept="image/*" required></label>
-    <label>Right image<input type="file" name="upload_right_image" accept="image/*" required></label>
+    {crop_upload_control("upload_left_image", "Left image", "left")}
+    {crop_upload_control("upload_right_image", "Right image", "right")}
     {weights_upload_control()}
     <button type="submit">Analyze Pair</button>
   </form>
@@ -924,7 +1130,7 @@ def render_upload_form(mode: str = "single") -> str:
     {model_controls_html(DEFAULT_RUN_ID)}
     {model_weights_source_control()}
     <label>Place / note<input name="street_name" placeholder="optional"></label>
-    <label class="file-wide">Image<input type="file" name="upload_image" accept="image/*" required></label>
+    {crop_upload_control("upload_image", "Image", "single", single=True)}
     {weights_upload_control()}
     <button type="submit">Analyze Image</button>
   </form>

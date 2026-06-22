@@ -612,13 +612,12 @@ class AttentionRecorder:
             layer = int(getattr(self.cfg, "layer", -1))
             if layer == -1:
                 attn_src = self._last_attn
-            elif layer >= 0:
-                attn_src = self._attn_mats[0] if (len(self._attn_mats) > 0) else self._last_attn
+            elif -len(self._attn_mats) <= layer < len(self._attn_mats):
+                attn_src = self._attn_mats[layer]
             else:
-                if len(self._attn_mats) >= abs(layer):
-                    attn_src = self._attn_mats[layer]
-                else:
-                    attn_src = self._last_attn
+                raise IndexError(
+                    f"Requested attention layer {layer}, but captured {len(self._attn_mats)} layers."
+                )
 
         if attn_src is None:
             return None
