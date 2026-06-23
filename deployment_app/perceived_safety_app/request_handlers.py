@@ -6,13 +6,17 @@ from __future__ import annotations
 
 import cgi
 import datetime as dt
+import gc
 import html
 import json
 import mimetypes
+import os
 import re
 import shutil
 import tempfile
+import threading
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
@@ -55,6 +59,11 @@ from perceived_safety_app.model_checkpoints import build_model_for_checkpoint, r
 from perceived_safety_app.prediction import _batch_tensor, forward_model_matching_train
 TEMP_OUTPUT_ROOT = Path(tempfile.gettempdir()) / "perceived_safety_app_outputs"
 TEMP_OUTPUT_MAX_AGE_SECONDS = 60 * 60
+
+MAX_IMAGE_UPLOAD_BYTES = int(os.environ.get("PERCEIVED_SAFETY_MAX_IMAGE_MB", "25")) * 1024 * 1024
+MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get("PERCEIVED_SAFETY_MAX_CHECKPOINT_MB", "512")) * 1024 * 1024
+MAX_REQUEST_BYTES = MAX_CHECKPOINT_UPLOAD_BYTES + 2 * MAX_IMAGE_UPLOAD_BYTES + 10 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 TRAINED_MODEL_OPTIONS = available_model_options()
 TRAINED_MODEL_LABELS = dict(TRAINED_MODEL_OPTIONS)
@@ -102,7 +111,45 @@ class ModelBundle:
     meta: dict
 
 
-_MODEL_CACHE: Dict[Tuple[str, str, str], ModelBundle] = {}
+try:
+    MODEL_CACHE_MAX_SIZE = max(1, int(os.environ.get("PERCEIVED_SAFETY_MODEL_CACHE_SIZE", "1")))
+except ValueError:
+    MODEL_CACHE_MAX_SIZE = 1
+
+_MODEL_CACHE: "OrderedDict[Tuple[str, str, str], ModelBundle]" = OrderedDict()
+_MODEL_CACHE_LOCK = threading.RLock()
+_GPU_REQUEST_LOCK = threading.Lock()
+
+
+def _reset_model_runtime(net: torch.nn.Module) -> None:
+    net.zero_grad(set_to_none=True)
+    recorder = getattr(net, "attn_recorder", None)
+    if recorder is not None and hasattr(recorder, "reset"):
+        recorder.reset()
+
+
+def _offload_bundle(bundle: Optional[ModelBundle]) -> None:
+    if bundle is None:
+        return
+    _reset_model_runtime(bundle.net)
+    if config.DEVICE.type == "cuda":
+        bundle.net.to("cpu")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _activate_bundle(bundle: ModelBundle) -> None:
+    bundle.net.to(config.DEVICE)
+    bundle.net.eval()
+
+
+def clear_model_cache() -> None:
+    with _MODEL_CACHE_LOCK:
+        bundles = list(_MODEL_CACHE.values())
+        _MODEL_CACHE.clear()
+    for bundle in bundles:
+        _offload_bundle(bundle)
 
 
 def slugify(value: object) -> str:
@@ -122,38 +169,49 @@ def get_model_bundle(run_id: str, checkpoint_path: str = "") -> ModelBundle:
     checkpoint_kind = DEFAULT_CHECKPOINT_KIND
     checkpoint_path = str(checkpoint_path or "").strip()
     key = (run_id, checkpoint_kind, checkpoint_path)
-    if key in _MODEL_CACHE:
-        return _MODEL_CACHE[key]
+    evicted = []
 
-    configure_runtime()
-    entry = {
-        "tag": f"deployment_{slugify(run_id)}",
-        "run_id": run_id,
-        "checkpoint": checkpoint_path or None,
-        "checkpoint_kind": checkpoint_kind,
-    }
-    rr = resolve_checkpoint(entry)
-    net, specs, gaze_grid_size = build_model_for_checkpoint(rr)
-    net.eval()
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.pop(key, None)
+        if cached is not None:
+            _MODEL_CACHE[key] = cached
+            return cached
 
-    bundle = ModelBundle(
-        run_id=run_id,
-        checkpoint_kind=checkpoint_kind,
-        checkpoint_path=str(rr.checkpoint_path),
-        tag=str(rr.tag),
-        rr=rr,
-        net=net,
-        specs=specs,
-        gaze_grid_size=tuple(int(x) for x in gaze_grid_size),
-        ties=bool(getattr(rr.args, "ties", False)),
-        meta={
-            "backbone": getattr(rr.args, "backbone", None),
-            "model": getattr(rr.args, "model", None),
-            "pooling": getattr(rr.args, "pooling", None),
-            "gaze_mode": getattr(rr.args, "gaze_mode", None),
-        },
-    )
-    _MODEL_CACHE[key] = bundle
+        configure_runtime()
+        entry = {
+            "tag": f"deployment_{slugify(run_id)}",
+            "run_id": run_id,
+            "checkpoint": checkpoint_path or None,
+            "checkpoint_kind": checkpoint_kind,
+        }
+        rr = resolve_checkpoint(entry)
+        net, specs, gaze_grid_size = build_model_for_checkpoint(rr)
+        net.eval()
+
+        bundle = ModelBundle(
+            run_id=run_id,
+            checkpoint_kind=checkpoint_kind,
+            checkpoint_path=str(rr.checkpoint_path),
+            tag=str(rr.tag),
+            rr=rr,
+            net=net,
+            specs=specs,
+            gaze_grid_size=tuple(int(x) for x in gaze_grid_size),
+            ties=bool(getattr(rr.args, "ties", False)),
+            meta={
+                "backbone": getattr(rr.args, "backbone", None),
+                "model": getattr(rr.args, "model", None),
+                "pooling": getattr(rr.args, "pooling", None),
+                "gaze_mode": getattr(rr.args, "gaze_mode", None),
+            },
+        )
+        _MODEL_CACHE[key] = bundle
+        while len(_MODEL_CACHE) > MODEL_CACHE_MAX_SIZE:
+            _, old_bundle = _MODEL_CACHE.popitem(last=False)
+            evicted.append(old_bundle)
+
+    for old_bundle in evicted:
+        _offload_bundle(old_bundle)
     return bundle
 
 
@@ -234,7 +292,11 @@ def colorize(arr: np.ndarray, cmap_name: str, *, signed: bool = False) -> Image.
         values = (np.clip(arr, -1.0, 1.0) + 1.0) / 2.0
     else:
         values = np.clip(arr, 0.0, 1.0)
-    rgba = cm.get_cmap(cmap_name)(values)
+    try:
+        cmap = matplotlib.colormaps[cmap_name]
+    except AttributeError:
+        cmap = cm.get_cmap(cmap_name)
+    rgba = cmap(values)
     return Image.fromarray((rgba[:, :, :3] * 255).astype(np.uint8), mode="RGB")
 
 
@@ -416,6 +478,11 @@ def cleanup_temp_outputs(max_age_seconds: int = TEMP_OUTPUT_MAX_AGE_SECONDS) -> 
     cutoff = dt.datetime.utcnow().timestamp() - int(max_age_seconds)
     for child in TEMP_OUTPUT_ROOT.iterdir():
         try:
+            if child.name == "uploaded_weights" and child.is_dir():
+                for weight_file in child.iterdir():
+                    if weight_file.is_file() and weight_file.stat().st_mtime < cutoff:
+                        weight_file.unlink(missing_ok=True)
+                continue
             if child.stat().st_mtime >= cutoff:
                 continue
             if child.is_dir():
@@ -549,11 +616,59 @@ def preprocess_uploaded_pair(
     )
 
 
+def execute_single_gpu_analysis(
+    run_id: str,
+    checkpoint_path: str,
+    image: Image.Image,
+    gradcam_target: str,
+    crop_position: float,
+):
+    with _GPU_REQUEST_LOCK:
+        bundle = get_model_bundle(run_id, checkpoint_path)
+        try:
+            _activate_bundle(bundle)
+            safety_score, maps = compute_single_image_outputs(
+                bundle, image, gradcam_target, crop_position
+            )
+            return bundle, safety_score, maps
+        finally:
+            _offload_bundle(bundle)
+
+
+def execute_comparison_gpu_analysis(
+    run_id: str,
+    checkpoint_path: str,
+    left_image: Image.Image,
+    right_image: Image.Image,
+    gradcam_target: str,
+    left_crop_position: float,
+    right_crop_position: float,
+):
+    with _GPU_REQUEST_LOCK:
+        bundle = get_model_bundle(run_id, checkpoint_path)
+        try:
+            _activate_bundle(bundle)
+            batch = preprocess_uploaded_pair(
+                bundle,
+                left_image,
+                right_image,
+                left_crop_position,
+                right_crop_position,
+            )
+            prediction = model_prediction(bundle, batch)
+            maps = compute_explanation_maps(bundle, batch, gradcam_target)
+            return bundle, prediction, maps
+        finally:
+            _offload_bundle(bundle)
+
+
 def uploaded_file_image(form, name: str) -> Tuple[Image.Image, str]:
     file_item = form[name] if name in form else None
     if file_item is None or not getattr(file_item, "filename", ""):
         raise ValueError(f"Choose an image file for {name}.")
-    image_bytes = file_item.file.read()
+    image_bytes = file_item.file.read(MAX_IMAGE_UPLOAD_BYTES + 1)
+    if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+        raise ValueError("Uploaded image exceeds the configured size limit.")
     if not image_bytes:
         raise ValueError(f"Uploaded image for {name} was empty.")
     image = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
@@ -572,6 +687,24 @@ def selected_crop_position(form, prefix: str) -> float:
         return 0.5
 
 
+def _stream_upload_to_path(source, out_path: Path, max_bytes: int) -> int:
+    total = 0
+    try:
+        with out_path.open("wb") as destination:
+            while True:
+                chunk = source.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("Uploaded weights file exceeds the configured size limit.")
+                destination.write(chunk)
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+    return total
+
+
 def uploaded_weights_path(form, run_id: str) -> Tuple[str, Optional[str]]:
     source = form_get(form, "weights_source", "bundled").strip().lower()
     if source != "upload":
@@ -580,18 +713,19 @@ def uploaded_weights_path(form, run_id: str) -> Tuple[str, Optional[str]]:
     file_item = form["weights_file"] if "weights_file" in form else None
     if file_item is None or not getattr(file_item, "filename", ""):
         raise ValueError("Choose a .pt or .pth checkpoint when uploading your own trained weights.")
-    weights_bytes = file_item.file.read()
-    if not weights_bytes:
-        raise ValueError("Uploaded weights file was empty.")
+
     filename = str(getattr(file_item, "filename", "weights.pt"))
     suffix = Path(filename).suffix.lower() or ".pt"
     if suffix not in {".pt", ".pth"}:
         raise ValueError("Weights file must be a .pt or .pth checkpoint.")
+
     weights_dir = TEMP_OUTPUT_ROOT / "uploaded_weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    stamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
     out_path = weights_dir / f"{stamp}_{slugify(run_id)}_{slugify(Path(filename).stem)}{suffix}"
-    out_path.write_bytes(weights_bytes)
+    if _stream_upload_to_path(file_item.file, out_path, MAX_CHECKPOINT_UPLOAD_BYTES) == 0:
+        out_path.unlink(missing_ok=True)
+        raise ValueError("Uploaded weights file was empty.")
     return str(out_path), filename
 
 
@@ -607,16 +741,15 @@ def analyze_upload_comparison(form) -> dict:
         "right": selected_crop_position(form, "right"),
     }
 
-    bundle = get_model_bundle(run_id, checkpoint_path)
-    batch = preprocess_uploaded_pair(
-        bundle,
+    bundle, prediction, maps = execute_comparison_gpu_analysis(
+        run_id,
+        checkpoint_path,
         left_image,
         right_image,
+        gradcam_target,
         crop_positions["left"],
         crop_positions["right"],
     )
-    prediction = model_prediction(bundle, batch)
-    maps = compute_explanation_maps(bundle, batch, gradcam_target)
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     run_dir = output_base_dir() / f"{timestamp}_{slugify(run_id)}_comparison_{slugify(place_name)}"
@@ -708,8 +841,13 @@ def analyze_upload(form) -> dict:
     image, uploaded_name = uploaded_file_image(form, "upload_image")
     crop_position = selected_crop_position(form, "single")
 
-    bundle = get_model_bundle(run_id, checkpoint_path)
-    safety_score, maps = compute_single_image_outputs(bundle, image, gradcam_target, crop_position)
+    bundle, safety_score, maps = execute_single_gpu_analysis(
+        run_id,
+        checkpoint_path,
+        image,
+        gradcam_target,
+        crop_position,
+    )
 
     timestamp = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     run_dir = output_base_dir() / f"{timestamp}_{slugify(run_id)}_upload_{slugify(street_name)}"
@@ -1343,6 +1481,13 @@ class SafetyAppHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/upload":
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                content_length = 0
+            if content_length > MAX_REQUEST_BYTES:
+                self.send_error(413, "Upload exceeds the configured request size limit.")
+                return
             try:
                 form = cgi.FieldStorage(
                     fp=self.rfile,

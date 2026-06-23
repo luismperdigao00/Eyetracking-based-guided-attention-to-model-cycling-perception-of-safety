@@ -7,7 +7,7 @@ import shutil
 from http.server import ThreadingHTTPServer
 from typing import Iterable, Optional
 
-from perceived_safety_app.request_handlers import TEMP_OUTPUT_ROOT, SafetyAppHandler
+from perceived_safety_app.request_handlers import TEMP_OUTPUT_ROOT, SafetyAppHandler, clear_model_cache
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -32,5 +32,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("\nStopping server.")
     finally:
         server.server_close()
+        clear_model_cache()
         shutil.rmtree(TEMP_OUTPUT_ROOT, ignore_errors=True)
     return 0

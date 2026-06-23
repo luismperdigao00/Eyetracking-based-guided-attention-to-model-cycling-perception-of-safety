@@ -7,6 +7,8 @@ import random
 import sys
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 
@@ -19,13 +21,17 @@ np.random.seed(SEED_GLOBAL)
 torch.manual_seed(SEED_GLOBAL)
 torch.cuda.manual_seed_all(SEED_GLOBAL)
 
-GPU_ID = 1
-if torch.cuda.is_available() and torch.cuda.device_count() > GPU_ID:
+try:
+    REQUESTED_GPU_ID = max(0, int(os.environ.get("PERCEIVED_SAFETY_GPU_ID", "0")))
+except ValueError:
+    REQUESTED_GPU_ID = 0
+
+if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+    GPU_ID = min(REQUESTED_GPU_ID, torch.cuda.device_count() - 1)
     DEVICE = torch.device(f"cuda:{GPU_ID}")
 else:
+    GPU_ID = None
     DEVICE = torch.device("cpu")
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 APP_ROOT = PACKAGE_ROOT.parent

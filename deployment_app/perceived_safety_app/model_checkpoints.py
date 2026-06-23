@@ -194,8 +194,8 @@ def _resolve_effective_attention(args: SimpleNamespace, override: Optional[dict]
 
     return attn_mode, attn_layer, force_use_attn
 
-def _load_checkpoint_state(ckpt_path: str, device: torch.device) -> dict:
-    obj = torch.load(ckpt_path, map_location=device)
+def _load_checkpoint_state(ckpt_path: str) -> dict:
+    obj = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     state = obj.get("model", obj) if isinstance(obj, dict) else obj
     if not isinstance(state, dict):
         raise ValueError(f"Checkpoint format not understood: {ckpt_path}")
@@ -244,9 +244,10 @@ def build_model_for_checkpoint(rr: RunResolved) -> Tuple[torch.nn.Module, dict, 
         use_kl_in_loss=False,
     )
 
-    net = build_model(rr.args, backbone, is_cnn_backbone).to(config.DEVICE)
-    state = _load_checkpoint_state(rr.checkpoint_path, config.DEVICE)
+    net = build_model(rr.args, backbone, is_cnn_backbone)
+    state = _load_checkpoint_state(rr.checkpoint_path)
     load_state_dict_safely(net, state, strict=True)
+    del state
     net.eval()
 
     meta = {
