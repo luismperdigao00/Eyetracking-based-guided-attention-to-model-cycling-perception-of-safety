@@ -131,12 +131,6 @@ egpcs-evaluate --help
 The equivalent module commands are `python -m egpcs.cli.train` and
 `python -m egpcs.cli.evaluate` after installation.
 
-## License
-
-The source code is available under the [MIT License](LICENSE). The EG-PCS dataset is
-licensed separately under CC BY 4.0, as recorded in `CITATION.cff` and the dataset
-documentation.
-
 ## How to Cite
 
 If you use this repository or build on EG-PCS, please cite the paper below. If you use the EG-PCS dataset, citation metadata for the dataset DOI is also available in [CITATION.cff](CITATION.cff).
