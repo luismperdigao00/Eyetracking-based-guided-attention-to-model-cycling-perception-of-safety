@@ -1,9 +1,10 @@
 cff-version: 1.2.0
-message: "If you use EG-PCS, please cite both the paper and the dataset DOI."
-title: "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset"
-version: "1.0.0"
-doi: "10.5281/zenodo.20101496"
-date-released: "2026-05-09"
+message: >-
+  Cite the software when using this code, the dataset when using its data, and
+  the paper when referring to the method or scientific findings.
+title: "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety"
+type: software
+version: "0.1.0"
 authors:
   - family-names: "Perdigao"
     given-names: "Luis Maria"
@@ -14,12 +15,39 @@ authors:
   - family-names: "Marques"
     given-names: "Manuel"
 repository-code: "https://github.com/DinhoDarroz/Eyetracking-based-guided-attention-to-model-cycling-perception-of-safety"
-abstract: "Pairwise perceived cycling safety comparisons, street-view images, and fixation-based gaze maps for eye-tracking-guided perceived cycling safety prediction."
+license: "MIT"
 keywords:
   - perceived cycling safety
   - eye tracking
-  - gaze maps
-  - pairwise comparison
-  - street-view imagery
+  - gaze-guided learning
   - computer vision
-license: "CC-BY-4.0"
+  - attention alignment
+preferred-citation:
+  type: conference-paper
+  title: "Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction"
+  authors:
+    - family-names: "Perdigao"
+      given-names: "Luis Maria"
+    - family-names: "Costa"
+      given-names: "Miguel"
+    - family-names: "Santiago"
+      given-names: "Carlos"
+    - family-names: "Marques"
+      given-names: "Manuel"
+  collection-title: "Proceedings of the IEEE International Conference on Intelligent Transportation Systems (ITSC)"
+  year: 2026
+references:
+  - type: dataset
+    title: "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset"
+    authors:
+      - family-names: "Perdigao"
+        given-names: "Luis Maria"
+      - family-names: "Costa"
+        given-names: "Miguel"
+      - family-names: "Santiago"
+        given-names: "Carlos"
+      - family-names: "Marques"
+        given-names: "Manuel"
+    version: "1.0.0"
+    date-released: 2026-05-09
+    doi: "10.5281/zenodo.20101496"

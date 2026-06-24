@@ -30,29 +30,21 @@ https://doi.org/10.5281/zenodo.20101496
 
 Dataset documentation is provided in [docs/dataset](docs/dataset/), including a dataset card, data dictionary, license notice, and supporting dataset files.
 
+## Deployment Application
+
+We provide a standalone web interface to deploy the EG-PCS-Net model, allowing users to easily obtain safety scores and visual attention heatmaps from street-level images. 
+
+<p align="center">
+  <img src="docs/Screenshot%20from%202026-06-17%2016-04-21.jpg" width="48%" />
+  <img src="docs/Screenshot%20from%202026-06-17%2016-04-58.jpg" width="48%" />
+</p>
+
 ## Code Organization
 
-The repository is structured to clearly separate the core training and evaluation package from the deployment application and data processing scripts. This modularity allows the different components of the project to evolve independently:
-
-```text
-eg-pcs/
-|-- pyproject.toml           # Package metadata, dependencies, and CLI commands
-|-- CITATION.cff             # Citation information
-|-- LICENSE                  # MIT License
-|-- configs/                 # YAML configuration files for experiments and sweeps
-|-- deployment_app/          # Standalone web application for model inference and visualization
-|-- docs/                    # Documentation, dataset details, and architecture figures
-|-- src/egpcs/               # Core training and evaluation package
-|   |-- cli/                 # Command-line interfaces for training and evaluation
-|   |-- config/              # Model variants and validation logic
-|   |-- data/                # Dataset loaders, transforms, and splitting logic
-|   |-- evaluation/          # Evaluator modules and interpretability/explanation maps
-|   |-- models/              # Vision Transformer (ViT), CNN backbones, and custom attention layers
-|   |-- training/            # Training engine, custom losses, metrics, and checkpoints
-|   \-- utils/               # Logging, filesystem, and reproducibility helpers
-|-- survey_eye_tracker/      # Scripts and notebooks for eye-tracking data processing
-\-- README.md                # Project overview and usage instructions
-```
+* `configs/` - YAML configuration files for model training, evaluation, and hyperparameter sweeps.
+* `deployment_app/` - The Python-based web application for model inference and interactive visualizations.
+* `docs/` - Documentation, dataset details, and project images.
+* `src/egpcs/` - Main source code for the EG-PCS-Net framework, including data loading, model architectures, and training loops.
 
 ## How to Use
 
