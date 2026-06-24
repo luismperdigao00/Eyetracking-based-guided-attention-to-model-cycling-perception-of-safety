@@ -35,9 +35,9 @@ Dataset documentation is provided in [docs/dataset](docs/dataset/), including a 
 We provide a standalone web interface to deploy the EG-PCS-Net model, allowing users to easily obtain safety scores and visual attention heatmaps from street-level images. 
 
 <p align="center">
-  <img src="docs/safety_score.png" width="60%" />
+  <img src="docs/safety_score.png" width="90%" />
   <br><br>
-  <img src="docs/maps.jpg" width="60%" />
+  <img src="docs/maps.png" width="90%" />
 </p>
 
 ## Code Organization
