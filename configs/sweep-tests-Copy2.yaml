@@ -1,0 +1,211 @@
+# ==============================================================================
+# W&B smoke test: one EG-PCS-Net training run
+# ==============================================================================
+program: egpcs.cli.train
+project: PCS_ET_v22
+command:
+  - python
+  - -m
+  - ${program}
+  - ${args}
+
+method: grid
+metric:
+  name: max_accuracy_validation
+  goal: maximize
+
+parameters:
+  # ---------------------------------------------------------------------------
+  # A) System / I/O
+  # ---------------------------------------------------------------------------
+  cuda:
+    value: true
+  cuda_id:
+    value: 1
+  multi_gpu:
+    value: False
+  gpu_ids:
+    value: "0,1"
+
+  seed:
+    values: [912]
+    #values: [187, 492, 678, 844, 998, 705, 912   ]
+  log_wandb:
+    value: true
+  log_console:
+    value: true
+
+  dataset:
+    value: images/printart/subjectivesafety_images/
+  gaze_root:
+    value: survey_eye_tracker/Eyetracker_attention_maps/864x508
+  model_dir:
+    value: models
+  comparisons:
+    value: comparisons_df.pickle # comparisons_df.pickle #comparisons_df_with_synthetic_berlin.pickle #comparisons_df.pickle
+  resume:
+    value: false
+  epoch:
+    value: 1
+  resume_checkpoint:
+    value: ""
+
+  # ---------------------------------------------------------------------------
+  # B) Dataset / Filtering
+  # ---------------------------------------------------------------------------
+  cities:
+    value: "berlin" # , paris, munich, barcelona, london_uk_collideoscope, london_uk_gov"
+
+  # ---------------------------------------------------------------------------
+  # C) Model family / Objective
+  # ---------------------------------------------------------------------------
+  model:
+    value: multitask_gaze
+  ties:
+    value: False
+  # ---------------------------------------------------------------------------
+  # D) Backbone & Architecture
+  # ---------------------------------------------------------------------------
+  backbone:
+    values:
+      #- "vit_small"
+      - "dinov3_vitb16"
+      #- "deit3_base_patch16_224"
+      #- "vit_base_patch16_224"
+      #- "vit_base_patch16_clip_224"
+      #- "dinov2_reg_base"
+      #- "vgg"
+      #- "convnext_base"
+      #- "efficientnet_v2_s"
+      #- "regnet_y_8gf"
+    
+
+  pooling:
+    value: cls
+      
+  pool_k:
+    value: 50
+
+  # ---------------------------------------------------------------------------
+  # E) Fine-tuning policy
+  # ---------------------------------------------------------------------------
+  finetune:
+    value: True
+    
+  num_ft_layers:
+    values: [4]
+
+  # ---------------------------------------------------------------------------
+  # F) Batch / Training length
+  # ---------------------------------------------------------------------------
+  batch_size:
+    value: 16
+  k:
+    value: 1
+    
+  # One epoch is enough to verify the complete training path.
+  max_epochs:
+    value: 5
+  grad_clip:
+    value: 0.0
+
+  # ---------------------------------------------------------------------------
+  # G) Optimizer
+  # ---------------------------------------------------------------------------
+  base_lr:
+    value: 3.5e-5
+  backbone_lr_scale:
+    value: 1
+  weight_decay:
+    value: 0.05
+  backbone_freeze_epochs:
+    value: 0
+    
+  rank_dropout:
+    value: 0.3
+  cross_dropout:
+    value: 0.3
+
+  # ---------------------------------------------------------------------------
+  # H) Ranking / Loss weights
+  # ---------------------------------------------------------------------------
+  ranking_margin:
+    values: [5.6]
+  rank_w:
+    value: 1
+
+  ties_w:
+    value: 0.0
+  attn_w:
+    value: 3.5
+
+  label_smoothing:
+    value: 0.0
+  use_class_weights:
+    value: false
+#  class_weights:
+#    value: "[1, 10, 1]"
+
+
+
+  # ---------------------------------------------------------------------------
+  # I) Scheduler
+  # ---------------------------------------------------------------------------
+  scheduler:
+    value: warmup_cosine
+  warmup_frac:
+    value: 0.15
+  eta_min:
+    value: 5.0e-6
+
+  # ---------------------------------------------------------------------------
+  # J) Augmentation
+  # ---------------------------------------------------------------------------
+  augment:
+    values: ["heavy"]
+  use_seg:
+    value: false
+
+  # ---------------------------------------------------------------------------
+  # K) Accuracy reporting
+  # ---------------------------------------------------------------------------
+  full_accuracy:
+    value: false
+
+  # ---------------------------------------------------------------------------
+  # L) Early stopping
+  # ---------------------------------------------------------------------------
+  early_stop:
+    value: true
+  early_stop_metric:
+    value: loss_validation
+  early_stop_mode:
+    value: min
+  early_stop_patience:
+    value: 3
+  early_stop_min_delta:
+    value: 0.0
+  early_stop_start_epoch:
+    value: 1
+
+  # ---------------------------------------------------------------------------
+  # Gaze Configuration
+  # ---------------------------------------------------------------------------
+  # A single value keeps this grid sweep to exactly one run.
+  model_variant:
+    value: EG-PCS-Net
+
+  gaze_align_target:
+    value: attention  #patch_tokens
+
+  attention_mode:
+    values: ["raw"]
+
+  attn_layer:
+    values: [-1]
+
+  gaze_map_size:
+    value: auto
+
+  #train_gaze_frac:
+  #  values: [1]

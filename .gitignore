@@ -49,6 +49,7 @@ survey_eye_tracker/eye_tracker_data/
 # ============================================================================
 __pycache__/
 *.py[cod]
+*.egg-info/
 *.pyo
 *.pyd
 *.so
@@ -65,6 +66,10 @@ venv/
 *.ckpt
 models/
 **/models/
+!src/egpcs/models/
+!src/egpcs/models/**
+src/egpcs/models/**/__pycache__/
+src/egpcs/models/**/*.py[cod]
 wandb/
 **/wandb/
 logs/
@@ -85,3 +90,15 @@ Analysis/**/*.jpg
 untitled.py
 tmp/
 temp/
+
+# Machine-specific Git configuration
+/.gitconfig
+
+# Legacy root-level Python files (maintained code lives under src/)
+/*.py
+
+# Legacy root-level compatibility packages and scripts
+/nets/
+/utils/
+/scripts/train_script.py
+/scripts/test_script.py

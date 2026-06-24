@@ -30,12 +30,37 @@ https://doi.org/10.5281/zenodo.20101496
 
 Dataset documentation is provided in [docs/dataset](docs/dataset/), including a dataset card, data dictionary, license notice, and supporting dataset files.
 
+## Code Organization
+
+Training and evaluation share one maintained implementation under the `src/egpcs`
+package. The deployment application remains separate and can evolve independently:
+
+```text
+eg-pcs/
+|-- pyproject.toml           # Package metadata, dependencies, and CLI commands
+|-- src/egpcs/               # Maintained training and evaluation package
+|   |-- cli/                 # Command-line entrypoints
+|   |-- config/              # Model variants and argument validation
+|   |-- data/                # Datasets, transforms, filtering, and splitting
+|   |-- models/              # Backbones and model implementations
+|   |-- training/            # Engine, losses, metrics, setup, and checkpoints
+|   |-- evaluation/          # Evaluator and explanation plots
+|   \-- utils/               # Logging, reproducibility, and filesystem helpers
+|-- deployment_app/          # Existing inference/web application
+|-- docs/                    # Documentation and figures
+|-- notebooks/               # Research notebooks (when applicable)
+\-- README.md
+```
+
+
 ## How to Use
 
-Install the main dependencies:
+Create or activate a Python environment, then install the project from the repository
+root. Editable mode is convenient during development because code changes under `src/`
+take effect immediately:
 
 ```bash
-pip install torch torchvision timm pandas numpy pyarrow scikit-learn pillow pytorch-ignite wandb optuna
+python -m pip install -e .
 ```
 
 Prepare the expected inputs:
@@ -47,7 +72,7 @@ Prepare the expected inputs:
 Train a baseline pairwise ranking model:
 
 ```bash
-python train.py \
+egpcs-train \
   --model ranking \
   --backbone dinov3_vitb16 \
   --comparisons comparisons_df.pickle \
@@ -60,7 +85,7 @@ python train.py \
 Train the gaze-aligned model:
 
 ```bash
-python train.py \
+egpcs-train \
   --model multitask_gaze \
   --backbone dinov3_vitb16 \
   --model_variant EG-PCS-Net \
@@ -74,7 +99,7 @@ python train.py \
 Train the paired ranking + classification model without gaze:
 
 ```bash
-python train.py \
+egpcs-train \
   --model multitask \
   --backbone dinov3_vitb16 \
   --comparisons comparisons_df.pickle \
@@ -85,7 +110,7 @@ python train.py \
 Evaluate a trained checkpoint:
 
 ```bash
-python test.py \
+egpcs-evaluate \
   --model multitask_gaze \
   --backbone dinov3_vitb16 \
   --comparisons comparisons_df.pickle \
@@ -95,6 +120,22 @@ python test.py \
 ```
 
 Useful options include `--model`, `--backbone`, `--model_variant`, `--attn_w`, `--batch_size`, `--max_epochs`, `--log_wandb`, and `--early_stop`.
+
+To inspect every available option:
+
+```bash
+egpcs-train --help
+egpcs-evaluate --help
+```
+
+The equivalent module commands are `python -m egpcs.cli.train` and
+`python -m egpcs.cli.evaluate` after installation.
+
+## License
+
+The source code is available under the [MIT License](LICENSE). The EG-PCS dataset is
+licensed separately under CC BY 4.0, as recorded in `CITATION.cff` and the dataset
+documentation.
 
 ## How to Cite
 
