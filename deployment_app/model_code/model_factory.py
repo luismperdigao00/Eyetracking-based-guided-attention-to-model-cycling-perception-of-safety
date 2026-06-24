@@ -50,9 +50,9 @@ def build_model(args, backbone_model, is_cnn_backbone: bool = False) -> torch.nn
     if model_name not in SUPPORTED_MODELS:
         raise ValueError(f"Unsupported model {model_name!r}. Expected one of {sorted(SUPPORTED_MODELS)}.")
 
-    gaze_cfg = getattr(args, "gaze_cfg", None)
-    need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False)) if gaze_cfg is not None else False
-    use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) if gaze_cfg is not None else False
+    model_variant_cfg = getattr(args, "model_variant_cfg", None)
+    need_attn_maps = bool(getattr(model_variant_cfg, "need_attn_maps", False)) if model_variant_cfg is not None else False
+    use_kl_in_loss = bool(getattr(model_variant_cfg, "use_kl_in_loss", False)) if model_variant_cfg is not None else False
     gaze_grid_hw = _grid_hw(args)
 
     net = Transformer(

@@ -45,7 +45,7 @@ from train_main_utils import _build_model as build_train_model
 from train_main_utils import _build_transforms_and_specs
 
 from backbone_registry import infer_vit_grid_size, resolve_backbone
-from gaze_policy import build_gaze_config, normalize_gaze_mode
+from model_variant_policy import build_model_variant_config, normalize_model_variant
 
 
 
@@ -176,21 +176,10 @@ def _plot_roc_when_ties_off(results_df: pd.DataFrame, args) -> None:
     print(f"[ROC] Saved ROC plot: {plot_path}")
     plt.show()
 
-def _normalize_and_attach_gaze_mode(args) -> str:
-    raw = getattr(args, "gaze_mode", getattr(args, "gaze", None))
-    raw_s = str(raw).lower().strip()
-
-    # Backward-compat for older runs / metadata
-    if raw_s in ("use", "on", "true", "1"):
-        raw_s = "align"
-    if raw_s == "only":
-        raw_s = "align"
-        if getattr(args, "eyetracker_only", None) is None:
-            args.eyetracker_only = True
-
-    args.gaze_mode = normalize_gaze_mode(raw_s)
-    args.gaze = args.gaze_mode  # legacy alias for older code paths
-    return args.gaze_mode
+def _normalize_and_attach_model_variant(args) -> str:
+    raw = getattr(args, "model_variant", None)
+    args.model_variant = normalize_model_variant(raw)
+    return args.model_variant
 
 
 # -----------------------------
@@ -287,7 +276,7 @@ def _apply_wandb_config_to_args(args, cfg: dict):
         "num_ft_layers": "num_ft_layers",
         "num_ft_blocks": "num_ft_layers",
         "ties": "ties",
-        "gaze_mode": "gaze_mode",
+        "model_variant": "model_variant",
         "eyetracker_filter": "eyetracker_filter",
         "rank_dropout": "rank_dropout",
         "cross_dropout": "cross_dropout",
@@ -460,7 +449,7 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     p.add_argument("--ties", nargs="?", const=True, type=str2bool)
 
-    p.add_argument("--gaze_mode", type=str)
+    p.add_argument("--model_variant", type=str)
     p.add_argument("--attn_w", type=float)
 
     p.add_argument("--rank_w", type=float)
@@ -509,19 +498,8 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
             continue
         setattr(args, k, v)
 
-    raw = getattr(args, "gaze_mode", getattr(args, "gaze", None))
-    raw_s = str(raw).lower().strip()
-    
-    # Backward-compat for older metadata values
-    if raw_s in ("use", "on", "true", "1"):
-        raw_s = "align"
-    if raw_s == "only":
-        raw_s = "align"
-        if getattr(args, "eyetracker_only", None) is None:
-            args.eyetracker_only = True
-    
-    args.gaze_mode = normalize_gaze_mode(raw_s)
-    args.gaze = args.gaze_mode
+    raw = getattr(args, "model_variant", None)
+    args.model_variant = normalize_model_variant(raw)
 
 
 def _normalize_finetune_layer_args(args) -> None:
@@ -588,7 +566,7 @@ def read_data(args) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         selected_cities = [c.strip() for c in args.cities.split(",") if c.strip()]
         df = df[df["dataset"].isin(selected_cities)].copy()
 
-    gaze_mode = args.gaze
+    model_variant = args.model_variant
     gaze_only_kept = None
     if "has_eyetracker" in df.columns:
         df["has_eyetracker"] = (
@@ -619,7 +597,7 @@ def read_data(args) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "rows_before_filters": before_rows,
         "rows_after_filters": after_rows,
         "cities_filter": selected_cities if selected_cities is not None else "all",
-        "gaze_mode": gaze_mode,
+        "model_variant": model_variant,
         "ties_mode": "ON" if ties_mode else "OFF",
         "dropped_ties_rows": dropped_ties,
         "gaze_only_rows_before_filter": gaze_only_kept,
@@ -662,12 +640,12 @@ def build_model(args):
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
         out_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
 
-        gaze_cfg = getattr(args, "gaze_cfg", None)
-        if gaze_cfg is None:
-            gaze_cfg = build_gaze_config(args, is_cnn_backbone=False, out_size=out_size)
+        model_variant_cfg = getattr(args, "model_variant_cfg", None)
+        if model_variant_cfg is None:
+            model_variant_cfg = build_model_variant_config(args, is_cnn_backbone=False, out_size=out_size)
 
-        use_attn_hook = bool(getattr(gaze_cfg, "need_attn_maps", False))
-        return_attn = bool(getattr(gaze_cfg, "need_attn_maps", False))
+        use_attn_hook = bool(getattr(model_variant_cfg, "need_attn_maps", False))
+        return_attn = bool(getattr(model_variant_cfg, "need_attn_maps", False))
 
         grid = getattr(args, "gaze_grid_size", None)
         if grid is None:
@@ -698,10 +676,10 @@ def build_model(args):
             attn_out_hw=attn_out_hw,
             attention_mode=attn_mode,
             attn_topk=attn_topk,
-            use_gaze_injection=bool(getattr(gaze_cfg, "inject", False)),
+            use_gaze_injection=bool(getattr(model_variant_cfg, "inject", False)),
         )
 
-        net.attn_grad = bool(getattr(gaze_cfg, "need_attn_maps", False))
+        net.attn_grad = bool(getattr(model_variant_cfg, "need_attn_maps", False))
         return net
 
     if args.backbone in CNN_BACKBONES:
@@ -805,10 +783,11 @@ def parse_args():
     
     p.add_argument("--ties", nargs="?", const=True, default=False, type=str2bool, help="Enable ties (3-class).")
     p.add_argument(
-        "--gaze_mode",
-        type=str,
-        default="disable",
-        help="disable | diag | guide | align | align+gaze (legacy accepted: off, align+guide, use, only)",
+        "--model_variant",
+        type=normalize_model_variant,
+        default="Baseline",
+        choices=["Baseline", "EG-ViT", "GII-ViT", "EG-PCS-Net"],
+        help="Baseline | EG-ViT | GII-ViT | EG-PCS-Net",
     )
 
     p.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps", help="Folder for .npy gaze maps.")
@@ -980,7 +959,7 @@ def main():
     # Ensure tie margin is always defined
     if args.ranking_margin_ties is None:
         args.ranking_margin_ties = args.ranking_margin
-    _normalize_and_attach_gaze_mode(args)
+    _normalize_and_attach_model_variant(args)
 
     # =============================================================================================== #
     # (STEP 2) REPRODUCIBILITY & DEVICE SETUP
@@ -1056,7 +1035,7 @@ def main():
 
     _print_kv("Modes:", {
         "ties": _fmt_bool(args.ties),
-        "gaze": args.gaze,
+        "model_variant": args.model_variant,
         "attn_w": args.attn_w,
         "full_accuracy": _fmt_bool(args.full_accuracy),
     })
@@ -1102,7 +1081,7 @@ def main():
     backbone_model, _train_tfms, eval_tfms, is_cnn_backbone = (
         _build_transforms_and_specs(args)
     )
-    enable_gaze = bool(getattr(args.gaze_cfg, "load_gaze", False))
+    enable_gaze = bool(getattr(args.model_variant_cfg, "load_gaze", False))
     
     dataset = ComparisonsDataset(
         dataframe=df,

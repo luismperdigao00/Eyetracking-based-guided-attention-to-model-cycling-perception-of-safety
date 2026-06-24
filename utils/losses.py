@@ -43,7 +43,7 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gaze_policy import normalize_gaze_mode
+from model_variant_policy import normalize_model_variant
 
 
 __all__ = [
@@ -527,21 +527,21 @@ def compute_loss(
         loss_rank_combo = (rank_w * loss_nonties) + (ties_w * loss_ties)
 
         # -----------------------------------------------------------------
-        # 4.3) Gaze KL (computed only when enabled by gaze_cfg)
+        # 4.3) Gaze KL (computed only when enabled by model_variant_cfg)
         # -----------------------------------------------------------------
         w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
 
-        gaze_cfg = getattr(args, "gaze_cfg", None)
-        gaze_mode = str(getattr(gaze_cfg, "mode", normalize_gaze_mode(getattr(args, "gaze_mode", None))))
+        model_variant_cfg = getattr(args, "model_variant_cfg", None)
+        model_variant = str(getattr(model_variant_cfg, "variant", normalize_model_variant(getattr(args, "model_variant", None))))
 
-        compute_kl = bool(getattr(gaze_cfg, "compute_kl", False)) and (model == "multitask_gaze")
-        use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) and (model == "multitask_gaze")
-        align_target = str(getattr(gaze_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))).lower().strip()
+        compute_kl = bool(getattr(model_variant_cfg, "compute_kl", False)) and (model == "multitask_gaze")
+        use_kl_in_loss = bool(getattr(model_variant_cfg, "use_kl_in_loss", False)) and (model == "multitask_gaze")
+        align_target = str(getattr(model_variant_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))).lower().strip()
 
-        if gaze_cfg is None:
-            mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
-            compute_kl = bool(model == "multitask_gaze" and mode in ("diag", "guide", "align", "align+gaze", "egvit"))
-            use_kl_in_loss = bool(model == "multitask_gaze" and mode in ("align", "align+gaze") and (w_kl > 0.0))
+        if model_variant_cfg is None:
+            variant = normalize_model_variant(getattr(args, "model_variant", None))
+            compute_kl = bool(model == "multitask_gaze" and variant in ("EG-ViT", "GII-ViT", "EG-PCS-Net"))
+            use_kl_in_loss = bool(model == "multitask_gaze" and variant == "EG-PCS-Net" and (w_kl > 0.0))
 
         if not compute_kl:
             loss_kl = loss_class.new_zeros(())
@@ -602,7 +602,7 @@ def compute_loss(
             "gaze_any": float(gaze_any),
             "gaze_count": gaze_count,
 
-            "gaze_mode": str(gaze_mode),
+            "model_variant": str(model_variant),
             "gaze_align_target": str(align_target),
             "compute_kl": float(compute_kl),
             "use_kl_in_loss": float(use_kl_in_loss),

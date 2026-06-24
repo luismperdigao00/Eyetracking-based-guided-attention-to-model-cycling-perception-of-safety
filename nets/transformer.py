@@ -99,9 +99,6 @@ class Transformer(nn.Module):
         apply_token_norm: bool = False,
         attn_out_hw: Optional[Tuple[int, int]] = None,
         gaze_align_target: str = "attention",
-        gaze_attention_bias: str = "none",
-        gaze_attention_bias_strength: float = 0.0,
-        gaze_attention_bias_train_only: bool = True,
         use_gaze_injection: bool = False,
         guidance_cfg: Optional[GuideGuidanceConfig] = None,
         use_egvit_masking: bool = False,
@@ -143,9 +140,6 @@ class Transformer(nn.Module):
                 mode=attn_mode,
                 layer=int(attn_layer),
                 out_hw=tuple(attn_out_hw) if attn_out_hw is not None else (14, 14),
-                gaze_bias=str(gaze_attention_bias).lower().strip(),
-                gaze_bias_strength=float(gaze_attention_bias_strength),
-                gaze_bias_train_only=bool(gaze_attention_bias_train_only),
             ),
             gaze_align_target=str(gaze_align_target).lower().strip(),
             egvit=(
@@ -185,11 +179,6 @@ class Transformer(nn.Module):
         if self.cfg.attention.mode not in ("raw", "rollout"):
             raise ValueError(
                 f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: raw/rollout."
-            )
-
-        if self.cfg.attention.gaze_bias not in ("none", "cls_to_patch", "all_queries_to_patch"):
-            raise ValueError(
-                f"Unknown gaze_attention_bias='{self.cfg.attention.gaze_bias}'. Expected: none/cls_to_patch/all_queries_to_patch."
             )
 
         if self.cfg.gaze_align_target not in ("attention", "patch_tokens"):
@@ -474,11 +463,6 @@ class Transformer(nn.Module):
         if self.attn_recorder is not None:
             self.attn_recorder.set_keep_grad(bool(self.gaze_requires_grad and self.gaze_backprop_enabled))
             self.attn_recorder.begin_capture()
-            self.attn_recorder.set_gaze_bias_context(
-                gaze_map=gaze_map,
-                has_eye_mask=has_eye_mask,
-                num_prefix_tokens=int(self.num_prefix_tokens),
-            )
 
         # Step B) Backbone forward (Guide and/or EG-ViT apply only when configured and gaze is provided)
         try:
@@ -499,7 +483,6 @@ class Transformer(nn.Module):
         finally:
             if self.attn_recorder is not None:
                 self.attn_recorder.end_capture()
-                self.attn_recorder.clear_gaze_bias_context()
 
         # Step C) Pool tokens -> feature vector
         pooled = pool_tokens(

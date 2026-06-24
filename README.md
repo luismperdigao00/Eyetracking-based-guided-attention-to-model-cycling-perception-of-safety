@@ -63,7 +63,7 @@ Train the gaze-aligned model:
 python train.py \
   --model multitask_gaze \
   --backbone dinov3_vitb16 \
-  --gaze_mode align \
+  --model_variant EG-PCS-Net \
   --attn_w 1.0 \
   --gaze_root Eyetracker_attention_maps \
   --comparisons comparisons_df.pickle \
@@ -94,7 +94,7 @@ python test.py \
   --cuda true
 ```
 
-Useful options include `--model`, `--backbone`, `--gaze_mode`, `--attn_w`, `--batch_size`, `--max_epochs`, `--log_wandb`, and `--early_stop`.
+Useful options include `--model`, `--backbone`, `--model_variant`, `--attn_w`, `--batch_size`, `--max_epochs`, `--log_wandb`, and `--early_stop`.
 
 ## How to Cite
 

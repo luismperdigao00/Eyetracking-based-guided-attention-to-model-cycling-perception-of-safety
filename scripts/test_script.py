@@ -103,19 +103,16 @@ def test(device, net, dataloader, args, logger=None):
             # ----------------------------
             # 2) Forward + loss
             # ----------------------------
-            # Resolve gaze mode and whether injection is active
-            gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-            if gaze_mode not in ("off", "align", "guide", "align+guide"):
-                gaze_mode = "off"
-            
-            use_gaze_inj = (args.model == "multitask_gaze") and (gaze_mode in ("guide", "align+guide"))
+            # The central gaze policy decides whether gaze enters the forward pass.
+            model_variant_cfg = getattr(args, "model_variant_cfg", None)
+            pass_to_model = bool(getattr(model_variant_cfg, "pass_to_model", False))
             
             # Detect transformer wrapper (DataParallel-safe)
             net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
             is_transformer = hasattr(net_cfg, "transformer")
             
             # Guided forward only for transformer models
-            if use_gaze_inj and is_transformer:
+            if pass_to_model and is_transformer:
                 forward_dict = net(input_left, input_right, gaze_l, gaze_r, has_eye_mask)
             else:
                 forward_dict = net(input_left, input_right)
@@ -292,8 +289,8 @@ def test(device, net, dataloader, args, logger=None):
             "iteration": evaluator.state.iteration,
         }
 
-        # When gaze != off, show loss breakdown + KL (if compute_loss provides it)
-        if getattr(args, "gaze", "off") != "off":
+        # For gaze-aware modes, show the loss breakdown and KL when available.
+        if getattr(args, "model_variant", "Baseline") != "Baseline":
             if "loss_class" in evaluator.state.metrics:
                 metrics["loss_class_validation"] = evaluator.state.metrics["loss_class"]
             if "loss_rank_combo" in evaluator.state.metrics:

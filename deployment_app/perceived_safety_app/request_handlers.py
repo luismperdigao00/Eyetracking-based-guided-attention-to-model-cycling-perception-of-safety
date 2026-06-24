@@ -202,7 +202,7 @@ def get_model_bundle(run_id: str, checkpoint_path: str = "") -> ModelBundle:
                 "backbone": getattr(rr.args, "backbone", None),
                 "model": getattr(rr.args, "model", None),
                 "pooling": getattr(rr.args, "pooling", None),
-                "gaze_mode": getattr(rr.args, "gaze_mode", None),
+                "model_variant": getattr(rr.args, "model_variant", None),
             },
         )
         _MODEL_CACHE[key] = bundle

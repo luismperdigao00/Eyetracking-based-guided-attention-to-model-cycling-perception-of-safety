@@ -348,11 +348,6 @@ class Transformer(nn.Module):
         if self.attn_recorder is not None:
             self.attn_recorder.set_keep_grad(bool(self.gaze_requires_grad and self.gaze_backprop_enabled))
             self.attn_recorder.begin_capture()
-            self.attn_recorder.set_gaze_bias_context(
-                gaze_map=gaze_map,
-                has_eye_mask=has_eye_mask,
-                num_prefix_tokens=int(self.num_prefix_tokens),
-            )
 
         # Step B) Backbone forward
         try:
@@ -360,7 +355,6 @@ class Transformer(nn.Module):
         finally:
             if self.attn_recorder is not None:
                 self.attn_recorder.end_capture()
-                self.attn_recorder.clear_gaze_bias_context()
 
         # Step C) Pool tokens -> feature vector
         pooled = pool_tokens(

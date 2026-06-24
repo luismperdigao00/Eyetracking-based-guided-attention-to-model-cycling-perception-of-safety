@@ -18,7 +18,7 @@ except Exception:
     wandb = None
     
 from backbone_registry import infer_vit_grid_size, resolve_backbone
-from gaze_policy import build_gaze_config
+from model_variant_policy import build_model_variant_config
 from train_utils import compute_class_weights_from_df, print_run_plan
 
 from data import (
@@ -77,7 +77,7 @@ def initialize_wandb(args):
             "rank_margin_ties": args.ranking_margin_ties,
             "resume_epoch": args.epoch,
             "checkpoint": checkpoint_path,
-            "gaze_mode": str(getattr(args, "gaze_mode", "disable")),
+            "model_variant": str(getattr(args, "model_variant", "Baseline")),
             "use_nobp": bool(getattr(args, "use_nobp", False)),
         }
     )
@@ -497,7 +497,7 @@ def _print_filtered_dataset_summary(args, df: pd.DataFrame) -> None:
     print("\n=== Effective Dataset (after all filters, before split) ===")
     print(f"Comparisons file : {args.comparisons}")
     print(f"Cities requested : {args.cities}")
-    print(f"Gaze mode        : {getattr(args, 'gaze_mode', 'disable')}  (rows kept depend on has_eyetracker + eyetracker_filter)")
+    print(f"Model variant        : {getattr(args, 'model_variant', 'Baseline')}  (rows kept depend on has_eyetracker + eyetracker_filter)")
     print(f"Ties enabled     : {args.ties}  (ties=False removes score==0 rows)")
     print(f"Final row count  : {len(df):,}")
 
@@ -720,8 +720,8 @@ def _build_transforms_and_specs(args):
     """
     Resolve the backbone configuration and build preprocessing pipelines.
 
-    Central gaze policy:
-      - build_gaze_config(...) defines all gaze dependencies (load/inject/KL/hook needs)
+    Central model-variant policy:
+      - build_model_variant_config(...) defines all gaze dependencies (load/inject/KL/hook needs)
       - transforms only receive enable_gaze and gaze_output
       - args.gaze_map_size_int only matters when gaze maps are actually loaded
     """
@@ -758,22 +758,22 @@ def _build_transforms_and_specs(args):
             model_specs["num_patches"] = int(num_patches)
 
     # Central gaze policy object (single source of truth)
-    gaze_cfg = build_gaze_config(args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
+    model_variant_cfg = build_model_variant_config(args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
 
     # gaze_output is only meaningful when gaze is loaded; kept stable for transform signatures
-    gaze_output = str(getattr(gaze_cfg, "gaze_output", "align")).lower().strip()
+    gaze_output = str(getattr(model_variant_cfg, "gaze_output", "align")).lower().strip()
     if gaze_output not in ("align", "guide"):
         gaze_output = "align"
 
     # Select gaze folder size only when gaze maps are loaded
-    if bool(getattr(gaze_cfg, "load_gaze", False)) and gaze_output == "align" and int(grid_h) != int(grid_w):
+    if bool(getattr(model_variant_cfg, "load_gaze", False)) and gaze_output == "align" and int(grid_h) != int(grid_w):
         raise RuntimeError(
             "The current gaze-map folder convention is square, but the resolved ViT patch grid is "
             f"{(int(grid_h), int(grid_w))}. Use a square input/patch grid or extend the gaze loader "
             "to address rectangular map folders explicitly."
         )
 
-    if bool(getattr(gaze_cfg, "load_gaze", False)) and (gaze_output == "guide"):
+    if bool(getattr(model_variant_cfg, "load_gaze", False)) and (gaze_output == "guide"):
         args.gaze_map_size_int = int(out_size)
     else:
         args.gaze_map_size_int = int(grid_h)
@@ -783,7 +783,7 @@ def _build_transforms_and_specs(args):
         augment=getattr(args, "augment", "none"),
         ties=bool(getattr(args, "ties", True)),
         gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=bool(getattr(gaze_cfg, "load_gaze", False)),
+        enable_gaze=bool(getattr(model_variant_cfg, "load_gaze", False)),
         gaze_output=gaze_output,
     )
     train_tfms = preprocessing["train"]
@@ -800,16 +800,13 @@ def _build_transforms_and_specs(args):
         "backbone_family": "cnn" if is_cnn_backbone else "transformer",
         "model_specs": dict(model_specs),
         "gaze": {
-            "mode": str(getattr(gaze_cfg, "mode", "disable")),
-            "load_gaze": bool(getattr(gaze_cfg, "load_gaze", False)),
-            "inject": bool(getattr(gaze_cfg, "inject", False)),
-            "compute_kl": bool(getattr(gaze_cfg, "compute_kl", False)),
-            "use_kl_in_loss": bool(getattr(gaze_cfg, "use_kl_in_loss", False)),
-            "need_attn_maps": bool(getattr(gaze_cfg, "need_attn_maps", False)),
-            "align_target": str(getattr(gaze_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))),
-            "attention_bias": bool(getattr(gaze_cfg, "attention_bias", False)),
-            "attention_bias_mode": str(getattr(args, "gaze_attention_bias", "none")),
-            "attention_bias_strength": float(getattr(args, "gaze_attention_bias_strength", 0.0)),
+            "model_variant": str(getattr(model_variant_cfg, "variant", "Baseline")),
+            "load_gaze": bool(getattr(model_variant_cfg, "load_gaze", False)),
+            "inject": bool(getattr(model_variant_cfg, "inject", False)),
+            "compute_kl": bool(getattr(model_variant_cfg, "compute_kl", False)),
+            "use_kl_in_loss": bool(getattr(model_variant_cfg, "use_kl_in_loss", False)),
+            "need_attn_maps": bool(getattr(model_variant_cfg, "need_attn_maps", False)),
+            "align_target": str(getattr(model_variant_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))),
             "gaze_output": gaze_output,
             "grid_size": tuple(args.gaze_grid_size),
             "out_size": int(out_size),
@@ -826,7 +823,7 @@ def _build_transforms_and_specs(args):
 
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
 
-    cfg = getattr(args, "gaze_cfg", None)
+    cfg = getattr(args, "model_variant_cfg", None)
     use_gaze = bool(getattr(cfg, "load_gaze", False))
 
     train_set = ComparisonsDataset(
@@ -870,13 +867,12 @@ def _build_model(args, backbone_model, is_cnn_backbone: bool) -> torch.nn.Module
         known = TRANSFORMER_BACKBONES + CNN_BACKBONES
         raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known}")
 
-    gaze_cfg = getattr(args, "gaze_cfg", None)
+    model_variant_cfg = getattr(args, "model_variant_cfg", None)
 
-    need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False)) if gaze_cfg is not None else False
-    gaze_align_target = str(getattr(gaze_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))).lower().strip() if gaze_cfg is not None else str(getattr(args, "gaze_align_target", "attention")).lower().strip()
-    use_gaze_inj = bool(getattr(gaze_cfg, "inject", False)) if gaze_cfg is not None else False
-    use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) if gaze_cfg is not None else False
-    use_gaze_attention_bias = bool(getattr(gaze_cfg, "attention_bias", False)) if gaze_cfg is not None else False
+    need_attn_maps = bool(getattr(model_variant_cfg, "need_attn_maps", False)) if model_variant_cfg is not None else False
+    gaze_align_target = str(getattr(model_variant_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))).lower().strip() if model_variant_cfg is not None else str(getattr(args, "gaze_align_target", "attention")).lower().strip()
+    use_gaze_inj = bool(getattr(model_variant_cfg, "inject", False)) if model_variant_cfg is not None else False
+    use_kl_in_loss = bool(getattr(model_variant_cfg, "use_kl_in_loss", False)) if model_variant_cfg is not None else False
 
     gaze_grid = getattr(args, "gaze_grid_size", (14, 14))
     if isinstance(gaze_grid, (list, tuple)) and len(gaze_grid) == 2:
@@ -924,10 +920,10 @@ def _build_model(args, backbone_model, is_cnn_backbone: bool) -> torch.nn.Module
     )
 
     use_egvit = False
-    if gaze_cfg is not None:
-        use_egvit = bool(getattr(gaze_cfg, "egvit", False)) or (str(getattr(gaze_cfg, "mode", "")).lower().strip() == "egvit")
+    if model_variant_cfg is not None:
+        use_egvit = bool(getattr(model_variant_cfg, "egvit", False)) or (str(getattr(model_variant_cfg, "variant", "")) == "EG-ViT")
     else:
-        use_egvit = (str(getattr(args, "gaze_mode", "disable")).lower().strip() == "egvit")
+        use_egvit = (str(getattr(args, "model_variant", "Baseline")) == "EG-ViT")
 
     focus_hw = getattr(args, "egvit_focus_hw", (3, 3))
     if isinstance(focus_hw, (list, tuple)) and len(focus_hw) == 2:
@@ -958,9 +954,6 @@ def _build_model(args, backbone_model, is_cnn_backbone: bool) -> torch.nn.Module
         return_attn=bool(need_attn_maps),
         attention_mode=args.attention_mode,
         gaze_align_target=gaze_align_target,
-        gaze_attention_bias=str(getattr(args, "gaze_attention_bias", "none")) if use_gaze_attention_bias else "none",
-        gaze_attention_bias_strength=float(getattr(args, "gaze_attention_bias_strength", 0.0)) if use_gaze_attention_bias else 0.0,
-        gaze_attention_bias_train_only=bool(getattr(args, "gaze_attention_bias_train_only", True)),
         attn_layer=int(getattr(args, "attn_layer", -1)),
         attn_out_hw=tuple(gaze_grid_hw),
         use_gaze_injection=bool(use_gaze_inj),

@@ -16,7 +16,7 @@ from perceived_safety_app.explanation_maps import get_selected_attention_methods
 from perceived_safety_app.model_catalog import DEFAULT_RUN_ID, get_model_entry
 
 from backbone import infer_vit_grid_size, resolve_backbone
-from gaze_config import build_gaze_config
+from model_variant_config import build_model_variant_config
 from model_factory import build_model, load_state_dict_safely
 
 
@@ -27,7 +27,7 @@ def _default_args() -> SimpleNamespace:
         pooling="cls",
         pool_k=10,
         ties=False,
-        gaze_mode="align",
+        model_variant="EG-PCS-Net",
         attention_mode="raw",
         attn_layer=-1,
         attn_w=0.0,
@@ -229,7 +229,7 @@ def build_model_for_checkpoint(rr: RunResolved) -> Tuple[torch.nn.Module, dict, 
     rr.args.gaze_grid_size = tuple(gaze_grid_size)
 
     out_size = int(specs.get("img_size", specs.get("input_size", (3, 224, 224))[-1]))
-    gaze_cfg = build_gaze_config(rr.args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
+    model_variant_cfg = build_model_variant_config(rr.args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
 
     use_attn_default = _attention_hooks_required()
     use_attn = bool(eff_force_use_attn) if (eff_force_use_attn is not None) else bool(use_attn_default)
@@ -237,8 +237,8 @@ def build_model_for_checkpoint(rr: RunResolved) -> Tuple[torch.nn.Module, dict, 
         warnings.warn("Selected attention extraction requires attention hooks; enabling them for evaluation.")
         use_attn = True
 
-    rr.args.gaze_cfg = replace(
-        gaze_cfg,
+    rr.args.model_variant_cfg = replace(
+        model_variant_cfg,
         need_attn_maps=bool(use_attn),
         compute_kl=bool(use_attn),
         use_kl_in_loss=False,
@@ -261,6 +261,6 @@ def build_model_for_checkpoint(rr: RunResolved) -> Tuple[torch.nn.Module, dict, 
         "gaze_grid_size": gaze_grid_size,
         "use_attn": bool(use_attn),
         "attention_methods": get_selected_attention_methods(),
-        "gaze_mode": getattr(rr.args, "gaze_mode", None),
+        "model_variant": getattr(rr.args, "model_variant", None),
     }
     return net, specs, gaze_grid_size

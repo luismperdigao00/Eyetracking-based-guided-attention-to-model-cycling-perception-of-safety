@@ -93,7 +93,7 @@ deployment_app/
 ├── model_code/                        # self-contained Siamese ViT implementation
 │   ├── __init__.py
 │   ├── backbone.py                    # backbone resolution and preprocessing specifications
-│   ├── gaze_config.py                 # deployment gaze-alignment configuration
+│   ├── model_variant_config.py        # deployment model-variant configuration
 │   ├── model_factory.py               # EG-PCS-Net model construction
 │   └── transformer/                   # transformer wrapper and attention utilities
 │       ├── __init__.py

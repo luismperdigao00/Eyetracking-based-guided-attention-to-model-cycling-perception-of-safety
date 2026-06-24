@@ -149,22 +149,22 @@ def _set_gaze_bp(model: torch.nn.Module, enabled: bool) -> None:
         return
 
 def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool, bool]:
-    gaze_cfg = getattr(args, "gaze_cfg", None)
-    if gaze_cfg is None:
+    model_variant_cfg = getattr(args, "model_variant_cfg", None)
+    if model_variant_cfg is None:
         raise RuntimeError(
-            "args.gaze_cfg is missing. Build it with gaze_policy.build_gaze_config(...) "
+            "args.model_variant_cfg is missing. Build it with model_variant_policy.build_model_variant_config(...) "
             "before entering the training loop."
         )
 
-    gaze_mode = str(getattr(gaze_cfg, "mode", "disable")).lower().strip()
-    use_gaze_inj = bool(getattr(gaze_cfg, "inject", False))
-    use_gaze_kl = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
-    pass_to_model = bool(getattr(gaze_cfg, "pass_to_model", False))
-    compute_kl = bool(getattr(gaze_cfg, "compute_kl", False))
-    load_gaze = bool(getattr(gaze_cfg, "load_gaze", False))
+    model_variant = str(getattr(model_variant_cfg, "variant", "Baseline")).strip()
+    use_gaze_inj = bool(getattr(model_variant_cfg, "inject", False))
+    use_gaze_kl = bool(getattr(model_variant_cfg, "use_kl_in_loss", False))
+    pass_to_model = bool(getattr(model_variant_cfg, "pass_to_model", False))
+    compute_kl = bool(getattr(model_variant_cfg, "compute_kl", False))
+    load_gaze = bool(getattr(model_variant_cfg, "load_gaze", False))
 
     use_gaze_any = bool(load_gaze or pass_to_model or compute_kl or use_gaze_kl)
-    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
+    return model_variant, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model
 
 
 
@@ -179,7 +179,7 @@ def _prepare_batch(
     label_r = data["score_r"].to(device).float()
     label_c = data["score_c"].to(device).long()
 
-    _gaze_mode, use_gaze_any, _use_gaze_kl, _use_gaze_inj, pass_to_model = _resolve_gaze_flags(args)
+    _model_variant, use_gaze_any, _use_gaze_kl, _use_gaze_inj, pass_to_model = _resolve_gaze_flags(args)
 
     labels: Dict[str, torch.Tensor] = {"label_r": label_r, "label_c": label_c}
 
@@ -274,7 +274,7 @@ def _build_metrics_output(
             out["loss_kl_weighted"] = 0.0
             out["w_kl_eff"] = 0.0
             out["gaze_count"] = 0
-            out["gaze_mode"] = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off")))
+            out["model_variant"] = str(getattr(args, "model_variant", "Baseline"))
             out["gaze_align_target"] = str(getattr(args, "gaze_align_target", "attention"))
             out["use_gaze_kl"] = 0.0
             return out
@@ -288,7 +288,7 @@ def _build_metrics_output(
         )
         out["w_kl_eff"] = float(parts.get("w_kl_eff", 0.0))
         out["gaze_count"] = int(parts.get("gaze_count", 0))
-        out["gaze_mode"] = str(parts.get("gaze_mode", getattr(args, "gaze_mode", getattr(args, "gaze", "off"))))
+        out["model_variant"] = str(parts.get("model_variant", getattr(args, "model_variant", "Baseline")))
         out["gaze_align_target"] = str(parts.get("gaze_align_target", getattr(args, "gaze_align_target", "attention")))
         out["use_gaze_kl"] = float(parts.get("use_gaze_kl", 0.0))
         return out
@@ -650,17 +650,16 @@ def _make_train_step(
     Ignite training-step factory.
 
     Centralized gaze behavior:
-      - _prepare_batch uses args.gaze_cfg to decide whether gaze tensors are present and whether
+      - _prepare_batch uses args.model_variant_cfg to decide whether gaze tensors are present and whether
         gaze is injected into the model forward.
-      - compute_loss uses args.gaze_cfg to decide whether KL(attn↔gaze) is computed and whether
+      - compute_loss uses args.model_variant_cfg to decide whether KL(attn↔gaze) is computed and whether
         it contributes to loss_total.
 
-    Supported gaze modes:
-      - disable     : no gaze tensors, no KL diagnostics, no injection
-      - diag        : KL computed for diagnostics only
-      - guide       : gaze injection enabled; KL computed for diagnostics only
-      - align       : KL weighted into objective via attn_w
-      - align+gaze  : injection enabled + KL weighted into objective via attn_w
+    Supported model variants:
+      - Baseline   : no gaze tensors, KL diagnostics, or injection
+      - EG-ViT     : gaze-guided patch masking
+      - GII-ViT    : gaze injection with KL diagnostics
+      - EG-PCS-Net : KL weighted into the objective via attn_w
     """
     accum = max(1, int(accum_steps))
 
@@ -721,7 +720,7 @@ def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
     Behavior:
       - Runs under torch.no_grad()
       - Calls compute_loss and reports loss_total (KL included only in align modes via w_kl_eff)
-      - If gaze_mode includes guide, gaze tensors are passed into the transformer for injection
+      - If model_variant is GII-ViT, gaze tensors are passed into the transformer for injection
         (handled by _prepare_batch input packing)
     """
     def inference_step(engine, data):
@@ -836,7 +835,7 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
 
 
             # Optional: track which mode is active in logs (string; keep in output dict but not as metric)
-            # gaze_mode, *_ = _resolve_gaze_flags(args)
+            # model_variant, *_ = _resolve_gaze_flags(args)
 
             # 3) Ranking accuracy
             if args.full_accuracy:
@@ -885,7 +884,7 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
 
-    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model = _resolve_gaze_flags(args)
+    model_variant, use_gaze_any, use_gaze_kl, use_gaze_inj, pass_to_model = _resolve_gaze_flags(args)
 
     net.eval()
     with torch.no_grad():
@@ -1284,13 +1283,13 @@ def train(
     net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
     is_transformer = hasattr(net_cfg, "transformer")
 
-    gaze_mode, _use_gaze_any, use_gaze_kl, _use_gaze_inj, _pass_to_model = _resolve_gaze_flags(args)
+    model_variant, _use_gaze_any, use_gaze_kl, _use_gaze_inj, _pass_to_model = _resolve_gaze_flags(args)
 
     
     attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
     
     # Attention-map gradient retention is only needed when KL actually contributes to the objective.
-    # In off/guide modes KL is diagnostic only (w_kl_eff=0), so attention grads are not required.
+    # In GII-ViT mode KL is diagnostic only (w_kl_eff=0), so attention grads are not required.
     _set_gaze_bp(net, enabled=bool(use_gaze_kl and (attn_w > 0.0)))
 
 

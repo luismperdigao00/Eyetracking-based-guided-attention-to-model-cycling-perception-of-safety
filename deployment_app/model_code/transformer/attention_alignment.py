@@ -63,10 +63,6 @@ class AttentionConfig:
     layer: int = -1
     out_hw: Tuple[int, int] = (14, 14)
     capture_mode: str = "graph"        # {"graph","approx_qk"}
-    gaze_bias: str = "none"            # {"none","cls_to_patch","all_queries_to_patch"}
-    gaze_bias_strength: float = 0.0
-    gaze_bias_train_only: bool = True
-    gaze_bias_eps: float = 1e-6
 
 
 class AttentionRecorder:
@@ -98,9 +94,6 @@ class AttentionRecorder:
 
         self._last_used_uniform: bool = False
 
-        self._active_gaze_map: Optional[torch.Tensor] = None
-        self._active_has_eye_mask: Optional[torch.Tensor] = None
-        self._active_num_prefix_tokens: int = 1
 
     @property
     def enabled(self) -> bool:
@@ -155,21 +148,6 @@ class AttentionRecorder:
         self._hooked_modules.clear()
         self._attn_hooked = False
         self.reset()
-
-    def set_gaze_bias_context(
-        self,
-        gaze_map: Optional[torch.Tensor],
-        has_eye_mask: Optional[torch.Tensor],
-        num_prefix_tokens: int,
-    ) -> None:
-        self._active_gaze_map = gaze_map
-        self._active_has_eye_mask = has_eye_mask
-        self._active_num_prefix_tokens = int(num_prefix_tokens)
-
-    def clear_gaze_bias_context(self) -> None:
-        self._active_gaze_map = None
-        self._active_has_eye_mask = None
-        self._active_num_prefix_tokens = 1
 
     def begin_capture(self) -> None:
         self.reset()
@@ -312,128 +290,6 @@ class AttentionRecorder:
             ).type_as(v)
             return q, k
 
-        def _configured_patch_count(n_tokens: int) -> Optional[int]:
-            try:
-                out_h, out_w = tuple(getattr(self.cfg, "out_hw", (14, 14)))
-                p = int(out_h) * int(out_w)
-                if 0 < p < int(n_tokens):
-                    return p
-            except Exception:
-                pass
-            return None
-
-        def _resize_flat_prior(g_flat: torch.Tensor, target_len: int) -> torch.Tensor:
-            target_len = int(target_len)
-            if int(g_flat.shape[-1]) == target_len:
-                return g_flat
-            return F.interpolate(
-                g_flat.unsqueeze(1),
-                size=target_len,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(1)
-
-        def _resize_gaze_prior_for_attention(
-            x_in: torch.Tensor,
-            num_patches: int,
-            _mod=mod,
-        ) -> Optional[torch.Tensor]:
-            mode = str(getattr(self.cfg, "gaze_bias", "none")).lower().strip()
-            if mode in ("", "none", "off", "disable", "disabled"):
-                return None
-            if float(getattr(self.cfg, "gaze_bias_strength", 0.0)) == 0.0:
-                return None
-            if bool(getattr(self.cfg, "gaze_bias_train_only", True)) and (not bool(_mod.training)):
-                return None
-
-            target_len = int(num_patches)
-            gaze_map = self._active_gaze_map
-            if gaze_map is None or target_len <= 0:
-                return None
-
-            g = gaze_map.to(device=x_in.device, dtype=x_in.dtype)
-            if g.ndim == 4:
-                g = g[:, 0, :, :] if g.shape[1] == 1 else g.mean(dim=1)
-            elif g.ndim == 2:
-                # Already flattened as [B,P].
-                pass
-            elif g.ndim != 3:
-                return None
-
-            b = int(x_in.shape[0])
-            if int(g.shape[0]) != b:
-                return None
-
-            if g.ndim == 2:
-                g_flat = g.clamp_min(0.0)
-            else:
-                out_h, out_w = tuple(getattr(self.cfg, "out_hw", (14, 14)))
-                out_h, out_w = int(out_h), int(out_w)
-                if out_h * out_w != target_len:
-                    side = int(math.isqrt(target_len))
-                    if side * side == target_len:
-                        out_h, out_w = side, side
-                    else:
-                        out_h, out_w = target_len, 1
-
-                g4 = g.unsqueeze(1).clamp_min(0.0)
-                g4 = F.interpolate(g4, size=(out_h, out_w), mode="bilinear", align_corners=False)
-                g_flat = g4.flatten(2)
-
-            g_flat = _resize_flat_prior(g_flat, target_len)
-            g_flat = g_flat / g_flat.sum(dim=-1, keepdim=True).clamp_min(float(getattr(self.cfg, "gaze_bias_eps", 1e-6)))
-
-            uniform = 1.0 / float(max(1, target_len))
-            prior = torch.log(g_flat.clamp_min(float(getattr(self.cfg, "gaze_bias_eps", 1e-6)))) - math.log(uniform)
-            prior = prior * float(getattr(self.cfg, "gaze_bias_strength", 0.0))
-
-            has_eye = self._active_has_eye_mask
-            if has_eye is not None:
-                m = has_eye.to(device=x_in.device, dtype=torch.bool).view(b, 1)
-                prior = torch.where(m, prior, prior.new_zeros(prior.shape))
-
-            return prior[:, None, None, :]
-
-        def _apply_gaze_attention_bias(attn_logits: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
-            mode = str(getattr(self.cfg, "gaze_bias", "none")).lower().strip()
-            if mode in ("", "none", "off", "disable", "disabled"):
-                return attn_logits
-
-            n_tokens = int(attn_logits.shape[-1])
-            t = int(self._active_num_prefix_tokens)
-
-            cfg_patch_count = _configured_patch_count(n_tokens)
-            if cfg_patch_count is not None:
-                key_start = n_tokens - int(cfg_patch_count)
-                key_count = int(cfg_patch_count)
-            else:
-                key_start = t
-                key_count = n_tokens - t
-
-            if key_count <= 0 or key_start < 0 or key_start >= n_tokens:
-                return attn_logits
-
-            prior = _resize_gaze_prior_for_attention(x_in, key_count)
-            if prior is None:
-                return attn_logits
-
-            # Force the prior to a broadcastable key-bias tensor. This avoids
-            # relying on prefix/register-token accounting in EVA/DINO variants.
-            prior = prior.reshape(prior.shape[0], 1, 1, -1)
-            prior_len = min(int(prior.shape[-1]), n_tokens)
-            if prior_len <= 0:
-                return attn_logits
-            prior = prior[..., -prior_len:]
-
-            out = attn_logits.clone()
-            if mode in ("cls", "cls_to_patch", "cls_patch"):
-                out[:, :, 0:1, -prior_len:] = out[:, :, 0:1, -prior_len:] + prior
-            elif mode in ("all", "all_queries", "all_queries_to_patch", "patch_keys"):
-                out[:, :, :, -prior_len:] = out[:, :, :, -prior_len:] + prior
-            else:
-                return attn_logits
-            return out
-
         def _compute_attn_pre_from_x(
             x_in: torch.Tensor,
             rope: Optional[torch.Tensor] = None,
@@ -450,7 +306,6 @@ class AttentionRecorder:
             scale = float(getattr(_mod, "scale", head_dim ** -0.5))
             attn_logits = (q * scale) @ k.transpose(-2, -1)
             attn_logits = maybe_add_mask(attn_logits, attn_mask)
-            attn_logits = _apply_gaze_attention_bias(attn_logits, x_in)
             return attn_logits.softmax(dim=-1)
 
         def _manual_attention_forward(
@@ -473,7 +328,6 @@ class AttentionRecorder:
             scale = float(getattr(_mod, "scale", head_dim ** -0.5))
             attn_logits = (q * scale) @ k.transpose(-2, -1)
             attn_logits = maybe_add_mask(attn_logits, attn_mask)
-            attn_logits = _apply_gaze_attention_bias(attn_logits, x_in)
             attn_pre = attn_logits.softmax(dim=-1)
 
             attn_fwd = _mod.attn_drop(attn_pre) if hasattr(_mod, "attn_drop") else attn_pre
@@ -532,12 +386,7 @@ class AttentionRecorder:
                 if out is not None:
                     return out
                 return _orig(x, *args, **kwargs)
-            except Exception as e:
-                if str(getattr(self.cfg, "gaze_bias", "none")).lower().strip() not in ("", "none", "off", "disable", "disabled"):
-                    warnings.warn(
-                        "Attention graph capture failed while gaze_attention_bias is active; "
-                        f"falling back to the original attention forward ({type(e).__name__}: {e})."
-                    )
+            except Exception:
                 return _orig(x, *args, **kwargs)
 
         mod.forward = wrapped_forward

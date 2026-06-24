@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from backbone_registry import BACKBONE_ALIAS_TO_TIMM_ID, DEFAULT_SPECS, infer_vit_grid_size, resolve_backbone
-from gaze_policy import normalize_gaze_mode
+from model_variant_policy import normalize_model_variant
 
 
 @dataclass
@@ -169,11 +169,11 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
             _warn(warnings, "--model classification: --ties_w is ignored.")
         if getattr(args, "ranking_margin", 0.0) != 0.3:
             _warn(warnings, "--model classification: --ranking_margin is ignored.")
-        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_gaze_mode(getattr(args, "gaze_mode", None)) != "disable":
+        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_model_variant(getattr(args, "model_variant", None)) != "Baseline":
             _warn(warnings, "--model classification: gaze alignment loss is not applicable; --attn_w will be ignored.")
 
     if model == "multitask":
-        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_gaze_mode(getattr(args, "gaze_mode", None)) != "disable":
+        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and normalize_model_variant(getattr(args, "model_variant", None)) != "Baseline":
             _warn(warnings, "--model multitask: gaze alignment loss is not applicable; --attn_w will be ignored.")
 
     # Ranking-only model ignores classification knobs
@@ -186,8 +186,8 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     # ------------------------------------------------------------------
     # Gaze dependencies
     # ------------------------------------------------------------------
-    gaze_mode = normalize_gaze_mode(getattr(args, "gaze_mode", None))
-    args.gaze_mode = gaze_mode
+    model_variant = normalize_model_variant(getattr(args, "model_variant", None))
+    args.model_variant = model_variant
 
     attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
     if attn_w < 0.0:
@@ -195,16 +195,16 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
 
     # KL is only used by the multitask_gaze objective in this codebase.
     model = str(getattr(args, "model", "ranking")).lower().strip()
-    wants_kl = gaze_mode in ("diag", "align", "align+gaze")
+    wants_kl = model_variant in ("GII-ViT", "EG-PCS-Net")
 
     if (model != "multitask_gaze") and wants_kl:
-        _warn(warnings, f"--gaze_mode={gaze_mode} requests KL diagnostics/supervision, but --model={model}; KL will be disabled.")
+        _warn(warnings, f"--model_variant={model_variant} requests KL diagnostics/supervision, but --model={model}; KL will be disabled.")
 
-    if gaze_mode in ("disable", "diag", "guide", "gaze_bias") and attn_w > 0.0:
-        _warn(warnings, f"--attn_w={attn_w} but --gaze_mode={gaze_mode}; KL will not contribute to the objective (w_kl_eff=0).")
+    if model_variant in ("Baseline", "EG-ViT", "GII-ViT") and attn_w > 0.0:
+        _warn(warnings, f"--attn_w={attn_w} but --model_variant={model_variant}; KL will not contribute to the objective (w_kl_eff=0).")
 
-    if gaze_mode in ("align", "align+gaze") and attn_w == 0.0:
-        _warn(warnings, f"--gaze_mode={gaze_mode} but --attn_w=0; KL supervision is effectively disabled.")
+    if model_variant == "EG-PCS-Net" and attn_w == 0.0:
+        _warn(warnings, f"--model_variant={model_variant} but --attn_w=0; KL supervision is effectively disabled.")
 
 
     # ------------------------------------------------------------------
@@ -245,7 +245,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     return ArgsCheckReport(warnings=warnings, errors=errors)
     
 
-# Backbone and gaze policy live in backbone_registry.py and gaze_policy.py.
+# Backbone and model-variant policy live in backbone_registry.py and model_variant_policy.py.
 # They are re-exported here to keep old scripts and notebooks compatible.
 
 
@@ -297,7 +297,7 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         training augmentation (swap/hflip/rotation + crop + photometric + erase).
 
     Gaze printing rules (centralized):
-      - Gaze mode and dependencies come from args.gaze_cfg when present
+      - Model variant and dependencies come from args.model_variant_cfg when present
       - When gaze is disabled, no gaze output/grid/out_size lines are printed
       - Gaze out_size is printed only when gaze is enabled and gaze_output == "guide"
     """
@@ -331,20 +331,20 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     train_class = train_tfms.__class__.__name__ if train_tfms is not None else str(tm.get("train_transform_class", "unknown"))
     eval_class = eval_tfms.__class__.__name__ if eval_tfms is not None else str(tm.get("eval_transform_class", "unknown"))
 
-    cfg = getattr(args, "gaze_cfg", None)
+    cfg = getattr(args, "model_variant_cfg", None)
 
-    gaze_mode = str(
+    model_variant = str(
         gaze_meta.get(
-            "mode",
-            getattr(cfg, "mode", getattr(args, "gaze_mode", "disable")),
+            "model_variant",
+            getattr(cfg, "variant", getattr(args, "model_variant", "Baseline")),
         )
-    ).lower().strip()
+    ).strip()
 
     load_gaze = bool(gaze_meta.get("load_gaze", getattr(cfg, "load_gaze", False)))
     if ("load_gaze" not in gaze_meta) and ("requested" in gaze_meta):
         load_gaze = bool(gaze_meta.get("requested", False))
 
-    gaze_enabled = bool(load_gaze) and (gaze_mode != "disable")
+    gaze_enabled = bool(load_gaze) and (model_variant != "Baseline")
 
     gaze_grid = gaze_meta.get("grid_size", getattr(args, "gaze_grid_size", None))
 
@@ -385,7 +385,7 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
 
     print(f"  Eval Tfms Class : {eval_class}")
 
-    print(f"  Gaze Mode       : {gaze_mode}")
+    print(f"  Model Variant       : {model_variant}")
     if not gaze_enabled:
         print("  Gaze Enabled    : OFF")
     else:
@@ -620,21 +620,19 @@ def print_run_plan(
     print(f"  ties         : {args.ties}")
     
     # --- Attention / gaze ---
-    gaze_cfg = getattr(args, 'gaze_cfg', None)
-    gaze_mode = str(getattr(gaze_cfg, 'mode', getattr(args, 'gaze_mode', 'disable')))
-    print(f"  gaze_mode    : {gaze_mode}")
+    model_variant_cfg = getattr(args, 'model_variant_cfg', None)
+    model_variant = str(getattr(model_variant_cfg, 'variant', getattr(args, 'model_variant', 'Baseline')))
+    print(f"  model_variant    : {model_variant}")
     print(f"  eyetracker   : {getattr(args, 'eyetracker_filter', 'all')}")
 
-    if gaze_cfg is not None:
-        print(f"  load_gaze    : {bool(getattr(gaze_cfg, 'load_gaze', False))}")
-        print(f"  inject_gaze  : {bool(getattr(gaze_cfg, 'inject', False))}")
-        print(f"  compute_kl   : {bool(getattr(gaze_cfg, 'compute_kl', False))}")
-        print(f"  kl_in_loss   : {bool(getattr(gaze_cfg, 'use_kl_in_loss', False))}")
-        print(f"  align_target : {getattr(gaze_cfg, 'align_target', getattr(args, 'gaze_align_target', 'attention'))}")
-        if bool(getattr(gaze_cfg, 'attention_bias', False)):
-            print(f"  attn_bias   : {getattr(args, 'gaze_attention_bias', 'none')} (strength={float(getattr(args, 'gaze_attention_bias_strength', 0.0))})")
+    if model_variant_cfg is not None:
+        print(f"  load_gaze    : {bool(getattr(model_variant_cfg, 'load_gaze', False))}")
+        print(f"  inject_gaze  : {bool(getattr(model_variant_cfg, 'inject', False))}")
+        print(f"  compute_kl   : {bool(getattr(model_variant_cfg, 'compute_kl', False))}")
+        print(f"  kl_in_loss   : {bool(getattr(model_variant_cfg, 'use_kl_in_loss', False))}")
+        print(f"  align_target : {getattr(model_variant_cfg, 'align_target', getattr(args, 'gaze_align_target', 'attention'))}")
 
-    if bool(getattr(gaze_cfg, 'need_attn_maps', False)):
+    if bool(getattr(model_variant_cfg, 'need_attn_maps', False)):
         print(f"  attn_mode    : {getattr(args, 'attention_mode', 'raw')}")
 
     print(f"  augment      : {args.augment}")
@@ -710,16 +708,16 @@ def print_run_plan(
     if args.ties and args.ties_w > 0:
         parts.append(f"{args.ties_w:g}·ties")
 
-    gaze_cfg = getattr(args, 'gaze_cfg', None)
-    if gaze_cfg is None:
+    model_variant_cfg = getattr(args, 'model_variant_cfg', None)
+    if model_variant_cfg is None:
         raise RuntimeError(
-            "args.gaze_cfg is missing. Build it with gaze_policy.build_gaze_config(...) "
+            "args.model_variant_cfg is missing. Build it with model_variant_policy.build_model_variant_config(...) "
             "before printing the run plan."
         )
 
-    gaze_mode = str(getattr(gaze_cfg, 'mode', 'disable'))
+    model_variant = str(getattr(model_variant_cfg, 'variant', 'Baseline'))
 
-    use_kl_in_loss = bool(getattr(gaze_cfg, 'use_kl_in_loss', False))
+    use_kl_in_loss = bool(getattr(model_variant_cfg, 'use_kl_in_loss', False))
 
     if use_kl_in_loss:
         parts.append(f"{args.attn_w:g}·KL(gaze↔attn)")

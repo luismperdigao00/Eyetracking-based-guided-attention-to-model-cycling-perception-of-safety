@@ -14,6 +14,7 @@ import wandb
 
 from backbone_registry import resolve_backbone
 from train_utils import validate_and_normalize_args
+from model_variant_policy import normalize_model_variant
 
 from train_main_utils import (
     _seed_everything,
@@ -21,9 +22,6 @@ from train_main_utils import (
     initialize_wandb,
     read_data,
     apply_backbone_hparam_overrides,
-    _boolish_series_to_bool_mask,
-    _ensure_dir,
-    _split_paths,
     _load_or_split,
     _print_filtered_dataset_summary,
     _print_image_overlap_stats,
@@ -31,10 +29,7 @@ from train_main_utils import (
     _print_split_sizes,
     _print_label_distribution_by_split,
     _compute_and_attach_class_weights,
-    _parse_gpu_ids,
     _select_device,
-    _load_state_dict_safely,
-    _resolve_gaze_grid,
     _build_transforms_and_specs,
     _build_dataloaders,
     _build_model,
@@ -42,7 +37,6 @@ from train_main_utils import (
     _maybe_resume,
     _cleanup_between_trials,
     normalize_finetune_layer_args,
-    scale_lr_and_eta_min_by_unfrozen_layers,
 )
 
 from scripts.train_script import train
@@ -150,21 +144,18 @@ def arg_parse():
     es_group.add_argument("--early_stop_start_epoch", type=int, default=1,
                           help="Do not early-stop before this epoch.")
 
-    # -------------------- GAZE & CITY FILTERS ----------------
+    # -------------------- MODEL VARIANT & CITY FILTERS ----------------
     parser.add_argument(
-        "--gaze_mode",
-        type=str,
-        default="disable",
+        "--model_variant",
+        type=normalize_model_variant,
+        default="Baseline",
+        choices=["Baseline", "EG-ViT", "GII-ViT", "EG-PCS-Net"],
         help=(
-            "Gaze behavior:\n"
-            "  disable    : no gaze loading, no KL diagnostics, no injection, no attention hooks\n"
-            "  diag       : KL computed for diagnostics only (no gradient contribution)\n"
-            "  guide      : gaze injected; KL computed for diagnostics only\n"
-            "  egvit      : EG-ViT masking (mask patch tokens by gaze during training; no KL)\n"
-            "  gaze_bias  : gaze prior injected into self-attention logits during training; no KL by default\n"
-            "  align      : KL added to total loss (attn_w * KL)\n"
-            "  align+gaze : gaze injected and KL added to total loss (attn_w * KL)\n"
-            "Legacy aliases: off->diag, align+guide->align+gaze, attn_bias->gaze_bias\n"
+            "Model variant:\n"
+            "  Baseline   : no gaze loading, diagnostics, injection, or attention hooks\n"
+            "  EG-ViT     : gaze-guided patch masking with KL diagnostics\n"
+            "  GII-ViT    : gaze injection with KL diagnostics\n"
+            "  EG-PCS-Net : gaze-attention KL added to the objective (attn_w * KL)\n"
         ),
     )
 
@@ -211,50 +202,23 @@ def arg_parse():
     )
 
 
-    parser.add_argument(
-        "--gaze_attention_bias",
-        type=str,
-        default="none",
-        choices=["none", "cls_to_patch", "all_queries_to_patch"],
-        help=(
-            "Variant used by --gaze_mode gaze_bias. "
-            "cls_to_patch biases the CLS query toward gaze patches; all_queries_to_patch also biases patch-token updates, "
-            "which is more suitable for patch_mean/GAP pooling. If left as none under gaze_bias, all_queries_to_patch is used."
-        ),
-    )
-    parser.add_argument(
-        "--gaze_attention_bias_strength",
-        type=float,
-        default=0.5,
-        help="Strength of the gaze log-prior added to attention logits for --gaze_mode gaze_bias. Try 0.25-1.0 first.",
-    )
-    parser.add_argument(
-        "--gaze_attention_bias_train_only",
-        nargs="?",
-        const=True,
-        default=True,
-        type=str2bool,
-        help="If True, gaze-biased attention is used only during training; validation/test remain gaze-free.",
-    )
-
-
     parser.add_argument("--cities", type=str, default="all")
 
     # -------------------- EG-ViT (GAZE MASKING) ----------------
     egvit_group = parser.add_argument_group("EG-ViT gaze masking options")
-    egvit_group.add_argument("--egvit_mask_type",type=str,default="separated",choices=["separated", "focused"],help="Mask construction strategy for --gaze_mode=egvit.",)
-    egvit_group.add_argument("--egvit_keep_ratio",type=float,default=0.25,help="Fraction of patch tokens to keep for separated masks (e.g., 0.25 keeps top 25% patches).",)
+    egvit_group.add_argument("--egvit_mask_type",type=str,default="separated",choices=["separated", "focused"],help="Mask construction strategy for --model_variant=EG-ViT.",)
+    egvit_group.add_argument("--egvit_keep_ratio",type=float,default=0.25,help="Fraction of patch tokens to keep for separated masks (e.g., 0.25 keeps top 25%% patches).",)
     egvit_group.add_argument("--egvit_focus_hw",type=int,nargs=2,default=(7, 7),help="Focused mask window size in patch units: H W (used only when --egvit_mask_type=focused).",)
     egvit_group.add_argument("--egvit_drop_prob",type=float,default=0.0,help="Probability to disable EG-ViT masking per-sample during training (stochastic robustness).",)
     egvit_group.add_argument("--egvit_train_only",nargs="?",const=True,default=True,type=str2bool,help="If True, apply EG-ViT masking only during training; eval() becomes a vanilla ViT forward.",
     )
-    # -------------------- GAZE GUIDANCE (Guide mode) --------------------
-    parser.add_argument("--guidance_drop_prob", type=float, default=0.0, help="Stochastic gaze disable prob (guide mode).")
+    # -------------------- GAZE GUIDANCE (GII-ViT) --------------------
+    parser.add_argument("--guidance_drop_prob", type=float, default=0.0, help="Stochastic gaze disable probability for GII-ViT.")
     parser.add_argument("--guidance_strength", type=float, default=1.0, help="Scale applied to injected guidance residual.")
     parser.add_argument("--guidance_bottleneck_dim", type=int, default=20, help="GII bottleneck dim (d').")
     parser.add_argument("--guidance_gaze_hidden_dim", type=int, default=30, help="Gaze token embedding dim (dg).")
     parser.add_argument("--guidance_conv_hidden_channels", type=int, default=64, help="GFF conv hidden channels.")
-    parser.add_argument("--guide_train_only",nargs="?",const=True,default=True,type=str2bool,help="When True, disables Guide/GII gaze injection during eval() (validation/test).",)
+    parser.add_argument("--guide_train_only",nargs="?",const=True,default=True,type=str2bool,help="When True, disables GII-ViT gaze injection during eval() (validation/test).",)
 
 
     # -------------------- LR & OPTIMIZATION ------------------

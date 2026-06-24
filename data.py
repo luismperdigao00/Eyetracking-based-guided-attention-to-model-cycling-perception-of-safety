@@ -576,7 +576,7 @@ class PairwisePreprocessing:
 
         enable_gaze: bool = False,
         gaze_grid_size=(14, 14),
-        gaze_output: str = "align",  # "align" or "guide" (also accepts "align+guide")
+        gaze_output: str = "align",  # "align" or "guide"
 
 
         paired_scale: bool = True,
@@ -645,10 +645,6 @@ class PairwisePreprocessing:
             raise ValueError(f"gaze_grid_size values must be positive, got {self.gaze_grid_size}")
 
         gaze_output = str(gaze_output).lower().strip()
-        
-        # "align+guide" is a gaze_mode; transform output should follow "align" (grid-sized).
-        if gaze_output == "align+guide":
-            gaze_output = "align"
         
         if gaze_output not in ("align", "guide"):
             gaze_output = "align"
