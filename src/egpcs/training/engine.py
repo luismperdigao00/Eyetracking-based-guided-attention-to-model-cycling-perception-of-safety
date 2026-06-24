@@ -266,19 +266,6 @@ def _build_metrics_output(
 
     raise ValueError(f"Unsupported model type: {args.model}")
 
-# --------------------------------------------------------------------------------------------------------------------
-# Optimizer / scheduler helpers
-# --------------------------------------------------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
 
 # ------------------------------------------------------------------------------------------------------------------
 # Engine step factories
@@ -1036,21 +1023,7 @@ def train(
 
     ckpt_dir = os.path.join(args.model_dir, str(run_id))
     os.makedirs(ckpt_dir, exist_ok=True)
-    """
-    trainer.add_event_handler(
-        Events.EPOCH_COMPLETED,
-        ModelCheckpoint(
-            args.model_dir,
-            f"{args.model}_{args.backbone}",
-            n_saved=10,
-            create_dir=True,
-            require_empty=False,
-            score_function=lambda e: e.state.metrics["val_acc"],
-            global_step_transform=lambda *_: trainer.state.epoch,
-        ),
-        {"model": net},
-    )
-    """
+
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED,
         ModelCheckpoint(
@@ -1114,53 +1087,6 @@ def train(
     # ------------------------------------------------------------------------------------------------
     trainer.run(train_loader, max_epochs=args.max_epochs)
 
-    """
-    # ------------------------------------------------------------------------------------------------
-    # Final evaluation using best-validation weights (not last epoch)
-    # ------------------------------------------------------------------------------------------------
-    best_sd = training_state.get("best_state_dict")
-
-    if isinstance(best_sd, dict) and len(best_sd) > 0:
-        model_to_load = net.module if hasattr(net, "module") else net
-        model_to_load.load_state_dict(best_sd, strict=True)
-
-        net.eval()
-        evaluator.run(val_loader)
-        evaluator_test.run(test_loader)
-        net.train()
-
-        training_state["final_best_val_acc"] = float(evaluator.state.metrics.get("acc", 0.0))
-        training_state["final_best_test_acc"] = float(evaluator_test.state.metrics.get("acc", 0.0))
-    else:
-        training_state["final_best_val_acc"] = float(training_state.get("best_val_acc", 0.0))
-        training_state["final_best_test_acc"] = float(training_state.get("test_acc_at_best_val", 0.0))
-
-    # ------------------------------------------------------------------------------------------------
-    # LOG final evaluation using BEST validation weights (so console/W&B end on epoch_best_val weights)
-    # ------------------------------------------------------------------------------------------------
-
-    final_best_metrics = {
-        # Make it visually “after last epoch” in plots
-        "epoch": int(trainer.state.epoch) + 1,
-        "iteration": int(trainer.state.iteration) + 1,
-        "time": f"{timer() - start_training:.3f}",
-
-        # Report BEST-weights results as the final point
-        "accuracy_train": float(training_state.get("train_acc_at_best_val", 0.0)),
-        "accuracy_validation": float(training_state.get("final_best_val_acc", 0.0)),
-        "accuracy_test": float(training_state.get("final_best_test_acc", 0.0)),
-
-        # Keep the “best tracking” keys consistent
-        "max_accuracy_validation": float(training_state.get("best_val_acc", 0.0)),
-        "max_accuracy_train": float(training_state.get("train_acc_at_best_val", 0.0)),
-        "max_accuracy_test": float(training_state.get("test_acc_at_best_val", 0.0)),
-        "epoch_best_val": int(training_state.get("epoch_best_val") or -1),
-
-        # Optional flag to disambiguate in W&B
-        "final_best_eval": 1,
-    }
-    log(args, final_best_metrics)
-    """
     # ------------------------------------------------------------------------------------------------
     # W&B finalization (after final eval so final metrics can be logged)
     # ------------------------------------------------------------------------------------------------
