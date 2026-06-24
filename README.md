@@ -32,26 +32,27 @@ Dataset documentation is provided in [docs/dataset](docs/dataset/), including a 
 
 ## Code Organization
 
-Training and evaluation share one maintained implementation under the `src/egpcs`
-package. The deployment application remains separate and can evolve independently:
+The repository is structured to clearly separate the core training and evaluation package from the deployment application and data processing scripts. This modularity allows the different components of the project to evolve independently:
 
 ```text
 eg-pcs/
 |-- pyproject.toml           # Package metadata, dependencies, and CLI commands
-|-- src/egpcs/               # Maintained training and evaluation package
-|   |-- cli/                 # Command-line entrypoints
-|   |-- config/              # Model variants and argument validation
-|   |-- data/                # Datasets, transforms, filtering, and splitting
-|   |-- models/              # Backbones and model implementations
-|   |-- training/            # Engine, losses, metrics, setup, and checkpoints
-|   |-- evaluation/          # Evaluator and explanation plots
-|   \-- utils/               # Logging, reproducibility, and filesystem helpers
-|-- deployment_app/          # Existing inference/web application
-|-- docs/                    # Documentation and figures
-|-- notebooks/               # Research notebooks (when applicable)
-\-- README.md
+|-- CITATION.cff             # Citation information
+|-- LICENSE                  # MIT License
+|-- configs/                 # YAML configuration files for experiments and sweeps
+|-- deployment_app/          # Standalone web application for model inference and visualization
+|-- docs/                    # Documentation, dataset details, and architecture figures
+|-- src/egpcs/               # Core training and evaluation package
+|   |-- cli/                 # Command-line interfaces for training and evaluation
+|   |-- config/              # Model variants and validation logic
+|   |-- data/                # Dataset loaders, transforms, and splitting logic
+|   |-- evaluation/          # Evaluator modules and interpretability/explanation maps
+|   |-- models/              # Vision Transformer (ViT), CNN backbones, and custom attention layers
+|   |-- training/            # Training engine, custom losses, metrics, and checkpoints
+|   \-- utils/               # Logging, filesystem, and reproducibility helpers
+|-- survey_eye_tracker/      # Scripts and notebooks for eye-tracking data processing
+\-- README.md                # Project overview and usage instructions
 ```
-
 
 ## How to Use
 
@@ -133,14 +134,53 @@ The equivalent module commands are `python -m egpcs.cli.train` and
 
 ## How to Cite
 
-If you use this repository or build on EG-PCS, please cite the paper below. If you use the EG-PCS dataset, citation metadata for the dataset DOI is also available in [CITATION.cff](CITATION.cff).
+Please cite the resources you actually use. If your work uses more than one resource,
+cite each applicable entry.
+
+### Software
+
+Cite the software when you use or adapt the training, evaluation, model, or deployment
+code from this repository.
+
+```bibtex
+@software{perdigao2026egpcssoftware,
+  title   = {EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety},
+  author  = {Perdig{\~a}o, Lu{\'i}s Maria},
+  year    = {2026},
+  version = {0.1.0},
+  url     = {[https://github.com/DinhoDarroz/Eyetracking-based-guided-attention-to-model-cycling-perception-of-safety](https://github.com/DinhoDarroz/Eyetracking-based-guided-attention-to-model-cycling-perception-of-safety)},
+  license = {MIT}
+}
+```
+
+### Dataset
+
+Cite the dataset when you use its images, pairwise comparisons, safety labels, gaze
+maps, or other released data. The dataset is published on
+[Zenodo](https://doi.org/10.5281/zenodo.20101496) under CC BY 4.0.
+
+```bibtex
+@dataset{perdigao2026egpcsdataset,
+  title     = {EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset},
+  author    = {Perdig{\~a}o, Lu{\'i}s Maria and Costa, Miguel and Santiago, Carlos and Marques, Manuel},
+  year      = {2026},
+  publisher = {Zenodo},
+  version   = {1.0.0},
+  doi       = {10.5281/zenodo.20101496},
+  url       = {[https://doi.org/10.5281/zenodo.20101496](https://doi.org/10.5281/zenodo.20101496)}
+}
+```
+
+### Paper
+
+Cite the paper when discussing the EG-PCS method, experiments, results, or scientific
+findings.
 
 ```bibtex
 @inproceedings{perdigao2026learning,
-  title     = {Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction},
+  title     = {Learning to See Like Humans: Gaze-Aligned Cycling Safety Prediction},
   author    = {Perdig{\~a}o, Lu{\'i}s Maria and Costa, Miguel and Santiago, Carlos and Marques, Manuel},
   booktitle = {Proceedings of the IEEE International Conference on Intelligent Transportation Systems (ITSC)},
-  year      = {2026},
-  abstract  = {Cycling delivers significant public-health and environmental benefits, yet its uptake in cities is often limited by perceived safety. When street environments appear unsafe, individuals are less likely to cycle, making perception a key barrier to adoption. Recent work has shown that pairwise comparisons of street-view images provide a scalable way to learn subjective safety judgments. However, existing approaches do not explicitly model human visual attention, which plays a central role in how humans perceive safety. We propose an Eye-Tracking-Guided Perceived Cycling Safety framework (EG-PCS) that integrates gaze data into a pairwise learning pipeline based on vision transformers. By supervising the model's attention mechanism with eye-tracking signals, we encourage alignment between learned attention maps and human fixation patterns. Experiments show that gaze-guided models achieve similar ranking performance compared to state-of-the-art approaches while producing attention maps that more accurately reflect human visual attention behavior. Our results demonstrate that incorporating eye-tracking information enhances both predictive accuracy and interpretability in perception-based urban analytics.}
+  year      = {2026}
 }
 ```
