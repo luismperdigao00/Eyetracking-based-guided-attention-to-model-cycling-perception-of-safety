@@ -2,8 +2,8 @@
 
 > Formal dataset card for **EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety
 > Dataset**. For practical loading instructions and archive navigation, start
-> with [`README.md`](README.md). For exact column definitions, use
-> [`data_dictionary.csv`](data_dictionary.csv).
+> with [`README.md`](README.md). For exact field definitions, use
+> [`DATA_DICTIONARY.md`](DATA_DICTIONARY.md).
 
 ## 📌 Dataset Summary
 
@@ -22,6 +22,7 @@ subset of trials collected with eye tracking.
 | Dataset type | Pairwise visual preference dataset with derived gaze maps |
 | Domain | Perceived cycling safety in street-level imagery |
 | Main table | `comparisons/comparisons.csv` |
+| Data dictionary | `DATA_DICTIONARY.md` and `data_dictionary.csv` |
 | License notice | `DATA_LICENSE.txt` |
 | Creators | Luis Maria Perdigao, Miguel Costa, Carlos Santiago, Manuel Marques |
 
@@ -57,7 +58,8 @@ represents one survey trial in which two images were compared side by side.
 A row includes the subset name, left and right image references, the pairwise
 label, anonymized survey/trial identifiers, a gaze-availability flag, and gaze-map
 paths when gaze maps are available. The full field specification is maintained in
-`data_dictionary.csv`.
+`DATA_DICTIONARY.md`; `data_dictionary.csv` is retained as a compact
+machine-readable mirror.
 
 ### Labels and annotations
 
@@ -88,6 +90,8 @@ recordings.
 | Gaze-annotated comparison rows | 1,360 |
 | Gaze-map files | 2,720 |
 | Subsets | 7 |
+| Extracted release size | 8.65 GiB |
+| Compressed archive size | 5.97 GiB |
 
 The release contains the subsets `barcelona`, `berlin`,
 `london_uk_collideoscope`, `london_uk_gov`, `munich`, `paris`, and `sequences`.
@@ -108,10 +112,16 @@ were used for training, evaluation, or both.
 
 ## 🏗️ Dataset Creation
 
-EG-PCS was created from a perceived-safety survey. Participants compared pairs of
-street-level cycling scenes and selected which scene appeared safer for cycling,
-or selected a tie when no clear difference was perceived. For a subset of survey
-trials, eye tracking was collected during the decision process.
+EG-PCS was created from a two-stage perceived-safety survey. Participants first
+completed a profile questionnaire covering cycling profile and sociodemographic
+context. They then completed pairwise safety-assessment trials showing two
+street-level cycling environments side by side.
+
+The survey involved 251 participants: 225 online participants and 26 laboratory
+eye-tracking participants. Each participant completed 65 pairwise trials. The
+online survey allowed a no-preference response, producing tie labels; the
+laboratory eye-tracking protocol used forced-choice left/right responses while
+gaze was recorded.
 
 The public release contains the pairwise labels, image references and files,
 anonymized survey/trial metadata, and derived gaze maps. The released gaze maps
@@ -162,11 +172,33 @@ When publishing results with EG-PCS, report:
 - evaluation metrics and confidence intervals when applicable;
 - limitations relevant to subjective perceived-safety labels.
 
-## 📚 Licensing and Attribution
+## 📝 Citation
+
+Please cite the dataset DOI when using the released data:
+
+```bibtex
+@dataset{perdigao2026egpcsdataset,
+  title     = {EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset},
+  author    = {Perdig{\~a}o, Lu{\'i}s Maria and Costa, Miguel and Santiago, Carlos and Marques, Manuel},
+  year      = {2026},
+  publisher = {Zenodo},
+  version   = {1.0.0},
+  doi       = {10.5281/zenodo.20101496},
+  url       = {https://doi.org/10.5281/zenodo.20101496}
+}
+```
+
+## 📜 Licensing and Attribution
 
 See `DATA_LICENSE.txt` for the dataset license notice and rights notes. Cite the
 dataset DOI when using the released data, and cite the EG-PCS paper when
 discussing the method, experiments, or scientific findings.
+
+## 📧 Contact
+
+- **GitHub:** [DinhoDarroz](https://github.com/DinhoDarroz)
+- **ORCID:** [0009-0007-5355-1702](https://orcid.org/0009-0007-5355-1702)
+- **Email:** Through GitHub profile
 
 ## 🔄 Maintenance
 
