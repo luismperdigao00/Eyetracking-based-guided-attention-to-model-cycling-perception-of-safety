@@ -14,12 +14,12 @@ tags: ["perceived cycling safety", "eye tracking", "gaze maps", "pairwise compar
 
 ## Eye-Tracking-Guided Perceived Cycling Safety from Street-Level Imagery
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20101496.svg)](https://doi.org/10.5281/zenodo.20101496)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20101496.svg)](https://doi.org/10.5281/zenodo.20101495)
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](DATA_LICENSE.txt)
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://doi.org/10.5281/zenodo.20101496)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://doi.org/10.5281/zenodo.20101495)
 [![Data Dictionary](https://img.shields.io/badge/docs-data%20dictionary-green.svg)](DATA_DICTIONARY.md)
 
-**Version 1.1.0** | **Prepared 2026-07-07** | **Zenodo DOI: [10.5281/zenodo.20101496](https://doi.org/10.5281/zenodo.20101496)**
+**Version 1.1.0** | **Prepared 2026-07-07** | **Zenodo DOI: [10.5281/zenodo.20101496](https://doi.org/10.5281/zenodo.20101495)**
 
 ---
 
@@ -235,7 +235,7 @@ See `eye_tracking_sources/README.md` for details.
 
 Download the dataset from Zenodo:
 
-**https://doi.org/10.5281/zenodo.20101496**
+**https://doi.org/10.5281/zenodo.20101495**
 
 Extract the archive. The examples below assume the extracted folder is named
 `EG-PCS-Dataset-v1.1.0`.
@@ -447,7 +447,7 @@ when discussing the method, experiments, or scientific findings.
   publisher = {Zenodo},
   version   = {1.1.0},
   doi       = {10.5281/zenodo.20101496},
-  url       = {https://doi.org/10.5281/zenodo.20101496}
+  url       = {https://doi.org/10.5281/zenodo.20101495}
 }
 ```
 

@@ -15,7 +15,7 @@ v1.1.0, sanitized source sessions for the laboratory eye-tracking subset.
 | Property | Value |
 | --- | --- |
 | Dataset title | EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset |
-| DOI | https://doi.org/10.5281/zenodo.20101496 |
+| DOI | https://doi.org/10.5281/zenodo.20101495 |
 | Version | 1.1.0 |
 | Prepared date | 2026-07-07 |
 | Dataset type | Pairwise visual preference dataset with gaze maps and eye-tracking source sessions |
@@ -204,7 +204,7 @@ When publishing results with EG-PCS, report:
   publisher = {Zenodo},
   version   = {1.1.0},
   doi       = {10.5281/zenodo.20101496},
-  url       = {https://doi.org/10.5281/zenodo.20101496}
+  url       = {https://doi.org/10.5281/zenodo.20101495}
 }
 ```
 
