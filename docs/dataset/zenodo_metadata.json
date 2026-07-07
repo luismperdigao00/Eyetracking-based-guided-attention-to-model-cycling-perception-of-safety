@@ -2,25 +2,29 @@
   "metadata": {
     "title": "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset",
     "upload_type": "dataset",
-    "description": "The EG-PCS dataset accompanies the accepted paper at the 2026 IEEE 29th International Conference on Intelligent Transportation Systems (ITSC). It contains pairwise perceived cycling safety comparisons, street-view image pairs, and fixation-based gaze maps derived from eye-tracking experiments. It supports research on perceived cycling safety prediction, gaze-guided computer vision, attention alignment, and human visual attention in urban imagery.",
+    "description": "The EG-PCS dataset accompanies research on perceived cycling safety from street-level imagery. It contains pairwise perceived cycling safety comparisons, released street-view image files, fixation-derived gaze maps, and sanitized eye-tracking source sessions used to document and regenerate the gaze-map layer. Version 1.1.0 adds curated eye-tracking source sessions, source-session manifest files, bridge columns from comparison rows to source sessions and trial screenshots, and a public script for building gaze maps from fixation tables using a 32-pixel Gaussian smoothing scale.",
     "creators": [
       {
-        "name": "Perdigao, Luis Maria"
+        "name": "Perdigão, Luís Maria",
+        "orcid": "0009-0007-5355-1702"
       },
       {
-        "name": "Costa, Miguel"
+        "name": "Costa, Miguel",
+        "orcid": "0000-0003-0860-7002"
       },
       {
-        "name": "Santiago, Carlos"
+        "name": "Santiago, Carlos",
+        "orcid": "0000-0002-4737-0020"
       },
       {
-        "name": "Marques, Manuel"
+        "name": "Marques, Manuel",
+        "orcid": "0000-0003-0532-1869"
       }
     ],
     "access_right": "open",
     "license": "cc-by-4.0",
-    "version": "1.0.0",
-    "publication_date": "2026-05-09",
+    "version": "1.1.0",
+    "publication_date": "2026-07-07",
     "keywords": [
       "perceived cycling safety",
       "eye tracking",
@@ -28,7 +32,8 @@
       "pairwise comparison",
       "street-view imagery",
       "computer vision",
-      "attention alignment"
+      "attention alignment",
+      "human visual attention"
     ],
     "related_identifiers": [
       {

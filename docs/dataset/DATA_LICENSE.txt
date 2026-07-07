@@ -1,6 +1,6 @@
 EG-PCS Dataset License Notice
 
-The Zenodo record for EG-PCS Dataset v1.0.0 declares the dataset license as
+The Zenodo record for EG-PCS Dataset v1.1.0 declares the dataset license as
 Creative Commons Attribution 4.0 International (CC BY 4.0).
 
 The release combines components with different origins and roles:
@@ -9,11 +9,19 @@ The release combines components with different origins and roles:
    documentation, and the data dictionary are provided for research use with
    attribution under the dataset license stated on Zenodo.
 
-2. Code in the companion repository is governed by the repository code license.
-   Convenience scripts included in the dataset release are provided to help load
-   and validate the archive; check the repository license when reusing code.
+2. Sanitized eye-tracking source-session files are provided to support
+   reproducibility and methodological transparency. Public OGAMA text exports
+   remove direct subject-name and demographic columns such as age, sex,
+   handedness, subject category, and comments. Raw gaze and fixation behavior can
+   still be sensitive behavioral data; users must not attempt participant
+   re-identification.
 
-3. Street-level images remain connected to the rights and terms of their
+3. Code in the companion repository is governed by the repository code license.
+   Convenience scripts included in the dataset release are provided to help load,
+   validate, and regenerate gaze maps from the archive; check the repository
+   license when reusing code.
+
+4. Street-level images remain connected to the rights and terms of their
    original providers. Users are responsible for respecting applicable image
    rights, provider terms, citation requirements, and redistribution conditions.
 
