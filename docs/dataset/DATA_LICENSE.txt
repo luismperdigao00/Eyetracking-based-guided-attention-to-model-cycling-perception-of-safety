@@ -1,13 +1,26 @@
 EG-PCS Dataset License Notice
 
-The EG-PCS dataset combines multiple components that may have different rights and licensing conditions:
+The Zenodo record for EG-PCS Dataset v1.0.0 declares the dataset license as
+Creative Commons Attribution 4.0 International (CC BY 4.0).
 
-1. Pairwise labels, anonymized metadata, and derived gaze maps are intended for research use with attribution.
+The release combines components with different origins and roles:
 
-2. Repository code is covered by the code license of this repository.
+1. Pairwise labels, anonymized survey/trial metadata, derived gaze maps, release
+   documentation, and the data dictionary are provided for research use with
+   attribution under the dataset license stated on Zenodo.
 
-3. Street-view images remain subject to the terms of their original providers. Users of the dataset are responsible for respecting the applicable image rights and redistribution conditions.
+2. Code in the companion repository is governed by the repository code license.
+   Convenience scripts included in the dataset release are provided to help load
+   and validate the archive; check the repository license when reusing code.
 
-When using the dataset, cite the EG-PCS paper and the dataset DOI:
+3. Street-level images remain connected to the rights and terms of their
+   original providers. Users are responsible for respecting applicable image
+   rights, provider terms, citation requirements, and redistribution conditions.
+
+When using the dataset, cite the EG-PCS paper when discussing the method or
+scientific findings, and cite the dataset DOI when using the released data:
 
 https://doi.org/10.5281/zenodo.20101496
+
+This notice is provided for documentation and does not replace legal review for
+uses beyond ordinary academic research and reproducibility.
