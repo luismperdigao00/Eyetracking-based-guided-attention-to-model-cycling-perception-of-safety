@@ -1,16 +1,18 @@
 field,type,required,description
-dataset,string,yes,"City/source subfolder under the released images/ directory."
-image_l,string,yes,"Left image filename for the pairwise comparison."
-image_r,string,yes,"Right image filename for the pairwise comparison."
-score,integer,yes,"Pairwise label: -1 means left preferred, 0 means tie, +1 means right preferred."
-score_classification,integer,no,"Classification label derived from score. With ties enabled, score_classification = score + 1."
-has_eyetracker,boolean,no,"True when valid gaze data are available for both sides of the comparison."
-has_eyetracker_source,boolean,no,"Original source eye-tracking flag before checking whether both released gaze-map files are present."
-survey_id,string,no,"Anonymized survey/session identifier."
-trial_id,string_or_integer,no,"Trial identifier within the survey/session."
-npy_file_l,string,no,"Left gaze map filename, usually relative to gaze_maps/864x508/."
-npy_file_r,string,no,"Right gaze map filename, usually relative to gaze_maps/864x508/."
-image_l_relpath,string,recommended,"Public relative path to the left image from the dataset root."
-image_r_relpath,string,recommended,"Public relative path to the right image from the dataset root."
-gaze_l_relpath,string,recommended,"Public relative path to the left gaze map from the dataset root, if available."
-gaze_r_relpath,string,recommended,"Public relative path to the right gaze map from the dataset root, if available."
+dataset,string,yes,City/source subset for the comparison; matches a subfolder under images/.
+image_l,string,yes,Filename of the left image shown in the pairwise comparison.
+image_r,string,yes,Filename of the right image shown in the pairwise comparison.
+score,integer,yes,"Pairwise label: -1 means left image perceived as safer, 0 means tie/no clear preference, +1 means right image perceived as safer."
+has_eyetracker,boolean,recommended,True when both released left and right gaze-map files are available for the row.
+survey_id,string,no,Anonymized survey/session identifier. For eye-tracking rows this matches a curated source-session folder.
+trial_id,integer_or_string,no,Trial identifier within the survey/session.
+npy_file_l,string,no,Left gaze-map filename retained for compatibility with earlier code. Prefer gaze_l_relpath for new analyses.
+npy_file_r,string,no,Right gaze-map filename retained for compatibility with earlier code. Prefer gaze_r_relpath for new analyses.
+score_classification,integer,no,"Class-index label derived from score: -1 -> 0, 0 -> 1, +1 -> 2."
+has_eyetracker_source,boolean,no,Original source eye-tracking flag before checking whether both released gaze-map files are present.
+image_l_relpath,string,recommended,Release-relative path to the left image from the dataset root.
+image_r_relpath,string,recommended,Release-relative path to the right image from the dataset root.
+gaze_l_relpath,string,recommended_when_gaze_exists,"Release-relative path to the left fixation-derived gaze map, if available."
+gaze_r_relpath,string,recommended_when_gaze_exists,"Release-relative path to the right fixation-derived gaze map, if available."
+eye_tracking_session_relpath,string,recommended_when_eye_tracking_source_exists,Release-relative path to the sanitized source session folder under eye_tracking_sources/sessions/.
+eye_tracking_trial_image_relpath,string,recommended_when_eye_tracking_source_exists,"Release-relative path to the trial screenshot used during the eye-tracking session, when the screenshot file is available."
