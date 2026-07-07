@@ -2,7 +2,7 @@
   "metadata": {
     "title": "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset",
     "upload_type": "dataset",
-    "description": "The EG-PCS dataset accompanies research on perceived cycling safety from street-level imagery. It contains pairwise perceived cycling safety comparisons, released street-view image files, fixation-derived gaze maps, and sanitized eye-tracking source sessions used to document and regenerate the gaze-map layer. Version 1.1.0 adds curated eye-tracking source sessions, source-session manifest files, bridge columns from comparison rows to source sessions and trial screenshots, and a public script for building gaze maps from fixation tables using a 32-pixel Gaussian smoothing scale.",
+    "description": "<p><strong>EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset</strong> is a research dataset for studying perceived cycling safety from street-level imagery and for developing models whose visual attention can be compared with human gaze. Each main data instance is a pairwise survey trial: two cycling scenes are shown side by side and the label records whether the left scene, the right scene, or neither scene was perceived as safer.</p><p><strong>Key contents.</strong></p><ul><li>13,623 pairwise perceived-safety comparison rows across Barcelona, Berlin, London, Munich, Paris, and image-sequence subsets.</li><li>9,790 released street-level image files referenced directly from the comparison table.</li><li>1,360 gaze-annotated comparison rows and 2,720 fixation-derived gaze-map arrays stored as NumPy files.</li><li>23 curated laboratory eye-tracking source sessions, with sanitized OGAMA exports, fixation and saccade tables when available, trial screenshots, session manifests, and bridge columns linking source sessions back to comparison rows.</li><li>Documentation, validation scripts, data dictionaries, checksum files, and loading utilities intended to make the release auditable and reusable.</li></ul><p><strong>Version 1.1.0 additions.</strong> This version extends the original release with the curated eye-tracking source layer used to document and regenerate the gaze-map component. It adds <code>eye_tracking_sources/</code>, source-session manifests, comparison-table columns linking rows to source sessions and trial screenshots, and <code>scripts/build_gaze_maps_from_fixations.py</code>, which rebuilds gaze maps from fixation tables using a Gaussian smoothing scale of sigma 32 screen pixels.</p><p><strong>Methodological context.</strong> EG-PCS was created from a perceived-safety survey in which participants completed profile questions and then evaluated pairs of street-level cycling environments. The survey included 251 participants: 225 online participants and 26 laboratory participants recorded with eye tracking. Each participant completed 65 pairwise trials. The eye-tracking subset was recorded with a Tobii eye tracker and processed through OGAMA; fixation-duration maps were smoothed and cropped to produce the released left/right gaze maps.</p><p><strong>Package contents.</strong> The Zenodo upload contains one compressed archive, <code>EG-PCS-Dataset-v1.1.0.tar.gz</code>, approximately 8.91 GB / 8.30 GiB compressed and 13.19 GB / 12.29 GiB after extraction. The extracted archive contains the comparison tables, image files, gaze maps, eye-tracking source sessions, documentation, validation scripts, loading examples, license notice, dataset card, and checksums.</p><p><strong>Intended research uses.</strong> The dataset supports pairwise perceived cycling safety prediction, tie-aware visual ranking or classification, gaze-guided learning, attention-gaze alignment, interpretability evaluation, and reproducibility studies from fixation events to derived gaze maps.</p><p><strong>Important limitations.</strong> Labels represent subjective perceived cycling safety, not objective crash risk. Gaze maps are derived attention summaries, not causal explanations. Coverage is uneven across cities and image sources, and the gaze/source layers are available only for the Berlin and sequences subsets. Researchers should report the dataset version, subsets used, treatment of tie labels, whether gaze maps or source sessions were used, and the train/validation/test splitting strategy.</p><p><strong>Associated paper.</strong> This dataset is released as a companion resource for the paper <em>Learning to See Like Humans: Gaze-Aligned Cycling Safety Prediction</em>, Proceedings of the IEEE International Conference on Intelligent Transportation Systems (ITSC), 2026. Cite the Zenodo dataset when using the files, and cite the paper when discussing the method, experiments, or scientific findings.</p>",
     "creators": [
       {
         "name": "Perdigão, Luís Maria",
@@ -33,7 +33,8 @@
       "street-view imagery",
       "computer vision",
       "attention alignment",
-      "human visual attention"
+      "human visual attention",
+      "intelligent transportation systems"
     ],
     "related_identifiers": [
       {
@@ -43,6 +44,10 @@
         "resource_type": "software"
       }
     ],
-    "prereserve_doi": true
+    "prereserve_doi": true,
+    "references": [
+      "Perdigão, Luís Maria; Costa, Miguel; Santiago, Carlos; Marques, Manuel (2026). Learning to See Like Humans: Gaze-Aligned Cycling Safety Prediction. Proceedings of the IEEE International Conference on Intelligent Transportation Systems (ITSC)."
+    ],
+    "method": "EG-PCS was created from a perceived cycling safety survey with 251 participants. Participants completed profile questions and then evaluated 65 side-by-side street-level cycling-scene comparisons. The online survey produced left/right/tie perceived-safety labels; the laboratory subset recorded eye tracking with a Tobii device and processed fixation events through OGAMA. Released gaze maps are duration-weighted fixation maps smoothed with a Gaussian kernel of sigma 32 screen pixels and cropped to the left/right image regions."
   }
 }
