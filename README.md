@@ -68,7 +68,7 @@ Dataset documentation is provided in [`docs/dataset`](docs/dataset/), including 
 
 ## 🖥️ Deployment Application
 
-We provide a standalone web interface to deploy EG-PCS-Net, allowing users to obtain perceived-safety scores and visual attention heatmaps from street-level images.
+We provide a standalone web interface for running EG-PCS-Net inference, allowing users to obtain perceived-safety scores and visual attention heatmaps from street-level images.
 
 <p align="center">
   <img src="docs/safety_score.png" width="90%" />
@@ -81,6 +81,8 @@ The application is intended to make model inference and visualization easier to 
 ---
 
 ## 🗂️ Repository Guide
+
+This root README gives a high-level overview of the project. Detailed usage instructions are split across the package, dataset, and application documentation.
 
 Use this guide to find the part of the repository that matches your goal.
 
@@ -95,11 +97,7 @@ Use this guide to find the part of the repository that matches your goal.
 
 The core package lives in [`src/egpcs/`](src/egpcs/). It contains the model architectures, data loading code, training loops, evaluation logic, checkpoint handling, and command-line tools.
 
-For installation, training commands, evaluation commands, model variants, gaze-alignment settings, and troubleshooting, see:
-
-```text
-src/egpcs/README.md
-```
+For installation, training commands, evaluation commands, model variants, gaze-alignment settings, and troubleshooting, see [`src/egpcs/README.md`](src/egpcs/README.md).
 
 ### 📊 Dataset documentation
 
@@ -122,6 +120,8 @@ The dataset documentation is intended for users who want to understand the EG-PC
 | View architecture and output examples | [`docs/`](docs/) |
 
 The deployment application provides an interface for applying EG-PCS-Net to street-level images and visualizing predicted safety scores and attention heatmaps.
+
+New users should start with the dataset documentation if they want to use the released data, or with [`src/egpcs/README.md`](src/egpcs/README.md) if they want to train or evaluate models.
 
 ---
 
