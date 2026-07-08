@@ -3,7 +3,7 @@
 title: "EG-PCS Dataset - Eye-Tracking Source Sessions"
 description: "Guide to the sanitized eye-tracking source-session layer released with EG-PCS Dataset v1.1.0."
 version: "1.1.0"
-doi: "10.5281/zenodo.20101496"
+doi: "10.5281/zenodo.20101495"
 status: "Prepared for Zenodo release"
 ---
 -->

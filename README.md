@@ -60,6 +60,7 @@ The dataset is available through Zenodo:
 
 ```text
 https://doi.org/10.5281/zenodo.20101495
+
 ```
 
 Dataset documentation is provided in [`docs/dataset`](docs/dataset/), including the dataset README, dataset card, data dictionary, eye-tracking source-session guide, license notice, and citation metadata.
@@ -138,8 +139,8 @@ Cite the dataset when you use its images, pairwise comparisons, perceived-safety
   year      = {2026},
   publisher = {Zenodo},
   version   = {1.1.0},
-  doi       = {10.5281/zenodo.20101496},
-  url       = {https://doi.org/10.5281/zenodo.20101496}
+  doi       = {10.5281/zenodo.20101495},
+  url       = {https://doi.org/10.5281/zenodo.20101495}
 }
 ```
 
