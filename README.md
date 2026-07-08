@@ -1,6 +1,6 @@
-# Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction
+# 🚲 Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction
 
-## Description
+## 📌 Description
 
 Cycling provides substantial benefits for public health, urban mobility, and environmental sustainability, but many people avoid cycling when certain urban environments feel unsafe. These perceived-safety judgments are strongly shaped by visual cues in the surrounding street scene, including both static infrastructure and dynamic traffic elements.
 
@@ -14,7 +14,21 @@ By producing transparent and perceptually grounded safety assessments, EG-PCS-Ne
 
 ---
 
-## Architecture
+## 🧩 Repository Contributions
+
+This repository brings together three connected parts of the EG-PCS project:
+
+| Component | Purpose |
+| --- | --- |
+| **EG-PCS-Net** | A gaze-aligned Siamese Vision Transformer framework for perceived cycling safety prediction. |
+| **EG-PCS Dataset** | A released dataset with pairwise street-view comparisons, perceived-safety labels, gaze maps, and sanitized eye-tracking source-session files. |
+| **Deployment application** | A standalone interface for producing perceived-safety scores and visual attention heatmaps from street-level images. |
+
+Together, these components support both **model development** and **interpretable urban perception analysis**.
+
+---
+
+## 🧠 Architecture
 
 <p align="center">
   <img src="docs/PCS-Net_arch.png" alt="EG-PCS architecture" width="900">
@@ -66,25 +80,71 @@ The application is intended to make model inference and visualization easier to 
 
 ---
 
-## Repository Guide
+## 🗂️ Repository Guide
 
-Use this repository depending on what you want to do:
+Use this guide to find the part of the repository that matches your goal.
 
-| Goal | Where to go |
+### 🔬 Model training and evaluation
+
+| Goal | Location |
 | --- | --- |
-| Train or evaluate EG-PCS-Net models | [`src/egpcs/`](src/egpcs/) and [`configs/`](configs/) |
-| Run model inference through the web interface | [`deployment_app/`](deployment_app/) |
-| Understand the dataset release | [`docs/dataset/`](docs/dataset/) |
-| Inspect project figures and documentation assets | [`docs/`](docs/) |
-| Configure experiments and hyperparameters | [`configs/`](configs/) |
+| Train EG-PCS-Net models | [`src/egpcs/`](src/egpcs/) |
+| Evaluate trained checkpoints | [`src/egpcs/`](src/egpcs/) |
+| Configure model and experiment settings | [`configs/`](configs/) |
+| Read the technical training/evaluation guide | [`src/egpcs/README.md`](src/egpcs/README.md) |
 
-Main folders:
+The core package lives in [`src/egpcs/`](src/egpcs/). It contains the model architectures, data loading code, training loops, evaluation logic, checkpoint handling, and command-line tools.
 
-- [`configs/`](configs/) — YAML configuration files for training, evaluation, and experiment settings.
-- [`deployment_app/`](deployment_app/) — standalone web application for inference and visual attention visualization.
-- [`docs/`](docs/) — project figures, architecture diagrams, screenshots, and dataset documentation.
-- [`docs/dataset/`](docs/dataset/) — dataset README, dataset card, data dictionary, license notice, and eye-tracking source-session guide.
-- [`src/egpcs/`](src/egpcs/) — core EG-PCS-Net source code, including data loading, model architectures, training loops, and evaluation logic.
+For installation, training commands, evaluation commands, model variants, gaze-alignment settings, and troubleshooting, see:
+
+```text
+src/egpcs/README.md
+```
+
+### 📊 Dataset documentation
+
+| Goal | Location |
+| --- | --- |
+| Understand the released dataset | [`docs/dataset/README.md`](docs/dataset/README.md) |
+| Read intended uses, limitations, and ethics | [`docs/dataset/dataset_card.md`](docs/dataset/dataset_card.md) |
+| Inspect column definitions | [`docs/dataset/DATA_DICTIONARY.md`](docs/dataset/DATA_DICTIONARY.md) |
+| Understand eye-tracking source sessions | [`docs/dataset/EYE_TRACKING_SOURCES.md`](docs/dataset/EYE_TRACKING_SOURCES.md) |
+| Read license and reuse notes | [`docs/dataset/DATA_LICENSE.txt`](docs/dataset/DATA_LICENSE.txt) |
+
+The dataset documentation is intended for users who want to understand the EG-PCS release, reuse the data, inspect gaze-map availability, or report experiments correctly.
+
+### 🖥️ Application and visualizations
+
+| Goal | Location |
+| --- | --- |
+| Run the inference application | [`deployment_app/`](deployment_app/) |
+| Inspect project images and figures | [`docs/`](docs/) |
+| View architecture and output examples | [`docs/`](docs/) |
+
+The deployment application provides an interface for applying EG-PCS-Net to street-level images and visualizing predicted safety scores and attention heatmaps.
+
+---
+
+## 📁 Main Folders
+
+| Folder | Description |
+| --- | --- |
+| [`configs/`](configs/) | YAML configuration files for training, evaluation, and experiment settings. |
+| [`deployment_app/`](deployment_app/) | Standalone web application for inference and visual attention visualization. |
+| [`docs/`](docs/) | Project figures, architecture diagrams, screenshots, and documentation assets. |
+| [`docs/dataset/`](docs/dataset/) | Dataset README, dataset card, data dictionary, license notice, and eye-tracking source-session guide. |
+| [`src/egpcs/`](src/egpcs/) | Core EG-PCS-Net package with data loading, model architectures, training, and evaluation code. |
+
+---
+
+## 🚀 Getting Started
+
+For most users, the recommended path is:
+
+1. Read this root README to understand the project.
+2. Read [`docs/dataset/README.md`](docs/dataset/README.md) if you want to use the dataset.
+3. Read [`src/egpcs/README.md`](src/egpcs/README.md) if you want to train or evaluate models.
+4. Use [`deployment_app/`](deployment_app/) if you want to run inference and visualize results.
 
 ---
 
@@ -134,3 +194,4 @@ Cite the paper when discussing the EG-PCS method, experiments, results, or scien
   booktitle = {Proceedings of the IEEE International Conference on Intelligent Transportation Systems},
   year      = {2026}
 }
+```
