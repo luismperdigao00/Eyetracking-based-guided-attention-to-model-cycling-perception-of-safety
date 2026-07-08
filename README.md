@@ -1,6 +1,6 @@
-# 🚲 Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction
+# Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction
 
-## 📌 Description
+## Description
 
 Cycling provides substantial benefits for public health, urban mobility, and environmental sustainability, but many people avoid cycling when certain urban environments feel unsafe. These perceived-safety judgments are strongly shaped by visual cues in the surrounding street scene, including both static infrastructure and dynamic traffic elements.
 
@@ -14,7 +14,7 @@ By producing transparent and perceptually grounded safety assessments, EG-PCS-Ne
 
 ---
 
-## 🧠 Architecture
+## Architecture
 
 <p align="center">
   <img src="docs/PCS-Net_arch.png" alt="EG-PCS architecture" width="900">
@@ -66,7 +66,7 @@ The application is intended to make model inference and visualization easier to 
 
 ---
 
-## 🗂️ Repository Guide
+## Repository Guide
 
 Use this repository depending on what you want to do:
 
