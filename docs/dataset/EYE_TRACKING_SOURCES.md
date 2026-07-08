@@ -1,15 +1,80 @@
-# 👁️ Eye-Tracking Source Sessions
+<!--
+---
+title: "EG-PCS Dataset - Eye-Tracking Source Sessions"
+description: "Guide to the sanitized eye-tracking source-session layer released with EG-PCS Dataset v1.1.0."
+version: "1.1.0"
+doi: "10.5281/zenodo.20101496"
+status: "Prepared for Zenodo release"
+---
+-->
 
-This document explains the `eye_tracking_sources/` folder introduced in
-EG-PCS Dataset v1.1.0. The folder exists so researchers can inspect the
-session-level material behind the released gaze maps and regenerate gaze maps
-with transparent preprocessing choices.
+# 👁️ EG-PCS Eye-Tracking Source Sessions
 
-## **What This Folder Contains**
+This document explains the `eye_tracking_sources/` layer released with **EG-PCS Dataset v1.1.0**.
+
+The purpose of this layer is to make the released gaze maps more transparent and reproducible. It lets researchers inspect the session-level material behind the fixation-derived gaze maps and, when needed, regenerate gaze maps with explicit preprocessing choices.
+
+For the main dataset overview, see `README.md`.  
+For table columns and path definitions, see `DATA_DICTIONARY.md`.  
+For responsible-use guidance, see `dataset_card.md`.
+
+---
+
+## 1. What this layer is for
+
+The released gaze maps in `gaze_maps/864x508/` are derived files. They are not raw eye-tracking recordings.
+
+The `eye_tracking_sources/` layer provides the source material used to document and regenerate those derived maps. It is intended for:
+
+- auditing how released gaze maps relate to source sessions;
+- inspecting fixation and saccade records;
+- checking which source files are available per session;
+- reproducing the fixation-to-map processing pipeline;
+- generating alternative gaze-map variants with different smoothing, normalization, or output resolution;
+- supporting methodological transparency in gaze-guided modelling experiments.
+
+This layer is **not required** for ordinary use of the dataset. If you only need released gaze maps for training or evaluation, use the paths in `comparisons/comparisons.csv` and the files in `gaze_maps/864x508/`.
+
+---
+
+## 2. Release summary
+
+Version 1.1.0 includes:
+
+| Item | Count |
+| --- | ---: |
+| Curated eye-tracking source sessions | 23 |
+| Main-table source rows | 1,495 |
+| Released gaze-map rows | 1,360 |
+| Released gaze-map files | 2,720 |
+
+The source rows are identified in the main comparison table using:
+
+```text
+has_eyetracker_source
+```
+
+Rows with complete released left/right gaze maps are identified using:
+
+```text
+has_eyetracker
+```
+
+Important distinction:
+
+- `has_eyetracker_source=True` means the row comes from the eye-tracking source layer.
+- `has_eyetracker=True` means both released left and right gaze-map files are available.
+
+A row can have `has_eyetracker_source=True` while not having a complete released gaze-map pair.
+
+---
+
+## 3. Folder structure
+
+The source layer is organized as follows:
 
 ```text
 eye_tracking_sources/
-├── README.md
 ├── sessions_manifest.csv
 └── sessions/
     └── <survey_id>/<timestamp>/
@@ -26,68 +91,94 @@ eye_tracking_sources/
         └── <trial>-<left>-<right>.png
 ```
 
-The release contains **23 curated source sessions** and
-**1,495 source trial rows**. These are the sessions referenced by the
-`has_eyetracker_source` flag in the main comparison table. Of those source rows,
-**1,360** have both left and right derived gaze maps in `gaze_maps/`.
+Each session folder corresponds to one curated laboratory eye-tracking session.
 
-## **Manifest**
+Some files are optional or unavailable for some sessions. Use `sessions_manifest.csv` to check availability before running source-level analyses.
 
-`sessions_manifest.csv` has one row per curated session. It reports whether each
-session includes raw Tobii JSON, OGAMA raw-sample exports, fixation tables,
-saccade tables, trial screenshots, and released derived gaze maps.
+---
 
-Important columns include:
+## 4. Session manifest
+
+The file:
+
+```text
+eye_tracking_sources/sessions_manifest.csv
+```
+
+contains one row per curated source session.
+
+It is the recommended entry point for auditing the source layer.
+
+### Key manifest columns
 
 | Column | Meaning |
 | --- | --- |
-| `session_index` | Human-readable index such as `et_session_001`. |
-| `survey_id` | Anonymized survey/session identifier used in `comparisons.csv`. |
-| `source_session_relpath` | Path to the session folder from the dataset root. |
+| `session_index` | Human-readable session index, such as `et_session_001`. |
+| `survey_id` | Anonymized survey/session identifier. |
+| `source_session_relpath` | Release-relative path to the source-session folder. |
 | `has_eye_tracker_json` | Whether the raw Tobii JSON sample stream is present. |
 | `has_ogama_raw_samples` | Whether `ogama_data.txt` is present. |
-| `has_stats_fixations` | Whether OGAMA fixation events are present. |
-| `has_stats_saccades` | Whether OGAMA saccade events are present. |
+| `has_stats_fixations` | Whether `stats_fixations.txt` is present. |
+| `has_stats_saccades` | Whether `stats_saccades.txt` is present. |
 | `trial_screenshot_files` | Number of full trial screenshots in the session folder. |
-| `main_table_source_rows` | Number of main-table rows linked to this source session. |
-| `released_gaze_rows` | Number of rows from this session with released left/right gaze maps. |
-| `missing_trial_screenshot_rows` | Source rows whose full trial screenshot file is not present. |
-| `public_text_tables_sanitized` | Whether direct subject demographic columns were removed from public text exports. |
+| `main_table_source_rows` | Number of main-table rows linked to the session. |
+| `released_gaze_rows` | Number of linked rows with complete released left/right gaze maps. |
+| `missing_trial_screenshot_rows` | Number of linked rows whose full trial screenshot is not present. |
+| `public_text_tables_sanitized` | Whether public text exports were sanitized to remove direct demographic fields. |
 
-## **Session Files**
+### Example: inspect manifest
 
-| File | Description |
+```python
+from pathlib import Path
+import pandas as pd
+
+root = Path("EG-PCS-Dataset-v1.1.0")
+
+manifest = pd.read_csv(root / "eye_tracking_sources" / "sessions_manifest.csv")
+
+print(manifest.head())
+print(manifest[["session_index", "main_table_source_rows", "released_gaze_rows"]])
+```
+
+---
+
+## 5. Session file reference
+
+Each source-session folder may contain the following files.
+
+| File | Purpose |
 | --- | --- |
 | `comparisons.csv` | Trial order and pairwise image identifiers used by the eye-tracking interface. |
-| `scores.csv` | Recorded forced-choice responses and timestamps. |
+| `scores.csv` | Forced-choice participant responses and response timestamps. |
 | `ui_params.json` | Screen-space coordinates of the left and right image regions. |
 | `eye_tracker_data.json` | Raw Tobii gaze sample stream, stored as JSON lines. |
-| `ogama_data.txt` | Sanitized OGAMA raw-sample export with trial timing, gaze position, pupil, mouse, and event columns. |
-| `stats_fixations.txt` | Sanitized OGAMA fixation table with trial IDs, fixation durations, positions, and AOI labels. |
-| `stats_saccades.txt` | Sanitized OGAMA saccade table with trial IDs, durations, distances, velocities, and target AOIs. |
-| `stats_standard.txt` | Sanitized OGAMA trial-level statistics when available. |
+| `ogama_data.txt` | Sanitized OGAMA raw-sample export. |
+| `stats_fixations.txt` | Sanitized OGAMA fixation table used to produce gaze maps. |
+| `stats_saccades.txt` | Sanitized OGAMA saccade table. |
+| `stats_standard.txt` | Sanitized OGAMA trial-level statistics, when available. |
 | `aoi.txt` | OGAMA area-of-interest table. |
 | `ogama_slides.ogs` | OGAMA slide metadata. |
 | `<trial>-*.png` | Full pairwise trial screenshot shown to the participant. |
 
-## **Sanitization Note**
+Not every session contains every file. Missing files are expected in some sessions and should be handled explicitly.
 
-The public copies of OGAMA text exports remove direct subject-name and demographic
-columns such as age, sex, handedness, subject category, and comments. The release
-keeps trial identifiers, gaze coordinates, fixation durations, saccade metrics,
-AOI labels, timestamps, and image-pair references because those fields are needed
-for reproducibility and gaze-map regeneration.
+---
 
-Researchers must not attempt participant re-identification.
+## 6. How source sessions connect to the main table
 
-## **How Source Rows Connect to `comparisons.csv`**
+The main table is:
 
-Version 1.1.0 adds two bridge columns to the main table:
+```text
+comparisons/comparisons.csv
+```
+
+Rows from the source layer can include these bridge fields:
 
 | Column | Meaning |
 | --- | --- |
-| `eye_tracking_session_relpath` | Path to the sanitized source session folder for eye-tracking source rows. |
-| `eye_tracking_trial_image_relpath` | Path to the full pairwise trial screenshot, when available. |
+| `has_eyetracker_source` | Indicates that the row belongs to the eye-tracking source layer. |
+| `eye_tracking_session_relpath` | Release-relative path to the source-session folder. |
+| `eye_tracking_trial_image_relpath` | Release-relative path to the full trial screenshot, when available. |
 
 Example:
 
@@ -96,22 +187,69 @@ from pathlib import Path
 import pandas as pd
 
 root = Path("EG-PCS-Dataset-v1.1.0")
+
 df = pd.read_csv(root / "comparisons" / "comparisons.csv")
-row = df[df["has_eyetracker_source"].fillna(False).astype(bool)].iloc[0]
+
+source_rows = df[df["has_eyetracker_source"].fillna(False).astype(bool)].copy()
+
+row = source_rows.iloc[0]
 
 session_dir = root / row["eye_tracking_session_relpath"]
-trial_screen = root / row["eye_tracking_trial_image_relpath"]
+
 print(session_dir)
-print(trial_screen)
+
+trial_image_relpath = row.get("eye_tracking_trial_image_relpath")
+
+if isinstance(trial_image_relpath, str) and trial_image_relpath:
+    trial_screen = root / trial_image_relpath
+    print(trial_screen)
 ```
 
-## **Regenerating Gaze Maps**
+Use `eye_tracking_trial_image_relpath` only when it is non-empty. Some source rows may not have a released full-trial screenshot.
 
-The public processing script reads `stats_fixations.txt`, `comparisons.csv`,
-`ui_params.json`, and the trial screenshots. It then creates left/right gaze maps
-by accumulating fixation duration in screen coordinates, applying Gaussian
-smoothing, cropping each image ROI, and resizing to the requested output
-resolution.
+---
+
+## 7. Relationship to released gaze maps
+
+Released gaze maps are stored separately under:
+
+```text
+gaze_maps/864x508/
+```
+
+A row with released gaze maps has:
+
+```text
+has_eyetracker=True
+gaze_l_relpath
+gaze_r_relpath
+```
+
+The gaze maps were generated from fixation records by:
+
+1. reading fixation events;
+2. assigning fixation duration to screen-space coordinates;
+3. using `ui_params.json` to identify left and right image regions;
+4. cropping fixations to each image region;
+5. smoothing fixation maps with a Gaussian kernel;
+6. resizing or saving the final left/right maps at the released resolution.
+
+The released reference maps use:
+
+| Parameter | Value |
+| --- | --- |
+| Output resolution | `864x508` |
+| Array shape | `(508, 864)` |
+| Blur sigma | `32` screen pixels |
+| Normalization | Not sum-normalized by default |
+
+Use the released `gaze_maps/864x508/` files when reproducing EG-PCS results. Generate alternative maps only when your analysis requires a different preprocessing configuration.
+
+---
+
+## 8. Regenerating gaze maps
+
+The dataset release includes a script for regenerating gaze maps from source fixation tables:
 
 ```bash
 python scripts/build_gaze_maps_from_fixations.py \
@@ -121,12 +259,176 @@ python scripts/build_gaze_maps_from_fixations.py \
   --map-res 864x508
 ```
 
-The default `--blur-sigma 32` approximates **1 degree of visual angle** under the
-assumed 50 cm viewing distance, 24-inch display, and 1920 x 1200 resolution
-described in the EG-PCS methodology. The released maps are **not normalized by
-default**; use `--normalize` only when your analysis requires each map to sum to
-1.
+The script uses source-session files such as:
 
-Changing the smoothing sigma, output resolution, normalization, interpolation,
-or fixation filtering creates a new gaze-map variant. Use the released
-`gaze_maps/864x508/` files as the reference layer when reproducing EG-PCS results.
+```text
+stats_fixations.txt
+comparisons.csv
+ui_params.json
+<trial>-*.png
+```
+
+The default `--blur-sigma 32` approximates 1 degree of visual angle under the display assumptions used in the EG-PCS methodology.
+
+The released maps are not normalized by default. To generate probability-style maps, use:
+
+```bash
+python scripts/build_gaze_maps_from_fixations.py \
+  --dataset-root . \
+  --out-dir regenerated_gaze_maps_normalized \
+  --blur-sigma 32 \
+  --map-res 864x508 \
+  --normalize
+```
+
+Changing the smoothing sigma, output resolution, normalization, interpolation, or fixation filtering creates a new gaze-map variant. Report these choices whenever using regenerated maps.
+
+---
+
+## 9. Sanitization and privacy
+
+Public OGAMA text exports were sanitized before release.
+
+Removed fields include direct subject-name and demographic columns such as:
+
+- age;
+- sex;
+- handedness;
+- subject category;
+- free-text comments;
+- direct OGAMA subject-name fields.
+
+The release keeps technical fields needed for reproducibility, including:
+
+- trial identifiers;
+- gaze coordinates;
+- fixation durations;
+- saccade metrics;
+- AOI labels;
+- timestamps;
+- image-pair references.
+
+Even after sanitization, gaze and fixation behavior can be sensitive behavioral data.
+
+Users must not attempt participant re-identification and must not combine EG-PCS source-session files with external information for that purpose.
+
+---
+
+## 10. Recommended use
+
+Use this source layer when you need to:
+
+- audit the path from fixation tables to released gaze maps;
+- inspect session-level completeness;
+- regenerate gaze maps;
+- compare preprocessing variants;
+- document gaze-map construction in a paper or thesis;
+- validate that a row, trial screenshot, and source session are connected correctly.
+
+Do not use this source layer to:
+
+- identify participants;
+- infer protected attributes;
+- treat gaze maps as complete explanations of decision-making;
+- make high-stakes decisions about individuals;
+- claim that visual attention alone explains perceived safety.
+
+---
+
+## 11. Common checks
+
+### Check source-session availability
+
+```python
+manifest = pd.read_csv(root / "eye_tracking_sources" / "sessions_manifest.csv")
+
+print(manifest["has_stats_fixations"].value_counts(dropna=False))
+print(manifest["has_stats_saccades"].value_counts(dropna=False))
+```
+
+### Count source rows in the main table
+
+```python
+source_rows = df[df["has_eyetracker_source"].fillna(False).astype(bool)]
+print(len(source_rows))
+```
+
+### Count released gaze rows
+
+```python
+gaze_rows = df[df["has_eyetracker"].fillna(False).astype(bool)]
+print(len(gaze_rows))
+```
+
+### Check source rows without released gaze maps
+
+```python
+source_without_released_gaze = source_rows[
+    ~source_rows["has_eyetracker"].fillna(False).astype(bool)
+]
+
+print(len(source_without_released_gaze))
+```
+
+### Check missing trial screenshots
+
+```python
+missing_trial_screens = source_rows[
+    source_rows["eye_tracking_trial_image_relpath"].isna()
+    | (source_rows["eye_tracking_trial_image_relpath"] == "")
+]
+
+print(len(missing_trial_screens))
+```
+
+---
+
+## 12. Reporting guidance
+
+When using the source layer, report:
+
+- dataset version;
+- dataset DOI;
+- whether released gaze maps or regenerated gaze maps were used;
+- gaze-map resolution;
+- blur sigma;
+- whether maps were normalized;
+- fixation filtering choices, if any;
+- whether source sessions with missing files were excluded;
+- number of source rows used;
+- number of released or regenerated gaze-map pairs used.
+
+If you regenerate gaze maps, describe how your generated maps differ from the released reference maps.
+
+---
+
+## 13. Known limitations
+
+The source layer improves transparency, but it is not complete in every respect.
+
+Known limitations include:
+
+- not every source session contains every OGAMA export;
+- some sessions may lack fixation or saccade tables;
+- some source rows may not have full trial screenshots;
+- not every source row has a complete released left/right gaze-map pair;
+- source files preserve technical gaze behavior that may still be sensitive;
+- regenerated gaze maps can differ from the released maps if preprocessing parameters are changed.
+
+Use `sessions_manifest.csv` before source-level analysis and document any exclusions.
+
+---
+
+## 14. Versioning
+
+This document describes the eye-tracking source layer for **EG-PCS Dataset v1.1.0**.
+
+Future releases should update this file whenever there are changes to:
+
+- source-session availability;
+- manifest columns;
+- source file formats;
+- sanitization rules;
+- gaze-map regeneration scripts;
+- released gaze-map parameters;
+- dataset version or DOI.
