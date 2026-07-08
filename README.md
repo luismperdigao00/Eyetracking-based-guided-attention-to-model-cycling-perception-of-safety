@@ -88,31 +88,6 @@ Main folders:
 
 ---
 
-## ⚙️ Installation
-
-Create and activate a Python environment, then install the project from the repository root:
-
-```bash
-python -m pip install -e .
-```
-
-The `-e` flag installs the package in **editable mode**. This means Python can import the local `src/egpcs/` package without copying it into your environment. Any changes you make to the source code are immediately reflected when you run the command-line tools again.
-
-After installation, the training and evaluation commands become available as terminal commands:
-
-```bash
-egpcs-train --help
-egpcs-evaluate --help
-```
-
-You can also run the same entry points as Python modules:
-
-```bash
-python -m egpcs.cli.train --help
-python -m egpcs.cli.evaluate --help
-```
----
-
 ## 📚 How to Cite
 
 Please cite the resources you actually use. If your work uses more than one resource, cite each applicable entry.
