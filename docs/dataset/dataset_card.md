@@ -1,200 +1,214 @@
 # EG-PCS Dataset Card
 
-> Formal dataset card for **EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety
-> Dataset** v1.1.0. For practical loading instructions and archive navigation,
-> start with `README.md`. For exact field definitions, use `DATA_DICTIONARY.md`.
+> Dataset card for **EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset** v1.1.0.
 
-## 📌 Dataset Summary
+This card summarizes the dataset's purpose, composition, intended uses, limitations, ethics, licensing, and recommended reporting practices. For loading instructions, file paths, validation commands, and release navigation, see `README.md`. For exact column definitions, see `DATA_DICTIONARY.md`.
 
-EG-PCS is a pairwise perceived cycling safety dataset built from street-level
-imagery. Each data instance compares a left and right cycling scene and records
-which scene was perceived as safer, or whether the two scenes were perceived as
-similarly safe. The release also includes fixation-derived gaze maps and, in
-v1.1.0, sanitized source sessions for the laboratory eye-tracking subset.
+---
 
-| Property | Value |
+## 1. Dataset overview
+
+| Field | Value |
 | --- | --- |
-| Dataset title | EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset |
-| DOI | https://doi.org/10.5281/zenodo.20101495 |
+| Dataset name | EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset |
 | Version | 1.1.0 |
-| Prepared date | 2026-07-07 |
-| Dataset type | Pairwise visual preference dataset with gaze maps and eye-tracking source sessions |
-| Domain | Perceived cycling safety in street-level imagery |
+| DOI | 10.5281/zenodo.20101496 |
+| Domain | Perceived cycling safety from street-level imagery |
+| Dataset type | Pairwise visual preference dataset with gaze maps and sanitized eye-tracking source sessions |
 | Main table | `comparisons/comparisons.csv` |
-| Source-session manifest | `eye_tracking_sources/sessions_manifest.csv` |
-| Data dictionary | `DATA_DICTIONARY.md` and `data_dictionary.csv` |
-| License notice | `DATA_LICENSE.txt` |
+| License | Creative Commons Attribution 4.0 International, with component-specific notes in `DATA_LICENSE.txt` |
 | Creators | Luís Maria Perdigão, Miguel Costa, Carlos Santiago, Manuel Marques |
 
-## 🎯 Supported Tasks
+EG-PCS is a research dataset for studying how people perceive cycling safety from street-level imagery. Each main data instance is a pairwise comparison: a participant saw two cycling scenes and selected which one felt safer to cycle in.
 
-### Primary research uses
+The dataset also includes fixation-derived gaze maps for a laboratory eye-tracking subset. These maps support research on gaze-guided learning, attention alignment, and interpretability.
 
-- Pairwise perceived cycling safety prediction.
-- Tie-aware visual ranking or classification.
-- Gaze-guided model training.
-- Attention-gaze alignment and interpretability evaluation.
-- Reproducibility studies from fixation events to derived gaze maps.
-- Parameter sensitivity studies for gaze-map smoothing, normalization, and resolution.
-- Urban perception research using street-level imagery.
+---
 
-### Out-of-scope uses
+## 2. Intended purpose
 
-- Treating labels as direct measurements of objective crash risk.
-- Making high-stakes decisions about individual people.
-- Using the dataset as the sole basis for infrastructure policy, enforcement, or investment decisions.
-- Ranking cities, neighborhoods, or communities without additional sampling, local context, and validation.
-- Treating gaze maps as complete causal explanations of perceived safety.
-- Attempting to identify survey participants from raw gaze traces, timestamps, metadata, or derived gaze maps.
+EG-PCS was created to support research on subjective perceived cycling safety and human visual attention during safety judgments.
 
-## 🧱 Dataset Structure
+The dataset is intended for:
 
-### Data instances
+- pairwise perceived cycling safety prediction;
+- tie-aware visual ranking or classification;
+- gaze-guided computer vision models;
+- comparison between human gaze and model attention;
+- saliency, interpretability, and attention-alignment studies;
+- cross-city or cross-source generalization experiments;
+- reproducibility studies linking fixation records to derived gaze maps;
+- urban perception research using street-level imagery.
 
-The main data instance is one row in `comparisons/comparisons.csv`. A row
-represents one survey trial in which two images were compared side by side.
+The dataset should be understood as a record of **perceived safety judgments**, not as a direct measurement of objective traffic safety.
 
-A row includes the subset name, left and right image references, the pairwise
-label, anonymized survey/trial identifiers, gaze-availability flags, gaze-map
-paths when gaze maps are available, and source-session paths when the row comes
-from the eye-tracking acquisition layer. The full field specification is
-maintained in `DATA_DICTIONARY.md`; `data_dictionary.csv` is retained as a compact
-machine-readable mirror.
+---
 
-### Labels and annotations
+## 3. Out-of-scope uses
 
-EG-PCS has three main annotation/provenance layers:
+EG-PCS should not be used as the sole basis for:
 
-1. **Pairwise perceived-safety labels** in the `score` column.
-2. **Fixation-derived gaze maps** for the released gaze subset.
-3. **Sanitized eye-tracking source sessions** for provenance and regeneration.
+- estimating objective crash risk;
+- making infrastructure investment decisions;
+- making enforcement or regulatory decisions;
+- ranking cities, neighborhoods, communities, or demographic groups;
+- making high-stakes decisions about individual people;
+- claiming that gaze maps fully explain why a participant made a safety judgment;
+- identifying or attempting to re-identify survey or eye-tracking participants.
 
-The `score` label is defined relative to the images in the same row:
+Any real-world planning or policy use should combine EG-PCS with local expertise, infrastructure audits, crash data, exposure data, and community context.
+
+---
+
+## 4. Data composition
+
+EG-PCS contains four connected layers:
+
+1. **Pairwise comparison labels**  
+   Each row in `comparisons/comparisons.csv` records a left image, a right image, and the participant's perceived-safety choice.
+
+2. **Street-level images**  
+   Images represent cycling-relevant street scenes from multiple city/source subsets.
+
+3. **Fixation-derived gaze maps**  
+   For the eye-tracking subset, gaze maps indicate where participants looked while making forced-choice safety decisions.
+
+4. **Sanitized eye-tracking source sessions**  
+   Version 1.1.0 includes sanitized source-session material used to audit or regenerate gaze maps.
+
+Key counts for v1.1.0:
+
+| Component | Count |
+| --- | ---: |
+| Pairwise comparison rows | 13,623 |
+| Released street-level images | 9,790 |
+| Released gaze-annotated comparison rows | 1,360 |
+| Released gaze-map files | 2,720 |
+| Eye-tracking source rows | 1,495 |
+| Curated eye-tracking source sessions | 23 |
+| Survey participants | 251 |
+| Laboratory eye-tracking participants | 26 |
+
+---
+
+## 5. Label semantics
+
+The main label is `score`.
 
 | `score` | Meaning |
 | ---: | --- |
-| `-1` | left image perceived as safer |
-| `0` | both images perceived as similarly safe |
-| `+1` | right image perceived as safer |
+| `-1` | Left image perceived as safer |
+| `0` | Tie / no clear preference |
+| `+1` | Right image perceived as safer |
 
-Gaze maps are stored as NumPy `.npy` arrays under `gaze_maps/864x508/`. Each
-released gaze-annotated row has one gaze map for the left image and one for the
-right image. These maps are derived attention distributions, not raw gaze streams.
+The label is **relative to the image pair**. A score does not assign an absolute safety value to either image. It only records how the two images were judged when shown together.
 
-The source sessions under `eye_tracking_sources/` contain raw and intermediate
-eye-tracking records. Public OGAMA text exports have been sanitized to remove
-direct subject-name and demographic columns while preserving gaze coordinates,
-fixation/saccade timing, AOI labels, and trial/image references.
+Rows with released gaze maps come from the laboratory eye-tracking protocol, where participants made forced-choice left/right decisions.
 
-### Size and coverage
+---
 
-| Component | Count / size |
-| --- | ---: |
-| Pairwise comparison rows | 13,623 |
-| Street-level image files | 9,790 |
-| Released gaze-annotated comparison rows | 1,360 |
-| Gaze-map files | 2,720 |
-| Eye-tracking source rows | 1,495 |
-| Curated eye-tracking source sessions | 23 |
-| Source sessions with fixation tables | 21 |
-| Source sessions with saccade tables | 22 |
-| Trial screenshots in source bundle | 1,492 |
-| Extracted release size | 13.19 GB / 12.29 GiB |
-| Eye-tracking source bundle size | 3.90 GB / 3.63 GiB |
+## 6. Collection process
 
-The release contains the subsets `barcelona`, `berlin`,
-`london_uk_collideoscope`, `london_uk_gov`, `munich`, `paris`, and `sequences`.
-Gaze annotations and eye-tracking source rows are available only for `berlin` and
-`sequences`.
+The dataset was built from a perceived cycling safety survey.
 
-## 🧪 Data Splits and Evaluation Notes
+Participants first completed a profile questionnaire and then evaluated pairs of street-level cycling scenes. Online participants could select the left image, the right image, or no clear preference. Laboratory participants completed a forced-choice version of the task while gaze was recorded with a Tobii eye tracker.
 
-The released dataset does not impose a single official train/validation/test
-split. Researchers should define splits appropriate to their question and report
-the splitting strategy.
+For the eye-tracking subset, gaze recordings were processed into fixation events and then converted into dense fixation-derived gaze maps. Version 1.1.0 releases both the derived gaze maps and sanitized source-session files for transparency and reproducibility.
 
-Because the dataset is pairwise, the same image can appear in multiple
-comparisons. For model-generalization experiments, consider image-aware splitting
-when possible so that the same image does not appear in both training and test
-pairs. Report whether ties were kept, removed, or remapped, and whether gaze rows
-or eye-tracking source files were used for training, evaluation, preprocessing,
-or analysis.
+---
 
-## 🏗️ Dataset Creation
+## 7. Privacy and ethics
 
-EG-PCS was created from a two-stage perceived-safety survey. Participants first
-completed a profile questionnaire covering cycling profile and sociodemographic
-context. They then completed pairwise safety-assessment trials showing two
-street-level cycling environments side by side.
+The underlying survey was approved by the Instituto Superior Técnico Ethics Committee.
 
-The survey involved 251 participants: 225 online participants and 26 laboratory
-eye-tracking participants. Each participant completed 65 pairwise trials. The
-online survey allowed a no-preference response, producing tie labels; the
-laboratory eye-tracking protocol used forced-choice left/right responses while
-gaze was recorded.
+The public release uses anonymized survey and session identifiers. Public OGAMA text exports were sanitized to remove direct subject-name and demographic columns such as age, sex, handedness, subject category, and comments.
 
-For the eye-tracking subset, gaze was recorded with a Tobii eye tracker after
-calibration and exported to OGAMA. OGAMA fixation records were used to build the
-released gaze maps. Each fixation contributes its duration at the fixation
-location; the sparse duration map is smoothed with a Gaussian kernel of sigma 32
-screen pixels, cropped to the left/right image regions, and saved as a dense
-array.
+Raw gaze and fixation behavior can still be sensitive behavioral data. Users must not attempt participant re-identification and must not combine EG-PCS with external data for that purpose.
 
-## 🔒 Privacy and Ethics
+Publications using EG-PCS should state that:
 
-The underlying survey was approved by Instituto Superior Técnico Ethics
-Committee. The public release uses anonymized survey/session identifiers. Version
-1.1.0 adds sanitized eye-tracking source sessions; public OGAMA text exports
-remove direct subject-name and demographic columns such as age, sex, handedness,
-subject category, and comments.
+- labels are subjective perceived-safety judgments;
+- gaze maps reflect recorded visual attention during the task;
+- gaze maps are not complete causal explanations of participant decisions.
 
-Raw gaze and fixation behavior can still be sensitive behavioral data. Researchers
-must not attempt participant re-identification and must avoid combining EG-PCS
-with external information for that purpose. Publications using EG-PCS should state
-that labels are subjective perceived-safety judgments collected in a survey
-context.
+---
 
-## ⚖️ Limitations
+## 8. Limitations
 
-The labels reflect perceived cycling safety, not measured crash risk. Judgments
-may be influenced by participant background, cycling experience, familiarity with
-urban environments, the visual contrast between paired images, image source,
-weather, lighting, camera position, and local infrastructure norms.
+EG-PCS has several important limitations:
 
-Coverage is not uniform across cities or sources. Berlin contributes the largest
-number of comparisons, and gaze annotations are concentrated in the Berlin and
-sequences subsets. Models trained on EG-PCS may not transfer directly to unseen
-cities, countries, image providers, infrastructure types, or cultural contexts
-without additional validation.
+- The labels measure perceived cycling safety, not measured crash risk.
+- Judgments may depend on participant background, cycling experience, local familiarity, image source, camera viewpoint, lighting, weather, road context, and the visual contrast between paired images.
+- Coverage is not uniform across cities or source subsets.
+- Berlin contributes the largest number of comparison rows.
+- Gaze annotations are available only for the `berlin` and `sequences` subsets.
+- The eye-tracking source layer is not uniformly complete across all sessions.
+- Some eye-tracking source rows do not have a complete released left/right gaze-map pair.
+- Street-level images may contain visual cues unrelated to cycling safety.
+- Models trained on EG-PCS may learn dataset-specific or source-specific correlations unless evaluation protocols are designed to test generalization.
 
-The source-session layer is valuable for transparency, but it is not uniformly
-complete: 21 of 23 curated sessions include
-`stats_fixations.txt`, 22 include `stats_saccades.txt`, and
-5 source rows do not have a matching trial screenshot
-file. Use `eye_tracking_sources/sessions_manifest.csv` to audit availability
-before running source-level analyses.
+Researchers should consider these limitations when designing experiments and interpreting results.
 
-Street-level images may contain incidental cues unrelated to cycling safety.
-Models can learn correlations with image composition, image source, lighting, or
-urban style unless evaluation protocols are designed to check for these effects.
+---
 
-## ✅ Recommended Reporting Checklist
+## 9. Bias and representativeness
+
+EG-PCS reflects the participants, image sources, survey design, and geographic coverage used during collection. It should not be assumed to represent all cyclists, all cities, all infrastructure types, or all cultural contexts.
+
+Perceived safety can vary across individuals and communities. A model trained on this dataset may reproduce or amplify patterns present in the survey responses or image distribution.
+
+Researchers are encouraged to evaluate performance across subsets and to avoid making broad claims about cities, populations, or infrastructure quality without additional validation.
+
+---
+
+## 10. Recommended evaluation practice
+
+The dataset does not define a single official train/validation/test split.
+
+Because the same image can appear in multiple pairwise comparisons, researchers should consider image-aware splitting when measuring generalization. This helps avoid leakage where the same image appears in both training and test pairs.
+
+When reporting experiments, specify:
+
+- the subsets used;
+- the number of comparison rows used;
+- whether ties were kept, removed, or remapped;
+- whether gaze maps were used;
+- whether eye-tracking source files were used;
+- the train/validation/test split strategy;
+- whether image-level leakage was controlled;
+- the evaluation metrics used;
+- uncertainty estimates or confidence intervals when applicable.
+
+---
+
+## 11. Responsible reporting checklist
 
 When publishing results with EG-PCS, report:
 
-- dataset DOI and version;
+- dataset name;
+- dataset version;
+- dataset DOI;
 - subsets used;
-- number of comparison rows used;
-- whether ties were kept, removed, or remapped;
-- whether released gaze maps were used and for what purpose;
-- whether eye-tracking source files were used or regenerated;
-- gaze-map preprocessing parameters, including smoothing sigma, resolution, normalization, and fixation filtering;
-- train/validation/test split strategy;
-- whether image-level leakage was controlled;
-- evaluation metrics and confidence intervals when applicable;
-- limitations relevant to subjective perceived-safety labels and eye-tracking source availability.
+- number of rows used;
+- label mapping;
+- treatment of tie labels;
+- whether gaze maps were used;
+- whether source eye-tracking files were used;
+- gaze-map preprocessing choices, if modified;
+- split strategy;
+- leakage-control strategy;
+- evaluation metrics;
+- main limitations relevant to the study.
 
-## 📝 Citation
+---
+
+## 12. Licensing and attribution
+
+The Zenodo record declares the dataset license as Creative Commons Attribution 4.0 International.
+
+See `DATA_LICENSE.txt` for component-specific notes. Street-level images remain connected to the rights and terms of their original providers. Users are responsible for respecting applicable image rights, provider terms, citation requirements, and redistribution conditions.
+
+When using the released data, cite the dataset.
 
 ```bibtex
 @dataset{perdigao2026egpcsdataset,
@@ -204,33 +218,36 @@ When publishing results with EG-PCS, report:
   publisher = {Zenodo},
   version   = {1.1.0},
   doi       = {10.5281/zenodo.20101496},
-  url       = {https://doi.org/10.5281/zenodo.20101495}
+  url       = {https://doi.org/10.5281/zenodo.20101496}
 }
 ```
 
-## 👥 Creators
+Cite the companion paper when discussing the EG-PCS method, experiments, results, or scientific findings.
 
-| Creator | ORCID |
-| --- | --- |
-| Luís Maria Perdigão | [0009-0007-5355-1702](https://orcid.org/0009-0007-5355-1702) |
-| Miguel Costa | [0000-0003-0860-7002](https://orcid.org/0000-0003-0860-7002) |
-| Carlos Santiago | [0000-0002-4737-0020](https://orcid.org/0000-0002-4737-0020) |
-| Manuel Marques | [0000-0003-0532-1869](https://orcid.org/0000-0003-0532-1869) |
+```bibtex
+@inproceedings{perdigao2026learning,
+  title     = {Learning to See Like Humans: Gaze-Aligned Cycling Safety Prediction},
+  author    = {Perdig{\~a}o, Lu{\'i}s Maria and Costa, Miguel and Santiago, Carlos and Marques, Manuel},
+  booktitle = {Proceedings of the IEEE International Conference on Intelligent Transportation Systems},
+  year      = {2026}
+}
+```
 
-## 📜 Licensing and Attribution
+---
 
-See `DATA_LICENSE.txt` for the dataset license notice and rights notes. Cite the
-dataset DOI when using the released data, and cite the EG-PCS paper when
-discussing the method, experiments, or scientific findings.
+## 13. Maintenance
 
-## 📧 Contact
+This dataset card describes EG-PCS Dataset v1.1.0.
 
-- **GitHub:** [DinhoDarroz](https://github.com/DinhoDarroz)
-- **ORCID:** [0009-0007-5355-1702](https://orcid.org/0009-0007-5355-1702)
-- **Email:** Through GitHub profile
+Future releases should update this card when there are changes to:
 
-## 🔄 Maintenance
-
-This card describes version 1.1.0. Future releases should update counts,
-coverage, checksums, metadata, license notes, and this card whenever files,
-labels, gaze maps, source sessions, or documentation change.
+- dataset version;
+- DOI;
+- file availability;
+- label semantics;
+- gaze-map generation;
+- source-session availability;
+- licensing;
+- privacy notes;
+- limitations;
+- recommended reporting practices.
