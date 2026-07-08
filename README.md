@@ -59,7 +59,7 @@ The dataset includes:
 The dataset is available through Zenodo:
 
 ```text
-https://doi.org/10.5281/zenodo.20101496
+https://doi.org/10.5281/zenodo.20101495
 ```
 
 Dataset documentation is provided in [`docs/dataset`](docs/dataset/), including the dataset README, dataset card, data dictionary, eye-tracking source-session guide, license notice, and citation metadata.
