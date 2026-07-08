@@ -419,18 +419,3 @@ Known limitations include:
 
 Use `sessions_manifest.csv` before source-level analysis and document any exclusions.
 
----
-
-## 14. Versioning
-
-This document describes the eye-tracking source layer for **EG-PCS Dataset v1.1.0**.
-
-Future releases should update this file whenever there are changes to:
-
-- source-session availability;
-- manifest columns;
-- source file formats;
-- sanitization rules;
-- gaze-map regeneration scripts;
-- released gaze-map parameters;
-- dataset version or DOI.

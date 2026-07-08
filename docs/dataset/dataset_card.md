@@ -232,22 +232,3 @@ Cite the companion paper when discussing the EG-PCS method, experiments, results
   year      = {2026}
 }
 ```
-
----
-
-## 13. Maintenance
-
-This dataset card describes EG-PCS Dataset v1.1.0.
-
-Future releases should update this card when there are changes to:
-
-- dataset version;
-- DOI;
-- file availability;
-- label semantics;
-- gaze-map generation;
-- source-session availability;
-- licensing;
-- privacy notes;
-- limitations;
-- recommended reporting practices.

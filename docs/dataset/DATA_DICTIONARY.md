@@ -461,20 +461,4 @@ When reporting experiments using the comparison table, state:
 - gaze-map preprocessing choices, if modified;
 - evaluation metrics.
 
----
 
-## 17. Versioning
-
-This data dictionary describes **EG-PCS Dataset v1.1.0**.
-
-Future releases should update this document whenever there are changes to:
-
-- table columns;
-- label semantics;
-- path semantics;
-- gaze-map format;
-- gaze-map resolution;
-- source-session contents;
-- validation rules;
-- file availability;
-- dataset version or DOI.
