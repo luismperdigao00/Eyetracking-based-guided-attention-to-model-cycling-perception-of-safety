@@ -12,7 +12,7 @@ status: "Prepared for Zenodo release"
 
 This document explains the `eye_tracking_sources/` layer released with **EG-PCS Dataset v1.1.0**.
 
-The purpose of this layer is to make the released gaze maps more transparent and reproducible. It lets researchers inspect the session-level material behind the fixation-derived gaze maps and, when needed, regenerate gaze maps with explicit preprocessing choices.
+The purpose of this layer is to make the eye-tracking component of EG-PCS transparent, reusable, and reproducible. It lets researchers inspect the session-level material behind the fixation-derived gaze maps, regenerate gaze maps with explicit preprocessing choices, and design new eye-tracking analyses beyond the baseline EG-PCS experiments.
 
 For the main dataset overview, see `README.md`.  
 For table columns and path definitions, see `DATA_DICTIONARY.md`.  
@@ -27,13 +27,15 @@ The released gaze maps in `gaze_maps/864x508/` are derived files. They are not r
 The `eye_tracking_sources/` layer provides the source material used to document and regenerate those derived maps. It is intended for:
 
 - auditing how released gaze maps relate to source sessions;
-- inspecting fixation and saccade records;
+- inspecting fixation, saccade, AOI, response, and timing records;
 - checking which source files are available per session;
 - reproducing the fixation-to-map processing pipeline;
 - generating alternative gaze-map variants with different smoothing, normalization, or output resolution;
-- supporting methodological transparency in gaze-guided modelling experiments.
+- studying gaze behavior directly without converting it into dense gaze maps;
+- designing new eye-tracking analyses beyond the baseline EG-PCS experiments;
+- supporting methodological transparency in gaze-guided modelling and human-attention research.
 
-This layer is **not required** for ordinary use of the dataset. If you only need released gaze maps for training or evaluation, use the paths in `comparisons/comparisons.csv` and the files in `gaze_maps/864x508/`.
+This layer is **not required** for standard image-pair or released-gaze-map experiments. If you only need released gaze maps for training or evaluation, use the paths in `comparisons/comparisons.csv` and the files in `gaze_maps/864x508/`.
 
 ---
 

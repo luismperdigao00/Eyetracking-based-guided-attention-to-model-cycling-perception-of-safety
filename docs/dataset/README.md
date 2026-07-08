@@ -184,7 +184,9 @@ The source layer is stored under:
 eye_tracking_sources/
 ```
 
-It contains sanitized source-session material used to document and regenerate the gaze-map layer. This includes raw Tobii gaze samples, OGAMA exports, fixation tables, saccade tables, AOI files, UI parameters, response files, and trial screenshots.
+It contains sanitized source-session material connected to the laboratory eye-tracking subset. This includes raw Tobii gaze samples, OGAMA exports, fixation tables, saccade tables, AOI files, UI parameters, response files, and trial screenshots.
+
+This layer is provided for transparency and reproducibility, but it is not limited to regenerating the released gaze maps. Researchers can also use it to design new eye-tracking analyses beyond the baseline EG-PCS experiments, such as studying fixation duration, saccade behavior, AOI attention, response timing, scanpaths, or alternative attention representations.
 
 Use:
 
@@ -192,7 +194,7 @@ Use:
 eye_tracking_sources/sessions_manifest.csv
 ```
 
-to audit which files are available for each curated session.
+to audit which files are available for each curated session before running source-level analyses.
 
 ---
 
