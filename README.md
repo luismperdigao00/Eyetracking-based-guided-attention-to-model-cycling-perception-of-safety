@@ -125,29 +125,6 @@ The deployment application provides an interface for applying EG-PCS-Net to stre
 
 ---
 
-## 📁 Main Folders
-
-| Folder | Description |
-| --- | --- |
-| [`configs/`](configs/) | YAML configuration files for training, evaluation, and experiment settings. |
-| [`deployment_app/`](deployment_app/) | Standalone web application for inference and visual attention visualization. |
-| [`docs/`](docs/) | Project figures, architecture diagrams, screenshots, and documentation assets. |
-| [`docs/dataset/`](docs/dataset/) | Dataset README, dataset card, data dictionary, license notice, and eye-tracking source-session guide. |
-| [`src/egpcs/`](src/egpcs/) | Core EG-PCS-Net package with data loading, model architectures, training, and evaluation code. |
-
----
-
-## 🚀 Getting Started
-
-For most users, the recommended path is:
-
-1. Read this root README to understand the project.
-2. Read [`docs/dataset/README.md`](docs/dataset/README.md) if you want to use the dataset.
-3. Read [`src/egpcs/README.md`](src/egpcs/README.md) if you want to train or evaluate models.
-4. Use [`deployment_app/`](deployment_app/) if you want to run inference and visualize results.
-
----
-
 ## 📚 How to Cite
 
 Please cite the resources you actually use. If your work uses more than one resource, cite each applicable entry.
