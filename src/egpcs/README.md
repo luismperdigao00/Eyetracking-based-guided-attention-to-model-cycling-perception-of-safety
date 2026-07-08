@@ -37,7 +37,35 @@ python -m egpcs.cli.evaluate
 
 ---
 
-## 2. Expected inputs
+## 2. Installation
+
+Install the package from the repository root before running the training or evaluation commands:
+
+```bash
+python -m pip install -e .
+```
+
+This command reads the project configuration from `pyproject.toml`, installs the `egpcs` package, installs the declared dependencies, and makes the command-line tools available in your active Python environment.
+
+The `-e` flag means **editable mode**. Python uses the local repository directly instead of copying a fixed version of the package into the environment. This is useful during development because changes made under `src/egpcs/` are immediately reflected without reinstalling.
+
+After installation, check that the commands are available:
+
+```bash
+egpcs-train --help
+egpcs-evaluate --help
+```
+
+The equivalent module commands are:
+
+```bash
+python -m egpcs.cli.train --help
+python -m egpcs.cli.evaluate --help
+```
+
+---
+
+## 3. Expected inputs
 
 Training and evaluation expect the dataset to be available locally.
 
@@ -83,7 +111,7 @@ You can override these paths with:
 
 ---
 
-## 3. Quick command overview
+## 4. Quick command overview
 
 | Task | Command |
 | --- | --- |
@@ -98,7 +126,7 @@ You can override these paths with:
 
 ---
 
-## 4. Model heads
+## 5. Model heads
 
 Use `--model` to select the prediction head.
 
@@ -119,7 +147,7 @@ multitask_gaze   ranking + classification with gaze-aware variants
 
 ---
 
-## 5. Model variants
+## 6. Model variants
 
 Use `--model_variant` to control how gaze information is used.
 
@@ -142,7 +170,7 @@ For the main gaze-aligned model, use:
 
 ---
 
-## 6. Backbones
+## 7. Backbones
 
 Use `--backbone` to choose the visual encoder.
 
@@ -179,7 +207,7 @@ egpcs-train --help
 
 ---
 
-## 7. Training a baseline pairwise ranking model
+## 8. Training a baseline pairwise ranking model
 
 Use this when you want a simple pairwise safety-preference baseline without gaze supervision.
 
@@ -206,7 +234,7 @@ What this does:
 
 ---
 
-## 8. Training a multitask model without gaze
+## 9. Training a multitask model without gaze
 
 Use this when you want ranking and classification supervision, but no gaze-guided attention loss.
 
@@ -226,7 +254,7 @@ This setup is useful as a strong non-gaze baseline.
 
 ---
 
-## 9. Training EG-PCS-Net with gaze alignment
+## 10. Training EG-PCS-Net with gaze alignment
 
 Use this for the main gaze-aligned model.
 
@@ -290,7 +318,7 @@ egpcs-train \
 
 ---
 
-## 10. Training only on gaze-annotated rows
+## 11. Training only on gaze-annotated rows
 
 Use `--eyetracker_filter only` to keep only rows where `has_eyetracker=True`.
 
@@ -319,7 +347,7 @@ For most full-dataset experiments, keep:
 
 ---
 
-## 11. Handling ties
+## 12. Handling ties
 
 The dataset can contain three label values:
 
@@ -356,7 +384,7 @@ Use `--ties true` only when the selected model and experimental setup are intend
 
 ---
 
-## 12. Training with W&B logging
+## 13. Training with W&B logging
 
 To log an experiment with Weights & Biases:
 
@@ -382,7 +410,7 @@ Evaluation can later recover configuration information from local W&B files when
 
 ---
 
-## 13. Early stopping
+## 14. Early stopping
 
 Early stopping can stop training when validation performance stops improving.
 
@@ -417,7 +445,7 @@ Useful early-stopping options:
 
 ---
 
-## 14. Learning-rate schedulers
+## 15. Learning-rate schedulers
 
 Use `--scheduler` to choose the learning-rate schedule.
 
@@ -471,7 +499,7 @@ egpcs-train \
 
 ---
 
-## 15. Fine-tuning the backbone
+## 16. Fine-tuning the backbone
 
 Use `--finetune true` to allow selected backbone layers to update during training.
 
@@ -504,7 +532,7 @@ Fine-tuning can improve performance but increases memory use and training time.
 
 ---
 
-## 16. Attention extraction options
+## 17. Attention extraction options
 
 For gaze-aligned experiments, attention extraction affects how the model compares internal attention with gaze maps.
 
@@ -539,7 +567,7 @@ egpcs-train \
 
 ---
 
-## 17. Pooling options
+## 18. Pooling options
 
 Use `--pooling` to choose how transformer features are pooled before prediction heads.
 
@@ -575,7 +603,7 @@ When evaluating a checkpoint, use the same pooling configuration used during tra
 
 ---
 
-## 18. Multi-GPU training
+## 19. Multi-GPU training
 
 To use multiple GPUs through DataParallel:
 
@@ -610,7 +638,7 @@ For CPU execution, omit CUDA or set:
 
 ---
 
-## 19. Evaluating a trained model
+## 20. Evaluating a trained model
 
 Use `egpcs-evaluate` to evaluate a saved checkpoint.
 
@@ -667,7 +695,7 @@ When using `--checkpoint` directly, make sure the model arguments match the trai
 
 ---
 
-## 20. Evaluation with recovered training configuration
+## 21. Evaluation with recovered training configuration
 
 `egpcs-evaluate` can recover configuration from local W&B files when available.
 
@@ -693,7 +721,7 @@ CLI options you pass directly override recovered values.
 
 ---
 
-## 21. Evaluation consistency checklist
+## 22. Evaluation consistency checklist
 
 Checkpoint evaluation requires the model architecture to match the training configuration.
 
@@ -717,7 +745,7 @@ If the checkpoint does not match the model being instantiated, evaluation may fa
 
 ---
 
-## 22. Useful training options
+## 23. Useful training options
 
 | Option | Purpose |
 | --- | --- |
@@ -745,7 +773,7 @@ If the checkpoint does not match the model being instantiated, evaluation may fa
 
 ---
 
-## 23. Useful evaluation options
+## 24. Useful evaluation options
 
 | Option | Purpose |
 | --- | --- |
@@ -769,7 +797,7 @@ If the checkpoint does not match the model being instantiated, evaluation may fa
 
 ---
 
-## 24. Recommended experiment workflow
+## 25. Recommended experiment workflow
 
 A typical EG-PCS-Net experiment looks like this:
 
@@ -809,11 +837,17 @@ egpcs-evaluate \
 
 ---
 
-## 25. Troubleshooting
+## 26. Troubleshooting
 
 ### `egpcs-train: command not found`
 
-The package is probably not installed in the active Python environment. Install the project from the repository root, then reopen or reactivate the environment if needed.
+The package is probably not installed in the active Python environment. Install the project from the repository root:
+
+```bash
+python -m pip install -e .
+```
+
+Then reopen or reactivate the environment if needed.
 
 ### CUDA is not used
 
@@ -863,7 +897,7 @@ Make sure training and evaluation use the same tie setting.
 
 ---
 
-## 26. Notes on reproducibility
+## 27. Notes on reproducibility
 
 Training uses random seeds, dataset splitting, and optional W&B logging. For reproducible experiments, report:
 
@@ -891,4 +925,3 @@ For gaze-guided experiments, also report:
 - gaze-alignment target;
 - gaze loss weight;
 - whether gaze maps were released or regenerated.
-

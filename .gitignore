@@ -41,8 +41,8 @@ EG-PCS-Dataset-v*/
 *.npz
 *.pkl
 *.pickle
-# Ignore the entire eye_tracker_data folder
-survey_eye_tracker/eye_tracker_data/
+# Local survey and eye-tracking source workspace
+survey_eye_tracker/
 
 # ============================================================================
 # 🐍 PYTHON / VIRTUAL ENVIRONMENTS
