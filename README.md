@@ -82,46 +82,29 @@ The application is intended to make model inference and visualization easier to 
 
 ## 🗂️ Repository Guide
 
-This root README gives a high-level overview of the project. Detailed usage instructions are split across the package, dataset, and application documentation.
+This repository is organized into three main parts: the model code, the dataset documentation, and the deployment application.
 
-Use this guide to find the part of the repository that matches your goal.
-
-### 🔬 Model training and evaluation
-
-| Goal | Location |
+| I want to... | Go to |
 | --- | --- |
-| Train EG-PCS-Net models | [`src/egpcs/`](src/egpcs/) |
-| Evaluate trained checkpoints | [`src/egpcs/`](src/egpcs/) |
-| Configure model and experiment settings | [`configs/`](configs/) |
-| Read the technical training/evaluation guide | [`src/egpcs/README.md`](src/egpcs/README.md) |
+| Understand the project at a high level | This `README.md` |
+| Train or evaluate EG-PCS-Net models | [`src/egpcs/README.md`](src/egpcs/README.md) |
+| Change experiment settings | [`configs/`](configs/) |
+| Understand or reuse the dataset | [`docs/dataset/README.md`](docs/dataset/README.md) |
+| Check dataset columns and file paths | [`docs/dataset/DATA_DICTIONARY.md`](docs/dataset/DATA_DICTIONARY.md) |
+| Read dataset limitations, ethics, and intended uses | [`docs/dataset/dataset_card.md`](docs/dataset/dataset_card.md) |
+| Understand the eye-tracking source sessions | [`docs/dataset/EYE_TRACKING_SOURCES.md`](docs/dataset/EYE_TRACKING_SOURCES.md) |
+| Run the inference web application | [`deployment_app/`](deployment_app/) |
+| View project figures and screenshots | [`docs/`](docs/) |
 
-The core package lives in [`src/egpcs/`](src/egpcs/). It contains the model architectures, data loading code, training loops, evaluation logic, checkpoint handling, and command-line tools.
+The most important folders are:
 
-For installation, training commands, evaluation commands, model variants, gaze-alignment settings, and troubleshooting, see [`src/egpcs/README.md`](src/egpcs/README.md).
+- [`src/egpcs/`](src/egpcs/) — core EG-PCS-Net package with model architectures, data loading, training, evaluation, and command-line tools.
+- [`configs/`](configs/) — experiment and hyperparameter configuration files.
+- [`docs/dataset/`](docs/dataset/) — documentation for the released EG-PCS Dataset.
+- [`deployment_app/`](deployment_app/) — web application for model inference and attention-map visualization.
+- [`docs/`](docs/) — architecture diagrams, screenshots, and other documentation assets.
 
-### 📊 Dataset documentation
-
-| Goal | Location |
-| --- | --- |
-| Understand the released dataset | [`docs/dataset/README.md`](docs/dataset/README.md) |
-| Read intended uses, limitations, and ethics | [`docs/dataset/dataset_card.md`](docs/dataset/dataset_card.md) |
-| Inspect column definitions | [`docs/dataset/DATA_DICTIONARY.md`](docs/dataset/DATA_DICTIONARY.md) |
-| Understand eye-tracking source sessions | [`docs/dataset/EYE_TRACKING_SOURCES.md`](docs/dataset/EYE_TRACKING_SOURCES.md) |
-| Read license and reuse notes | [`docs/dataset/DATA_LICENSE.txt`](docs/dataset/DATA_LICENSE.txt) |
-
-The dataset documentation is intended for users who want to understand the EG-PCS release, reuse the data, inspect gaze-map availability, or report experiments correctly.
-
-### 🖥️ Application and visualizations
-
-| Goal | Location |
-| --- | --- |
-| Run the inference application | [`deployment_app/`](deployment_app/) |
-| Inspect project images and figures | [`docs/`](docs/) |
-| View architecture and output examples | [`docs/`](docs/) |
-
-The deployment application provides an interface for applying EG-PCS-Net to street-level images and visualizing predicted safety scores and attention heatmaps.
-
-New users should start with the dataset documentation if they want to use the released data, or with [`src/egpcs/README.md`](src/egpcs/README.md) if they want to train or evaluate models.
+New researchers should start with [`docs/dataset/README.md`](docs/dataset/README.md) to understand the released data, then use [`src/egpcs/README.md`](src/egpcs/README.md) to train or evaluate models.
 
 ---
 
