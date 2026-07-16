@@ -704,7 +704,7 @@ Cite the companion paper when discussing the EG-PCS method, experiments, results
 
 ## 📧 28. Contact
 
-- GitHub: [DinhoDarroz](https://github.com/DinhoDarroz)
+- GitHub: [LuismPerdigao00](https://github.com/LuismPerdigao00)
 - ORCID: [0009-0007-5355-1702](https://orcid.org/0009-0007-5355-1702)
 - Email: through GitHub profile
 
