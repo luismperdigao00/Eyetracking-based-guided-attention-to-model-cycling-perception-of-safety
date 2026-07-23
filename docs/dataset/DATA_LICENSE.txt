@@ -28,7 +28,7 @@ The release combines components with different origins and roles:
 When using the dataset, cite the EG-PCS paper when discussing the method or
 scientific findings, and cite the dataset DOI when using the released data:
 
-https://doi.org/10.5281/zenodo.20101495
+https://doi.org/10.5281/zenodo.21242459
 
 This notice is provided for documentation and does not replace legal review for
 uses beyond ordinary academic research and reproducibility.
