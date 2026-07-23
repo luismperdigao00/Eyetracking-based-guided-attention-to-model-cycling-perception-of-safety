@@ -3,7 +3,7 @@
 title: "EG-PCS Dataset - Data Dictionary"
 description: "Schema reference for the EG-PCS comparison table, labels, image paths, gaze-map paths, and eye-tracking source-session links."
 version: "1.1.0"
-doi: "10.5281/zenodo.20101495"
+doi: "10.5281/zenodo.21242459"
 status: "Prepared for Zenodo release"
 ---
 -->
