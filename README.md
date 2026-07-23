@@ -59,7 +59,7 @@ The dataset includes:
 The dataset is available through Zenodo:
 
 ```text
-https://doi.org/10.5281/zenodo.20101495
+https://doi.org/10.5281/zenodo.21242459
 
 ```
 
@@ -139,8 +139,8 @@ Cite the dataset when you use its images, pairwise comparisons, perceived-safety
   year      = {2026},
   publisher = {Zenodo},
   version   = {1.1.0},
-  doi       = {10.5281/zenodo.20101495},
-  url       = {https://doi.org/10.5281/zenodo.20101495}
+  doi       = {10.5281/zenodo.21242459},
+  url       = {https://doi.org/10.5281/zenodo.21242459}
 }
 ```
 
