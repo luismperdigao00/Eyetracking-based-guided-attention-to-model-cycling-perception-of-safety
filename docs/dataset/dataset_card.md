@@ -12,7 +12,7 @@ This card summarizes the dataset's purpose, composition, intended uses, limitati
 | --- | --- |
 | Dataset name | EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset |
 | Version | 1.1.0 |
-| DOI | 10.5281/zenodo.20101495 |
+| DOI | 10.5281/zenodo.21242459 |
 | Domain | Perceived cycling safety from street-level imagery |
 | Dataset type | Pairwise visual preference dataset with gaze maps and sanitized eye-tracking source sessions |
 | Main table | `comparisons/comparisons.csv` |
@@ -217,8 +217,8 @@ When using the released data, cite the dataset.
   year      = {2026},
   publisher = {Zenodo},
   version   = {1.1.0},
-  doi       = {10.5281/zenodo.20101495},
-  url       = {https://doi.org/10.5281/zenodo.20101495}
+  doi       = {10.5281/zenodo.21242459},
+  url       = {https://doi.org/10.5281/zenodo.21242459}
 }
 ```
 
