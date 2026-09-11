@@ -156,3 +156,7 @@ Cite the paper when discussing the EG-PCS method, experiments, results, or scien
   year      = {2026}
 }
 ```
+
+<p align="center">
+  <img src="docs/prr.jpg" alt="Funding_project" width="900">
+</p>
