@@ -6,14 +6,18 @@ title: "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety"
 type: software
 version: "0.1.0"
 authors:
-  - family-names: "Perdigao"
-    given-names: "Luis Maria"
+  - family-names: "Perdigão"
+    given-names: "Luís Maria"
+    orcid: "https://orcid.org/0009-0007-5355-1702"
   - family-names: "Costa"
     given-names: "Miguel"
+    orcid: "https://orcid.org/0000-0003-0860-7002"
   - family-names: "Santiago"
     given-names: "Carlos"
+    orcid: "https://orcid.org/0000-0002-4737-0020"
   - family-names: "Marques"
     given-names: "Manuel"
+    orcid: "https://orcid.org/0000-0003-0532-1869"
 repository-code: "https://github.com/DinhoDarroz/Eyetracking-based-guided-attention-to-model-cycling-perception-of-safety"
 license: "MIT"
 keywords:
@@ -24,30 +28,42 @@ keywords:
   - attention alignment
 preferred-citation:
   type: conference-paper
-  title: "Learning to Look Like Humans: Gaze-Aligned Cycling Safety Prediction"
+  title: "Learning to See Like Humans: Gaze-Aligned Cycling Safety Prediction"
   authors:
-    - family-names: "Perdigao"
-      given-names: "Luis Maria"
+    - family-names: "Perdigão"
+      given-names: "Luís Maria"
+      orcid: "https://orcid.org/0009-0007-5355-1702"
     - family-names: "Costa"
       given-names: "Miguel"
+      orcid: "https://orcid.org/0000-0003-0860-7002"
     - family-names: "Santiago"
       given-names: "Carlos"
+      orcid: "https://orcid.org/0000-0002-4737-0020"
     - family-names: "Marques"
       given-names: "Manuel"
+      orcid: "https://orcid.org/0000-0003-0532-1869"
   collection-title: "Proceedings of the IEEE International Conference on Intelligent Transportation Systems (ITSC)"
   year: 2026
 references:
   - type: dataset
     title: "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset"
     authors:
-      - family-names: "Perdigao"
-        given-names: "Luis Maria"
+      - family-names: "Perdigão"
+        given-names: "Luís Maria"
+        orcid: "https://orcid.org/0009-0007-5355-1702"
       - family-names: "Costa"
         given-names: "Miguel"
+        orcid: "https://orcid.org/0000-0003-0860-7002"
       - family-names: "Santiago"
         given-names: "Carlos"
+        orcid: "https://orcid.org/0000-0002-4737-0020"
       - family-names: "Marques"
         given-names: "Manuel"
+        orcid: "https://orcid.org/0000-0003-0532-1869"
     version: "1.0.0"
     date-released: 2026-05-09
-    doi: "10.5281/zenodo.20101496"
+    doi: "10.5281/zenodo.21242459"
+  - type: grant
+    institution:
+      name: "Fundação para a Ciência e a Tecnologia"
+    number: "UID/50009/2025"
