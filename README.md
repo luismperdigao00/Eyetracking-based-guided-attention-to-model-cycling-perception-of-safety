@@ -156,7 +156,9 @@ Cite the paper when discussing the EG-PCS method, experiments, results, or scien
   year      = {2026}
 }
 ```
+### Acknowledgements
 
+This work was supported by the Fundação para a Ciência e a Tecnologia (FCT), Portugal, under the project **UID/50009/2025** (Laboratório de Robótica e Sistemas de Engenharia - LARSyS).
 <p align="center">
   <img src="docs/prr.jpg" alt="Funding_project" width="900">
 </p>
